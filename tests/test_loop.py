@@ -111,16 +111,15 @@ def test_timeout_fires_in_virtual_time():
     ],
 )
 def test_real_nondeterminism_escapes(call):
-    with pytest.raises(Escape):
-        with sealed():
-            call()
+    with pytest.raises(Escape), sealed():
+        call()
 
 
 def test_escape_inside_a_run_is_not_swallowed_by_except_exception():
     async def main():
         try:
             time.time()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     with pytest.raises(Escape):
@@ -131,7 +130,7 @@ def test_swallowed_escape_still_fails_the_run():
     async def main():
         try:
             time.time()
-        except BaseException:
+        except BaseException:  # noqa: BLE001, S110
             pass
 
     with pytest.raises(Escape):
@@ -139,9 +138,8 @@ def test_swallowed_escape_still_fails_the_run():
 
 
 def test_seal_restores_real_functions():
-    with pytest.raises(Escape):
-        with sealed():
-            time.time()
+    with pytest.raises(Escape), sealed():
+        time.time()
     assert time.time() > 0
     assert isinstance(random.random(), float)
     assert SeededChoices(1).draw("x", [1, 1]) in (0, 1)
