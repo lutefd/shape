@@ -1,0 +1,26 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: ruff check
+      - run: pytest -q
+      - name: toy saga must fail and shrink
+        run: |
+          set +e
+          shape run --seeds 2000 --saga toy | tee toy.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -ne 0
+          grep -q "invariant=at_most_once_effect" toy.out
+      - name: fixed saga must pass
+        run: shape run --seeds 2000 --saga fixed
