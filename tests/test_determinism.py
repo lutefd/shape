@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -31,6 +32,9 @@ def test_realized_replayed_through_explicit_choices_gives_identical_trace(saga):
         assert [v.message for v in replayed.violations] == [v.message for v in seeded.violations]
 
 
+SRC = str(Path(__file__).resolve().parents[1] / "src")
+
+
 def test_runs_do_not_depend_on_python_hash_randomization():
     code = (
         "from shape.simulation import run_seed\n"
@@ -40,7 +44,7 @@ def test_runs_do_not_depend_on_python_hash_randomization():
     )
     outs = {
         subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
-                       env={**os.environ, "PYTHONHASHSEED": str(h)}).stdout.splitlines()[-1]
+                       env={**os.environ, "PYTHONHASHSEED": str(h), "PYTHONPATH": SRC}).stdout.splitlines()[-1]
         for h in (1, 2, 3)
     }
     assert len(outs) == 1
