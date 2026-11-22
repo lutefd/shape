@@ -29,6 +29,10 @@ Realized = dict[str, int]
 class ChoiceSource(Protocol):
     realized: Realized
 
+    def enabled(self, kind: str) -> bool:
+        """Swarm testing: whether this run may inject faults of ``kind``."""
+        ...
+
     def draw(self, key: str, weights: Sequence[float]) -> int:
         """Return an index into ``weights``. Index 0 is the nominal outcome."""
         ...
