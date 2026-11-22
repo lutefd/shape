@@ -10,3 +10,9 @@ See [docs/design.md](docs/design.md).
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest
 ```
+
+```sh
+.venv/bin/shape run --seeds 10000 --saga toy    # finds the planted double charge, shrinks it
+.venv/bin/shape run --seeds 10000 --saga fixed  # passes
+.venv/bin/shape replay runs/seed-24.at_most_once_effect.min.json
+```
