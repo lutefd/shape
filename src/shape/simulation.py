@@ -115,15 +115,21 @@ class Simulation:
                               "[documented]", record=target, delta=delta)
 
         actor = asyncio.ensure_future(outsider())
-        work = agent(store, host, approver).run(order, policy)
+        def first_round():
+            return agent(store, host, approver).run(order, policy)
+
+        def recovery_round():
+            return agent(store, host, approver).recover(policy)
+
+        start = first_round
         for _ in range(MAX_ROUNDS):
             try:
-                await work
+                await start()
                 if not store.open_sagas():
                     break
             except Crash:
                 trace.add("runtime", "process restarts; recover() on the durable store")
-            work = agent(store, host, approver).recover(policy)
+            start = recovery_round
         finished = True
         actor.cancel()
         await asyncio.gather(actor, return_exceptions=True)
@@ -135,8 +141,12 @@ class Simulation:
 
 
 def place_order(saga: str, choices: ChoiceSource, agent: Agent | None = None,
-                invariants: list[Invariant] | None = None) -> RunResult:
-    """One run of the place-order scenario against saga `toy` or `fixed`."""
+                invariants: list[Invariant] | None = None,
+                policy: Callable[[ChoiceSource], Policy] | None = None) -> RunResult:
+    """One run of the place-order scenario against saga `toy` or `fixed`.
+
+    `policy` builds the agent's policy from the run's choices; the default is adversarial.
+    """
     sim = Simulation(choices=choices)
     for tool in (SimDB, SimPayments, SimEmail):
         sim.add_tool(tool)
@@ -144,8 +154,8 @@ def place_order(saga: str, choices: ChoiceSource, agent: Agent | None = None,
         sim.add_invariant(inv)
     for record_id, value in INVENTORY.items():
         sim.add_record(record_id, value)
-    policy = AdversarialPolicy(sim.choices, SPECS)
-    return sim.run(agent or make_agent(SAGAS[saga]), policy)
+    made = policy(sim.choices) if policy else AdversarialPolicy(sim.choices, SPECS)
+    return sim.run(agent or make_agent(SAGAS[saga]), made)
 
 
 def run_seed(saga: str, seed: int) -> RunResult:
