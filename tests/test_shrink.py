@@ -33,7 +33,7 @@ def test_shrink_never_drops_value_keys_and_skips_them_as_candidates():
 def test_toy_failure_shrinks_to_the_timeout_after_commit_that_matters():
     seed = next(s for s in range(200) if not run_seed("toy", s).ok)
     original = run_seed("toy", seed).realized
-    noisy = {**original, "agent#5": 5, "actor:ext#7": 2, "fault:email.send#0": 1}
+    noisy = {**original, "agent#5": 5, "actor:ext#7": 2, "fault:email.send#9": 1}
 
     def fails(r):
         return any(v.invariant == "at_most_once_effect" for v in replay("toy", r).violations)
@@ -45,7 +45,7 @@ def test_toy_failure_shrinks_to_the_timeout_after_commit_that_matters():
 
 
 def test_cli_run_finds_shrinks_and_writes_a_replay_file(tmp_path, capsys):
-    code = main(["run", "--seeds", "60", "--saga", "toy", "--runs-dir", str(tmp_path)])
+    code = main(["run", "--seeds", "120", "--saga", "toy", "--runs-dir", str(tmp_path)])
     out = capsys.readouterr().out
     assert code == 1
     assert "FAIL seed=" in out and "invariant=at_most_once_effect" in out

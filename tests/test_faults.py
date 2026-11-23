@@ -21,7 +21,8 @@ def test_provenance_is_declared_for_every_fault_kind():
     for kind in (*CALL_FAULTS, "external_modification", "crash"):
         assert kind in PROVENANCE
     assert {"latency", "timeout", "timeout_after_commit", "duplicate_delivery", "rate_limit",
-            "transient_5xx", "compensation_failure"} == set(CALL_FAULTS)
+            "transient_5xx", "compensation_failure", "rate_limit_burst",
+            "outage_burst"} == set(CALL_FAULTS)
 
 
 def test_crash_cannot_be_swallowed_by_except_exception():
@@ -99,3 +100,21 @@ def test_crash_at_every_durable_write_recovers(mode):
         for n in range(writes):
             result = replay("fixed", {f"crash:durable:{table}#{n}": mode})
             assert result.ok, (table, n, mode, [v.message for v in result.violations])
+
+
+@pytest.mark.parametrize("burst, base", [("rate_limit_burst", "rate_limit"),
+                                         ("outage_burst", "transient_5xx")])
+def test_burst_faults_hit_the_next_calls_to_the_same_op_and_are_tagged_observed(burst, base):
+    assert PROVENANCE[burst] == "observed"
+    result = replay("fixed", {"fault:payments.charge#0": index(burst),
+                              "burst:payments.charge#0": 1})  # a burst of 3 calls
+    hits = [e for e in result.trace.events if e.kind == "fault" and e.data["op"] == "charge"]
+    assert [e.data["fault"] for e in hits] == [burst] * 3
+    assert result.ok and states(result) == ["committed"] and len(result.world.charges) == 1
+
+
+def test_a_burst_that_outlasts_the_retry_budget_fails_the_step_without_an_effect():
+    result = replay("fixed", {"fault:payments.charge#0": index("rate_limit_burst"),
+                              "burst:payments.charge#0": 4})  # 8 calls > 4 attempts
+    assert result.ok and states(result) == ["compensated"]
+    assert not result.world.charges
