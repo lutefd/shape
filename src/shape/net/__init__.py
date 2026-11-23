@@ -89,7 +89,7 @@ class _Capture:
         if not safe:
             spec = api.EffectSpec(proposed.op, None, None, proposed.irreversible, errors)
             pending = ctx.begin(spec, args, args, call, proposed.scope,
-                                proposed.key if key is None else key)
+                                proposed.key if key is None else key, resolve_after=True)
         try:
             with contextlib.closing(sqlite3.connect(self.db, isolation_level=None)) as db, db:
                 db.execute("CREATE TABLE IF NOT EXISTS providers (id INTEGER PRIMARY KEY, "
@@ -115,7 +115,7 @@ class _Capture:
                                   final.irreversible, result(response) if result else None)
             else:
                 info = final or proposed
-                ctx.without_effect(info.op, info.scope, call)
+                ctx.without_effect(pending, info.op, info.scope)
         return response
 
 
