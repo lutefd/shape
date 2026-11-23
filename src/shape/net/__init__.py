@@ -173,4 +173,7 @@ def _capture(workdir, fakes):
 
 def _http_op(method, url):
     parsed = urlsplit(url)
-    return parsed.hostname or "", f"{method} {parsed.hostname or ''}{parsed.path or '/'}"
+    host, path = parsed.hostname or "", parsed.path or "/"
+    if path.startswith("/bot") and ":" in path.partition("/bot")[2].partition("/")[0]:
+        path = "/bot<redacted>/" + path[4:].partition("/")[2]
+    return host, f"{method} {host}{path}"

@@ -154,6 +154,11 @@ class SendGridFake:
             ):
                 return _sg_error(400, "Unless a valid template_id is provided, the content parameter is required.", "content")
 
+        settings = params.get("mail_settings")
+        sandbox = settings.get("sandbox_mode") if isinstance(settings, dict) else None
+        if isinstance(sandbox, dict) and sandbox.get("enable") is True:
+            return Response(status=200, headers={}, body=b"")
+
         msg_id = f"sg_msg_{next_seq(state, '_sg_seq')}"
         state["messages"].append({
             "message_id": msg_id,

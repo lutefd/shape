@@ -119,6 +119,7 @@ def main() -> int:
 
     # 3. Local relative links across README and user guide
     check_links()
+    run([sys.executable, "scripts/sync_fake_verification.py", "--check"], expect=0)
     print("docs check passed")
     return 0
 

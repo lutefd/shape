@@ -4,8 +4,6 @@ When an agent charges a card, sends an email, posts to Slack, or opens a GitHub 
 
 `shape.fakes` ships stdlib-only provider test doubles built against the `HttpFake` and `MailFake` protocols used by `shape.net` (pass them to `@shape.scenario(net=[...])` or invoke them directly in tests). Every fake keeps its entire state in a JSON-serializable `dict` so state persists cleanly across crashed incarnations and concurrent actors.
 
-> **Verification status:** These fakes are written directly from each provider's published API documentation and tested against their documented semantics, error shapes, and idempotency rules. **They are not yet verified against live provider sandboxes.** Automated contract tests that run the same suite against both each fake and the real provider sandbox are planned work (see [Core simulation design](../design.md#fakes)).
-
 ## Capture an existing client
 
 Register a fake on the scenario and call your client as usual. Shape captures the write, injects faults at the transport, and uses the fake's default invariants. The client code needs no `@shape.effect`:
@@ -43,8 +41,15 @@ For a mail agent, use `net=[SmtpFake(), ImapFake(initial_messages=[sample_email_
 | `GitHubFake` | `shape.fakes.github` | `api.github.com` | `2022-11-28` | `at_most_once("github.issue.create")` |
 | `SendGridFake` | `shape.fakes.sendgrid` | `api.sendgrid.com` | `v3` | `at_most_once("sendgrid.mail.send")` |
 | `TwilioFake` | `shape.fakes.twilio` | `api.twilio.com` | `2010-04-01` | `at_most_once("twilio.message.create")` |
+| `GmailFake` | `shape.fakes.gmail` | `gmail.googleapis.com` | Gmail API v1 | `at_most_once("gmail.messages.send")`, `at_most_once("gmail.labels.create")` |
+| `GoogleCalendarFake` | `shape.fakes.google_calendar` | `www.googleapis.com`, `calendar.googleapis.com` | Google Calendar API v3 | `at_most_once("calendar.events.insert")` |
+| `TelegramFake` | `shape.fakes.telegram` | `api.telegram.org` | Telegram Bot API (HTTP) | `at_most_once("telegram.sendMessage")` |
+| `DiscordFake` | `shape.fakes.discord` | `discord.com`, `discordapp.com` | Discord REST v10 | `at_most_once("discord.message.create")` |
+| `LinearFake` | `shape.fakes.linear` | `api.linear.app` | Linear GraphQL (unversioned) | `at_most_once("linear.issueCreate")`, `at_most_once("linear.commentCreate")` |
+| `JiraFake` | `shape.fakes.jira` | `jira.example.com` | Jira Cloud REST v3 | `at_most_once("jira.issue.create")`, `at_most_once("jira.comment.create")` |
+| `LangGraphFake` | `shape.fakes.langgraph` | `langgraph.example.com`, `localhost`, `127.0.0.1` | LangSmith Agent Server OpenAPI 0.1.0 | `at_most_once("langgraph.threads.create")`, `at_most_once("langgraph.runs.create")`, `at_most_once("langgraph.crons.create")` |
 
-## What each fake models (and does not)
+## Provider behavior
 
 Each fake intentionally models only the semantics safety invariants depend on: resource state transitions, idempotency behavior, error status codes and payload shapes, and write visibility. None of them is a full API clone.
 
@@ -94,7 +99,7 @@ Each fake intentionally models only the semantics safety invariants depend on: r
 ### `SendGridFake` (`v3`)
 
 - **Models:**
-  - `POST /v3/mail/send` returning `202 Accepted` with empty body and `X-Message-Id` header
+  - `POST /v3/mail/send` returning `202 Accepted` with empty body and `X-Message-Id` header. Sandbox validation (`mail_settings.sandbox_mode.enable` set to true) returns `200 OK` with no send effect.
   - Validation of `personalizations[].to[].email`, `from.email`, `subject`, `content` (or `template_id`) with SendGrid `400 {"errors": [...]}` bodies, plus optional `valid_api_keys` (`401`)
   - Non-idempotent sends (every accepted POST records a new email)
 - **Does not model:** scheduled sends, batch IDs, dynamic template rendering, suppression lists, or bounce webhooks.
@@ -105,7 +110,80 @@ Each fake intentionally models only the semantics safety invariants depend on: r
   - `POST /2010-04-01/Accounts/{AccountSid}/Messages.json` (form-encoded or JSON) returning `201 Created` with deterministic 34-char `SM...` SIDs; non-idempotent
   - `GET /2010-04-01/Accounts/{AccountSid}/Messages.json` (with `To`/`From` filters) and `GET .../Messages/{Sid}.json`
   - Twilio error payloads (`code`, `message`, `more_info`, `status`) for missing `To` (`21604`), invalid `To` (`21211`), missing `From`/`MessagingServiceSid` (`21603`), missing `Body`/`MediaUrl` (`21602`), and not found (`20404`)
+- With `test_mode=True`, creates return ephemeral test SIDs and reads return `403` / `20008`.
 - **Does not model:** delivery status callbacks, carrier segment splitting, MMS media downloads, or Voice/Verify resources.
+
+### `GmailFake` (Gmail API v1)
+
+- Send base64url-encoded RFC 5322 mail. A retry can send a second message even with the same Message-ID or generic idempotency header. Supply `initial_messages=[raw_rfc5322_bytes]` to seed the mailbox. Reads support message and thread lists, API formats, label filters, and basic `q` terms. Thread replies use a thread ID, matching subject, and reply headers.
+- Modify message or thread labels, create/read/update/delete user labels, and list changes after a history ID. A thread label edit affects its current messages. History IDs are monotonic and retained for the scenario. MIME uploads, delivery to other mailboxes, and the full Gmail search grammar are outside this fake. [Gmail API reference](https://developers.google.com/workspace/gmail/api/reference/rest), [Gmail threads](https://developers.google.com/workspace/gmail/api/guides/threads).
+
+### `GoogleCalendarFake` (Google Calendar API v3)
+
+- Insert, read, list, patch, and delete events by calendar. A caller-supplied event ID returns a duplicate conflict on reuse. PATCH updates supplied fields, replaces arrays, and checks `If-Match`. Deleted events are kept as cancelled entries. Recurrence expansion, guest notifications, and sync tokens are outside this fake. [Events reference](https://developers.google.com/workspace/calendar/api/v3/reference/events), [Resource versions](https://developers.google.com/workspace/calendar/api/guides/version-resources).
+
+### `TelegramFake` (Telegram Bot API)
+
+- Send and edit text messages in numeric chats and acknowledge chat actions. Retries of `sendMessage` create distinct messages. Repeating the same text edit returns Telegram's 400 envelope. Seed `initial_updates=[...]` to test redelivery, positive offset confirmation, and negative offset truncation. Polling returns immediately, and bot sends generate no incoming updates. [Telegram Bot API](https://core.telegram.org/bots/api).
+
+### `DiscordFake` (Discord REST v10)
+
+- Create, retrieve, and delete channel messages. With `enforce_nonce=true`, a repeated nonce for the same author returns the existing message and commits no new send. A `clock=` callable enables expiration after `nonce_ttl` seconds, which defaults to 300. A run with no clock keeps nonces for the duration of the scenario. This fake covers JSON message requests. [Discord message API](https://discord.com/developers/docs/resources/message#create-message).
+
+### `LinearFake` (GraphQL)
+
+- Execute `issueCreate`, `commentCreate`, and single issue/comment lookups. Specify inputs with GraphQL variables or inline arguments. The fake supports nested field selections and aliases with one root field per operation. Mutations create a new resource on retry. It represents rejected resolvers with a GraphQL error envelope, including errors returned with HTTP 200. [Linear GraphQL](https://linear.app/developers/graphql), [Linear errors](https://linear.app/developers/sdk-errors).
+
+### `JiraFake` (Jira Cloud REST v3)
+
+- Create or retrieve an issue, create or retrieve Atlassian Document Format comments, and list or apply transitions. Pass `hosts=` for your own Jira hostname, `projects=` to map project keys to IDs, and `transitions=` to map workflow transition IDs to status names. The supplied transitions are available on each issue. Issue and comment creates can duplicate on retry. [Jira issues](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/), [Jira comments](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/).
+
+### `LangGraphFake` (LangSmith Agent Server OpenAPI 0.1.0)
+
+- Create and read threads and launch background, streaming, or wait-for-output runs. Creating a thread with a stable ID and `if_exists="do_nothing"` returns the saved thread on retry. Run creation can duplicate. Stream replies use server-sent events. Runs resolve on stream, join, or wait and return their input by default. Pass `run_result=` for a scripted output.
+- Create thread-bound or standalone cron definitions, search, patch, and delete them. The fake stores definitions for inspection. Graph execution, crontab scheduling, and webhooks are outside this fake. [Agent Server API reference](https://docs.langchain.com/langsmith/server-api-ref), [OpenAPI schema](https://github.com/langchain-ai/docs/blob/main/src/langsmith/agent-server-openapi.json).
+
+## Contract tests
+
+```sh
+shape fakes contract stripe
+shape fakes contract stripe --live --report contract-stripe.json
+```
+
+The suite runs documented requests against the fake by default. With `--live`, it sends the same script to the configured test service. It compares HTTP status, provider error codes, selected response field types, and whether an immediate retry of the write returns the same resource, conflicts, or creates a duplicate. The script always retries the initial write to model a caller that lost its reply. Separate scenario tests exercise real transport clients with injected loss after commit.
+
+SendGrid's sandbox validates without sending. Twilio test credentials return an ephemeral SID and reject reads. Telegram's Bot API can check a committed message through an edit. The Gmail suite sends only to the configured test mailbox. GitHub, Slack, Telegram, Discord, Gmail, Calendar, Linear, Jira, and LangGraph use dedicated scratch resources. The suite attempts to clean up its writes after each run.
+
+The pytest helper `from shape.fakes.contracts import assert_contract` takes the same provider name and `live=True` when desired. Missing environment variables produce a skip. Mismatches return a failing CLI exit code and pytest assertion. JSON reports contain selected response field types and comparisons.
+
+<!-- provider-verification:start -->
+| Provider | Verification | Required environment variables |
+| --- | --- | --- |
+| `discord` | unverified | `DISCORD_BOT_TOKEN`, `DISCORD_TEST_CHANNEL` |
+| `github` | unverified | `GITHUB_TOKEN`, `GITHUB_SCRATCH_REPO` |
+| `gmail` | unverified | `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`, `GMAIL_TEST_EMAIL` |
+| `google-calendar` | unverified | `CALENDAR_CLIENT_ID`, `CALENDAR_CLIENT_SECRET`, `CALENDAR_REFRESH_TOKEN`, `CALENDAR_TEST_ID` |
+| `imap` | unverified | — |
+| `jira` | unverified | `JIRA_TEST_SITE`, `JIRA_TEST_EMAIL`, `JIRA_TEST_API_TOKEN`, `JIRA_TEST_PROJECT`, `JIRA_TEST_ISSUE_TYPE`, `JIRA_TEST_TRANSITION` |
+| `langgraph` | unverified | `LANGGRAPH_TEST_URL`, `LANGGRAPH_TEST_ASSISTANT_ID` |
+| `linear` | unverified | `LINEAR_API_KEY`, `LINEAR_TEST_TEAM_ID` |
+| `sendgrid` | unverified | `SENDGRID_API_KEY`, `SENDGRID_TEST_FROM` |
+| `slack` | unverified | `SLACK_BOT_TOKEN`, `SLACK_TEST_CHANNEL` |
+| `smtp` | unverified | — |
+| `stripe` | unverified | `STRIPE_TEST_KEY` |
+| `telegram` | unverified | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_TEST_CHAT_ID` |
+| `twilio` | unverified | `TWILIO_TEST_ACCOUNT_SID`, `TWILIO_TEST_AUTH_TOKEN` |
+<!-- provider-verification:end -->
+
+Use the same names for scheduled GitHub Actions secrets, except GitHub's suite takes secrets `CONTRACT_GITHUB_TOKEN` and `CONTRACT_GITHUB_SCRATCH_REPO`. The workflow maps them to `GITHUB_TOKEN` and `GITHUB_SCRATCH_REPO`. `LANGGRAPH_TEST_API_KEY` is an optional variable and secret for authenticated Agent Servers. `LANGGRAPH_TEST_URL` accepts an HTTPS deployment or an HTTP localhost URL when running locally.
+
+- **GitHub:** fine-grained token with Issues read/write access to the scratch repository. Set `GITHUB_SCRATCH_REPO` to `owner/repo`.
+- **Slack:** bot in the test channel with `chat:write` and the channel's history scope. **Telegram:** a numeric test chat that has started the bot or admitted it. **Discord:** a bot with permission to send, read and delete its own messages in the specified test channel.
+- **SendGrid:** Mail Send permission. **Twilio:** legacy test Account SID and Auth Token.
+- **Gmail:** OAuth refresh token for the test mailbox with `https://www.googleapis.com/auth/gmail.modify`. **Calendar:** test calendar ID with an OAuth refresh token authorized to write its events.
+- **Linear:** scratch team UUID and a personal API key with issue create, read, comment, and archive access. **Jira:** Atlassian site hostname such as `shape-test.atlassian.net`, account email and API token, scratch project key, issue type ID, and an available transition ID. **LangGraph:** use a test assistant that accepts a JSON object containing a string `shape` field and returns an object.
+
+The packaged [contract results](../../src/shape/fakes/contract_results.json) are the source for each fake's `verified_on` and `verification_status` attributes and the table above. After a successful live comparison, copy its JSON report into the corresponding provider entry and run `python scripts/sync_fake_verification.py`. The scheduled workflow uploads reports for review.
 
 ## Configuring scopes
 
