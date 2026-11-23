@@ -24,3 +24,13 @@ jobs:
           grep -q "invariant=at_most_once_effect" toy.out
       - name: fixed saga must pass
         run: shape run --seeds 2000 --saga fixed
+      - name: plain-python example must fail and shrink
+        run: |
+          set +e
+          shape test examples/plain_python/checks.py::checkout_buggy --seeds 200 | tee plain.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -ne 0
+          grep -q "invariant=at_most_once(payments.charge)" plain.out
+      - name: plain-python fixed example must pass
+        run: shape test examples/plain_python/checks.py::checkout_fixed --seeds 200
