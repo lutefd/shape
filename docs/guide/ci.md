@@ -85,7 +85,9 @@ This projection of the checkout report shows how the replay paths relate to the 
 }
 ```
 
-When a budget or shrink limit prevents minimization, the corresponding seed IDs appear in `shrink_budget_skipped_seeds` or `shrink_limit_skipped_seeds`. A defect with no verified replay has a null `replay_path`. Each defect and trigger object also includes `trigger_label` (all kept deviations in order), and `flaky_details` lists each flaky seed's saved `runs/<scenario>/flaky/seed-<n>` directory and first divergence. Upload the runs directory along with the JSON to make the replay paths available after the job.
+When a budget or shrink limit prevents minimization, the corresponding seed IDs appear in `shrink_budget_skipped_seeds` or `shrink_limit_skipped_seeds`. A defect with no verified replay has a null `replay_path`. Each defect and trigger object also includes `trigger_label` (all kept deviations in order), and `flaky_details` lists each flaky seed's saved `runs/<scenario>/flaky/seed-<n>` directory and first divergence. Upload the runs directory along with the JSON to make the replay paths available after the job. Effects declared `delivery="at-most-once"` appear under `by_design`, apart from `defects`: one object per op with `lost`, `lost_seeds`, `seeds` and `triggers` (the fault classes behind the losses). A lost effect there never fails the run.
+
+## Postgres in CI
 
 Scenarios with a [Postgres fixture](world-fixtures.md#postgres) need a database in the job. Add a service container and set `SHAPE_PG_DSN`; without it `shape test` prints `SKIP <scenario>: fixture 'pg' is unavailable` for those scenarios and exits 0, and `shape.check` raises `shape.FixtureUnavailable`, which pytest reports as skipped:
 

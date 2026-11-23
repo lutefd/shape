@@ -422,7 +422,7 @@ def test_at_most_once_loss_is_by_design_and_duplicates_still_fail(tmp_path):
     lost = runner.execute(never_sent, {"explicit": {"fault:notify.send#0.0": server_error}},
                           tmp_path / "lost")
     assert lost.ok, lost.violations
-    assert lost.stats["by_design"] == {"notify.send": 1}
+    assert lost.stats["by_design"] == {"notify.send": {"lost": True, "triggers": ["before_commit"]}}
 
     @shape.scenario(max_restarts=1, recovery="redeliver",
                     invariants=[shape.exactly_once("notify.send")])
@@ -454,7 +454,7 @@ def test_scenario_level_delivery_covers_ops_without_a_decorator(tmp_path):
 
     server_error = FAULTS.index("server_error") + 1
     out = runner.execute(never_paged, {"explicit": {"fault:notify.page#0.0": server_error}}, tmp_path)
-    assert out.ok and out.stats["by_design"] == {"notify.page": 1}
+    assert out.ok and out.stats["by_design"]["notify.page"]["lost"]
 
 
 def test_by_design_section_in_the_coverage_report(tmp_path):
@@ -471,10 +471,52 @@ def test_by_design_section_in_the_coverage_report(tmp_path):
 
     swept = runner.run_sweep(job, range(80), tmp_path)
     assert not swept.failing
-    text = swept.cov.render()
-    assert "by design (declared at-most-once" in text
-    assert "notify.keyed: lost in" in text
-    assert swept.cov.by_design["notify.keyed"] > 0
+    assert "by design" not in swept.cov.render()  # it is its own section, apart from coverage
+    text = swept.cov.render_by_design()
+    assert text.startswith("by design (declared at-most-once, a lost effect is not a defect;")
+    [row] = swept.cov.by_design_report()
+    assert row["op"] == "notify.keyed" and row["lost"] == len(row["lost_seeds"]) > 0
+    assert row["seeds"] == 80 and set(row["triggers"]) <= {"before_commit", "reply_lost",
+                                                          "crash_before", "crash_after"}
+    assert f"notify.keyed: lost in {row['lost']} of 80 seeds (" in text
+    assert f"e.g. seed {row['lost_seeds'][0]}" in text
+
+
+def test_by_design_section_in_json_and_failing_reports(tmp_path, capsys):
+    import json as jsonlib
+
+    from shape import cli
+
+    path = tmp_path / "checks.py"
+    path.write_text("""
+import shape
+
+@shape.effect("sms.send", scope=lambda user: f"user:{user}", key=lambda user: f"sms-{user}",
+              delivery="at-most-once")
+def send(user):
+    pass
+
+@shape.effect("db.write", scope=lambda: "row")
+def write():
+    pass
+
+@shape.scenario(max_restarts=1, recovery="redeliver",
+                invariants=[shape.exactly_once("sms.send"), shape.at_most_once("db.write")])
+def job(run):
+    try:
+        send("u1")
+    except Exception:
+        pass
+    write()
+    write()  # a real defect: written twice
+""")
+    code = cli.main(["test", str(path), "--seeds", "40", "--json", "--runs-dir", str(tmp_path / "r")])
+    report = jsonlib.loads(capsys.readouterr().out)["scenarios"][0]
+    assert code == 1  # the duplicate write fails; the lost texts do not
+    [row] = report["by_design"]
+    assert row["op"] == "sms.send" and row["lost"] > 0 and row["delivery"] == "at-most-once"
+    assert {d["invariant"] for d in report["defects"]} == {"at_most_once(db.write)"}
+    assert "by design" not in report["coverage"]
 
 
 def test_delivery_values_are_checked():

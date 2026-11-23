@@ -194,6 +194,7 @@ def cmd_test(args: argparse.Namespace) -> int:
         problems = swept.problems(scen)
         notes = swept.notes(scen)
         coverage = swept.cov.render()
+        by_design = swept.cov.render_by_design()
         scopes = swept.cov.render_scopes(scen.invariants)
         scenario_failed = bool(swept.failing or swept.flaky or problems)
         failed |= scenario_failed
@@ -214,6 +215,7 @@ def cmd_test(args: argparse.Namespace) -> int:
                 "problems": problems,
                 "notes": notes,
                 "coverage": coverage,
+                "by_design": swept.cov.by_design_report(),
                 "scope_assignment": scopes,
                 **report.as_dict(),
             })
@@ -223,6 +225,8 @@ def cmd_test(args: argparse.Namespace) -> int:
               f"failing={len(swept.failing)}{flaky}  wall={swept.wall:.2f}s  "
               f"{swept.seeds / swept.wall:.0f} seeds/s")
         print(coverage)
+        if by_design:
+            print(by_design)
         if scopes:
             print(scopes)
         if args.verbose:

@@ -142,7 +142,7 @@ Two limits: a module that imported the clock function under another name (`from 
 
 A text message nobody retries, a best-effort metric, a notification that may drop. `@shape.effect(..., delivery="at-most-once")` declares that losing it is the design. For `shape.exactly_once(op)`:
 
-- A **lost** effect is not a defect. The coverage report lists it under its own heading with how often it happened, so a rate that grows is still visible.
+- A **lost** effect is not a defect. The report lists it under its own `by design` heading, apart from the coverage table and the defects, with how many seeds lost one and which fault classes were behind it, so a rate that grows is still visible. `shape test --json` carries it as a `by_design` list, and a failing `shape.check` prints it above the defects.
 - A **duplicate** still fails, as it would for any effect.
 
 For ops that come from a fake or a framework adapter, declare it on the scenario instead: `@shape.scenario(delivery={"slack.chat.postMessage": "at-most-once"})`. The scenario's map wins over the effect's.
@@ -166,7 +166,7 @@ coverage over 100 seeds:
   model choices taken: none
   interleaving choices taken: none
 by design (declared at-most-once, a lost effect is not a defect; a duplicate still fails):
-  sms.send: lost in 14 of 100 seeds
+  sms.send: lost in 14 of 100 seeds (before-commit fault: 14; e.g. seed 6)
 scope assignment:
   sms.send: explicit scope= (e.g. 'user:u1')
 1 defect across 2 failing seeds
@@ -175,6 +175,7 @@ defect 1 of 1: exactly_once(sms.send)  op=sms.send  scope=user:<id>  (2 of 2 fai
   crash after commit: 2 seeds (crash_after)
 FAIL docs/guide/examples/world_fixtures.py::sms_unkeyed  seed=31  invariant=exactly_once(sms.send)
   sms.send happened 2 times for scope 'user:u1' (it must happen exactly once)
+  trigger: crash after commit
   minimized to 2 steps (1 of 1 deviations kept, 2 replays):
     incarnation 0
       1. send_sms(user='u1')
@@ -202,7 +203,7 @@ coverage over 100 seeds:
   model choices taken: none
   interleaving choices taken: none
 by design (declared at-most-once, a lost effect is not a defect; a duplicate still fails):
-  sms.send: lost in 14 of 100 seeds
+  sms.send: lost in 14 of 100 seeds (before-commit fault: 14; e.g. seed 6)
 scope assignment:
   sms.send: explicit scope= (e.g. 'user:u1')
 PASS
@@ -217,7 +218,7 @@ shape test docs/guide/examples/world_fixtures.py::lease_unkeyed --start 39 --see
 ```
 
 ```text
-scenario=lease_unkeyed  seeds=1 (from 39)  failing=1  wall=0.29s  3 seeds/s
+scenario=lease_unkeyed  seeds=1 (from 39)  failing=1  wall=0.06s  17 seeds/s
 coverage over 1 seeds:
   op          landed  attempts
   agent.run        2         3
@@ -233,6 +234,7 @@ defect 1 of 1: exactly_once(agent.run)  op=agent.run  scope=job:<id>  (1 of 1 fa
   crash after commit: 1 seed (crash_after)
 FAIL docs/guide/examples/world_fixtures.py::lease_unkeyed  seed=39  invariant=exactly_once(agent.run)
   agent.run happened 2 times for scope 'job:j1' (it must happen exactly once)
+  trigger: before-commit fault (server_error) + crash after commit
   minimized to 3 steps (2 of 2 deviations kept, 4 replays):
     setup (no faults)
       enqueue_job(job_id='j1')
@@ -254,7 +256,7 @@ FAIL docs/guide/examples/world_fixtures.py::lease_unkeyed  seed=39  invariant=ex
 The first worker's run landed and then the process died before it could mark the job done. Its lease held for 30 seconds, so nothing could take the job over until the clock passed it; the trace shows 31 seconds going by (the 30 second lease plus the reaper's 1 second poll), and the second worker ran the step again. With `key=lambda job_id: f"run-{job_id}"` the provider dedupes the repeat and the same scenario passes (`lease_keyed`, 40 seeds):
 
 ```text
-scenario=lease_keyed  seeds=40 (from 0)  failing=0  wall=3.04s  13 seeds/s
+scenario=lease_keyed  seeds=40 (from 0)  failing=0  wall=0.60s  67 seeds/s
 ...
 PASS
 ```
@@ -268,6 +270,7 @@ shape test docs/guide/examples/postgres_queue.py::pg_lease_unkeyed --start 39 --
 ```text
 FAIL docs/guide/examples/postgres_queue.py::pg_lease_unkeyed  seed=39  invariant=exactly_once(agent.run)
   agent.run happened 2 times for scope 'job:j1' (it must happen exactly once)
+  trigger: before-commit fault (server_error) + crash after commit
   minimized to 3 steps (2 of 2 deviations kept, 4 replays):
     setup (no faults)
       enqueue_job(job_id='j1')
@@ -291,7 +294,7 @@ shape test docs/guide/examples/postgres_queue.py::pg_lease_keyed --seeds 100 --j
 ```
 
 ```text
-scenario=pg_lease_keyed  seeds=100 (from 0)  failing=0  wall=6.12s  16 seeds/s
+scenario=pg_lease_keyed  seeds=100 (from 0)  failing=0  wall=2.56s  39 seeds/s
 ...
 PASS
 ```
@@ -307,6 +310,7 @@ shape test docs/guide/examples/world_fixtures.py::digest_current_hour --start 2 
 ```text
 FAIL docs/guide/examples/world_fixtures.py::digest_current_hour  seed=2  invariant=every_hour_has_a_digest
   no digest was sent for hour 0
+  trigger: before-commit fault (timeout)
   minimized to 2 steps (1 of 1 deviations kept, 2 replays):
     incarnation 0
       1. send_digest(hour=0)
