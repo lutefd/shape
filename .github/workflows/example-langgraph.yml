@@ -1,0 +1,75 @@
+name: example-langgraph
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  langgraph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e . -r examples/langgraph/requirements.txt
+      - name: retry_connection_reset must fail at_most_once and shrink to ConnectionResetError
+        run: |
+          set +e
+          shape test examples/langgraph/retry_policy.py::retry_connection_reset --seeds 200 --jobs 4 | tee retry_conn.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -eq 1
+          grep -q "invariant=at_most_once(payments.charge)" retry_conn.out
+          grep -q "ConnectionResetError" retry_conn.out
+      - name: retry_httpx_timeout must fail at_most_once and shrink to ReadTimeout
+        run: |
+          set +e
+          shape test examples/langgraph/retry_policy.py::retry_httpx_timeout --seeds 200 --jobs 4 | tee retry_httpx.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -eq 1
+          grep -q "invariant=at_most_once(payments.charge)" retry_httpx.out
+          grep -q "ReadTimeout" retry_httpx.out
+      - name: retry_requests_402_before_commit must fail on forbidden 402 retry
+        run: |
+          set +e
+          shape test examples/langgraph/retry_policy.py::retry_requests_402_before_commit --seeds 200 --jobs 4 | tee retry_402_before.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -eq 1
+          grep -q "LangGraph retried charge_node after a 402 requests.HTTPError" retry_402_before.out
+      - name: retry_httpx_402_not_retried and retry_fixed must pass
+        run: |
+          shape test examples/langgraph/retry_policy.py::retry_httpx_402_not_retried --seeds 200 --jobs 4
+          shape test examples/langgraph/retry_policy.py::retry_fixed --seeds 200 --jobs 4
+      - name: durability_async and durability_sync_no_key must fail at_most_once
+        run: |
+          set +e
+          shape test examples/langgraph/durability.py::durability_async --seeds 200 --jobs 4 | tee dur_async.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -eq 1
+          grep -q "invariant=at_most_once(payments.charge)" dur_async.out
+
+          set +e
+          shape test examples/langgraph/durability.py::durability_sync_no_key --seeds 200 --jobs 4 | tee dur_sync.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -eq 1
+          grep -q "invariant=at_most_once(payments.charge)" dur_sync.out
+      - name: durability_async_with_key and durability_sync_fixed must pass
+        run: |
+          shape test examples/langgraph/durability.py::durability_async_with_key --seeds 200 --jobs 4
+          shape test examples/langgraph/durability.py::durability_sync_fixed --seeds 200 --jobs 4
+      - name: approval_default must fail at_most_once while approval_gate_only, approval_sync_fixed, and approval_rejected pass
+        run: |
+          set +e
+          shape test examples/langgraph/approval.py::approval_default --seeds 200 --jobs 4 | tee appr_def.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -eq 1
+          grep -q "invariant=at_most_once(transfers.send)" appr_def.out
+
+          shape test examples/langgraph/approval.py::approval_gate_only --seeds 200 --jobs 4
+          shape test examples/langgraph/approval.py::approval_sync_fixed --seeds 200 --jobs 4
+          shape test examples/langgraph/approval.py::approval_rejected --seeds 200 --jobs 4
