@@ -49,7 +49,6 @@ Classification follows [`docs/jepsen/methodology.md`](../../docs/jepsen/methodol
 | --- | --- | --- | --- | --- | --- |
 | `retry_policy.py` | `retry_connection_reset` | `at_most_once(payments.charge)` | **FAIL** (26/200; `at_most_once` + `scenario_terminates` from `max_restarts=0`) | `seed=99` (`connection_reset_after_commit` -> `ConnectionResetError`) | **(a) / 1** (LG-C24) |
 | `retry_policy.py` | `retry_httpx_timeout` | `at_most_once(payments.charge)` | **FAIL** (23/200; `at_most_once` + `scenario_terminates` from `max_restarts=0`) | `seed=7` (`timeout_after_commit` -> `httpx.ReadTimeout`) | **(a) / 1** (LG-C24) |
-| `retry_policy.py` | `retry_requests_402` | `at_most_once(payments.charge)` | **FAIL** (26/200; `at_most_once` + `scenario_terminates` from `max_restarts=0`) | `seed=7` (`timeout_after_commit` -> `requests.HTTPError` 402)* | **(a) / 1** (LG-C24) |
 | `retry_policy.py` | `retry_requests_402_before_commit` | `at_most_once(payments.charge)` + no retry on 402 | **FAIL** (3/200; `scenario_terminates` on forbidden retry) | `seed=13` (`server_error` -> `requests.HTTPError` 402)* | **(a) / 1** (LG-C24) |
 | `retry_policy.py` | `retry_httpx_402_not_retried` | `at_most_once(payments.charge)` + no retry on 402 | **PASS** (0/200) | — | control (matches docs) |
 | `retry_policy.py` | `retry_fixed` | `at_most_once`, `exactly_once` (`payments.charge`) | **PASS** (0/200) | — | mitigated (`durability="sync"` + key) |
@@ -62,7 +61,7 @@ Classification follows [`docs/jepsen/methodology.md`](../../docs/jepsen/methodol
 | `approval.py` | `approval_sync_fixed` | `approved_before`, `at_most_once`, `exactly_once` (`transfers.send`) | **PASS** (0/200) | — | mitigated (`durability="sync"` + key) |
 | `approval.py` | `approval_rejected` | `approved_before(transfers.send)` | **PASS** (0/200; 0 transfers) | — | holds |
 
-*\*Note on the 402 fault mapping:* `shape`'s boundary fault table has no dedicated `client_error` fault kind. `retry_requests_402` maps `timeout_after_commit` (and `server_error`) to a `requests.HTTPError` carrying a status-402 `requests.Response` so the effect commits before raising the 402 error; `retry_requests_402_before_commit` maps `server_error` (a before-commit fault) to the same 402 `requests.HTTPError` and maps the other non-crash faults to `httpx.HTTPStatusError(402)` so only a retry of `requests.HTTPError(402)` trips the check.
+*\*Note on the 402 fault mapping:* `shape`'s boundary fault table has no `client_error` kind yet, so `retry_requests_402_before_commit` maps `server_error` (a before-commit fault) to a `requests.HTTPError` carrying a status-402 response, and the other non-crash faults to `httpx.HTTPStatusError(402)`, so only a retry of the `requests` 402 trips the check. A 402 after the charge committed is not modeled: a declined card does not charge, so that combination would be an invented fault.
 
 ## Finding details: `RetryPolicy()` vs documentation (LG-C24, class (a) / 1)
 
@@ -146,20 +145,6 @@ FAIL examples/langgraph/retry_policy.py::retry_httpx_timeout  seed=7  invariant=
       1. HttpxPaymentClient.charge(order_id='ord-17', amount=5000, idempotency_key=None)
            effect landed, then timeout after commit: the caller saw ReadTimeout
       2. HttpxPaymentClient.charge(order_id='ord-17', amount=5000, idempotency_key=None)
-           effect landed
-      finished
-```
-
-### `retry_requests_402` (`seed=7`, class (a) / 1)
-
-```text
-FAIL examples/langgraph/retry_policy.py::retry_requests_402  seed=7  invariant=at_most_once(payments.charge)
-  payments.charge happened 2 times for scope 'order:ord-17' (at most 1 allowed)
-  minimized to 2 steps (1 of 1 faults kept, 3 replays):
-    incarnation 0
-      1. Requests402PaymentClient.charge(order_id='ord-17', amount=5000, idempotency_key=None)
-           effect landed, then timeout after commit: the caller saw HTTPError
-      2. Requests402PaymentClient.charge(order_id='ord-17', amount=5000, idempotency_key=None)
            effect landed
       finished
 ```

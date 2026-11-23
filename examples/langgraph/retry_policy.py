@@ -86,32 +86,6 @@ class HttpxPaymentClient:
         self.provider.close()
 
 
-class Requests402PaymentClient:
-    """Maps `timeout_after_commit` and `server_error` to `requests.HTTPError` (402).
-
-    Note on fault mapping: shape's boundary fault table has no dedicated `client_error` fault,
-    so we attach a 402 `requests.HTTPError` factory to `timeout_after_commit` (after-commit
-    4xx, showing a double-charge when LangGraph retries) and `server_error` (before-commit 4xx).
-    """
-
-    def __init__(self, db_path: Path) -> None:
-        self.provider = PaymentProvider(db_path)
-
-    @shape.effect(
-        "payments.charge",
-        scope=lambda order_id, **_: f"order:{order_id}",
-        key=lambda idempotency_key=None, **_: idempotency_key,
-        errors={
-            "timeout_after_commit": requests_http_error(402, "Payment Required"),
-            "server_error": requests_http_error(402, "Payment Required"),
-        },
-    )
-    def charge(self, order_id: str, amount: int, idempotency_key: str | None = None) -> int:
-        return self.provider.charge(order_id, amount, idempotency_key)
-
-    def close(self) -> None:
-        self.provider.close()
-
 
 class Requests402BeforeCommitClient:
     """Maps `server_error` (before-commit) to `requests.HTTPError` (402 Payment Required).
@@ -264,11 +238,6 @@ def retry_httpx_timeout(run: shape.Run) -> None:
     """httpx.ReadTimeout after commit is retried by default RetryPolicy() -> double charge."""
     _run_charge_graph(run, HttpxPaymentClient)
 
-
-@shape.scenario(invariants=[shape.at_most_once("payments.charge")], max_restarts=0)
-def retry_requests_402(run: shape.Run) -> None:
-    """requests.HTTPError(402) after commit is retried by default RetryPolicy() -> double charge."""
-    _run_charge_graph(run, Requests402PaymentClient)
 
 
 @shape.scenario(invariants=[shape.at_most_once("payments.charge")], max_restarts=3)

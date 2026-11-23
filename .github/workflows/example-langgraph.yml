@@ -30,15 +30,6 @@ jobs:
           test "$code" -eq 1
           grep -q "invariant=at_most_once(payments.charge)" retry_httpx.out
           grep -q "ReadTimeout" retry_httpx.out
-      - name: retry_requests_402 must fail at_most_once and shrink to HTTPError
-        run: |
-          set +e
-          shape test examples/langgraph/retry_policy.py::retry_requests_402 --seeds 200 --jobs 4 | tee retry_402.out
-          code=${PIPESTATUS[0]}
-          set -e
-          test "$code" -eq 1
-          grep -q "invariant=at_most_once(payments.charge)" retry_402.out
-          grep -q "HTTPError" retry_402.out
       - name: retry_requests_402_before_commit must fail on forbidden 402 retry
         run: |
           set +e
