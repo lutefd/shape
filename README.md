@@ -9,8 +9,10 @@ The model is an untrusted input. shape asks whether the system around it keeps i
 You mark the functions with side effects, write a scenario that runs your agent, and name what must hold.
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
+pip install agent-shape        # Python 3.12+, no dependencies. Imports as `shape`, CLI is `shape`.
 ```
+
+To run the examples below from a clone: `python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'`.
 
 `examples/plain_python/` is a small agent with no framework: a retry loop around a payment call, progress saved to a sqlite file, and a restart that resumes from it. The charge call is marked:
 
@@ -78,3 +80,11 @@ See [docs/design.md](docs/design.md).
 .venv/bin/shape run --seeds 10000 --saga fixed  # passes
 .venv/bin/shape replay runs/seed-24.at_most_once_effect.min.json
 ```
+
+## License
+
+Apache-2.0. The PyPI distribution is `agent-shape` because `shape` is taken by an unrelated package that also imports as `shape`; do not install both in one environment.
+
+## Releasing
+
+Bump `version` in `pyproject.toml`, merge, then push a matching tag (`git tag v0.1.1 && git push origin v0.1.1`). The `release` workflow builds, smoke-tests the wheel, and uploads to PyPI with the `PYPI_API_TOKEN` repository secret.

@@ -1,9 +1,27 @@
 [project]
-name = "shape"
-version = "0.0.1"
-description = "Deterministic simulation testing for agent systems, and a Jepsen-style harness for agent frameworks"
+name = "agent-shape"
+version = "0.1.0"
+description = "Crash-safety testing for AI agents: inject faults and real crashes at tool side effects, check invariants, shrink failures"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = []
+keywords = ["agents", "testing", "fault-injection", "idempotency", "simulation", "langgraph"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/lutefd/shape"
+Source = "https://github.com/lutefd/shape"
+Issues = "https://github.com/lutefd/shape/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
@@ -17,6 +35,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/shape"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/shape", "/tests", "/README.md", "/LICENSE", "/docs/boundary.md", "/docs/design.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
