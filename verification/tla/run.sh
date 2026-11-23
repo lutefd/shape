@@ -7,9 +7,9 @@ jar=${TLA2TOOLS_JAR:-$HOME/.cache/tla/tla2tools.jar}
 model=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 case_name=${1:-all}
 case "$case_name" in
-    all|fixed|toy|approval-mutant|pivot-mutant|order-mutant|submission|compensation) ;;
+    all|fixed|toy|approval-mutant|pivot-mutant|pivot-guard|order-mutant|doubt-mutant|retry-mutant|ack-mutant|submission|compensation) ;;
     *)
-        echo "Usage: $0 [all|fixed|toy|approval-mutant|pivot-mutant|order-mutant|submission|compensation]" >&2
+        echo "Usage: $0 [all|fixed|toy|approval-mutant|pivot-mutant|pivot-guard|order-mutant|doubt-mutant|retry-mutant|ack-mutant|submission|compensation]" >&2
         exit 2
         ;;
 esac
@@ -51,13 +51,17 @@ check() {
 
 if [[ "$case_name" == all ]]; then
     check fixed
+    check submission
+    check compensation
+    check pivot-guard
     check toy 12 'Invariant AtMostOnePaymentEffect is violated.'
     check approval-mutant 12 'Invariant DurableApprovalBeforeEmail is violated.'
     check pivot-mutant 12 'Invariant CleanCompensation is violated.'
+    check doubt-mutant 12 'Invariant CleanCompensation is violated.'
+    check retry-mutant 12 'Invariant CleanCompensation is violated.'
     check order-mutant 13 'Temporal property RecordedSagaTerminates was violated.'
-    check submission 13 'Temporal property SubmissionTerminates was violated.'
-    check compensation 12 'Invariant CleanCompensation is violated.'
-    echo 'All expected TLC outcomes reproduced, including the two fixed-runtime findings.'
+    check ack-mutant 13 'Temporal property SubmissionTerminates was violated.'
+    echo 'All expected TLC outcomes reproduced: the fixed runtime passes, every mutant fails.'
 else
     check "$case_name"
 fi

@@ -2,12 +2,13 @@
 
 import argparse
 
-from shape.runtime.store import COMPENSATED
-from shape.sim.faults import CALL_FAULTS
+from shape.runtime.store import COMMITTED, ESCALATED
+from shape.sim.faults import BURST_LENGTHS, CALL_FAULTS
 from shape.simulation import ORDER, replay
 
 REQUEST = f"saga-{ORDER['order']}:email"
 EMAIL_ARGS = {key: ORDER[key] for key in ("order", "to")}
+BURST_OF_FOUR = BURST_LENGTHS.index(4)
 
 
 def fault(name):
@@ -43,18 +44,30 @@ def report_findings():
         print(f"DST {saga}: charge keys {keys}")
 
     first_write = replay("fixed", {"crash:durable:sagas#0": 1})
-    assert not first_write.store.sagas and not first_write.world.effects
-    assert not first_write.violations
-    print("DST fixed submission: pre-write crash left no saga row. The DST oracle passed vacuously.")
+    assert not first_write.violations and first_write.world.submitted
+    assert first_write.store.saga("saga-17").state == COMMITTED
+    assert any("resubmitting" in e.text for e in first_write.trace.events if e.kind == "client")
+    print("DST fixed submission: pre-write crash lost no order. The client resubmitted until acked.")
 
     later_calls = {f"fault:email.send#{i}": fault("rate_limit") for i in range(1, 5)}
     lost_response = replay("fixed", {"crash:call:email.send#0": 2, **later_calls})
-    saga = lost_response.store.saga("saga-17")
-    assert saga.state == COMPENSATED
-    assert any(e.tool == "email" and e.op == "send" for e in lost_response.world.effects)
-    assert any(v.invariant == "rollback_restores_state" and "email.send" in v.message
-               for v in lost_response.violations)
-    print("DST fixed compensation: email landed, recovery rate-limited four times, then compensated.")
+    assert_escalated_after_delivery(lost_response)
+    print("DST fixed compensation: email landed, recovery rate-limited four times, then escalated.")
+
+    stale_failure = replay("fixed", {
+        "fault:email.send#0": fault("rate_limit_burst"), "burst:email.send#0": BURST_OF_FOUR,
+        "crash:durable:intents#5": 2, "crash:call:email.send#4": 2,
+        "fault:email.send#5": fault("rate_limit_burst"), "burst:email.send#5": BURST_OF_FOUR,
+    })
+    assert_escalated_after_delivery(stale_failure)
+    print("DST fixed retry: a failed intent called again was in doubt after the second crash.")
+
+
+def assert_escalated_after_delivery(result):
+    assert not result.violations, [v.message for v in result.violations]
+    assert result.store.saga("saga-17").state == ESCALATED
+    assert len([e for e in result.world.effects if (e.tool, e.op) == ("email", "send")]) == 1
+    assert any(row["kind"] == "escalate" for row in result.store.audit_log)
 
 
 if __name__ == "__main__":
