@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from pathlib import Path
 
 import pytest
 import scenarios as sc
@@ -396,9 +397,10 @@ def test_exactly_once_failure_claim_ok_accepts_honest_failure_and_rejects_lies_o
 def test_public_check_jobs_and_replay_api(tmp_path):
     shape.check(sc.model_never_repeats, seeds=20, runs_dir=tmp_path / "p", jobs=2)
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError) as info:
         shape.check(sc.naive_retry, seeds=100, runs_dir=tmp_path / "f", jobs=2)
-    min_file = next((tmp_path / "f" / "naive_retry").glob("seed-*.min.json"))
+    replay = next(line for line in str(info.value).splitlines() if line.startswith("  replay: "))
+    min_file = Path(replay.removeprefix("  replay: "))
 
     # Replaying against the buggy scenario raises AssertionError
     with pytest.raises(AssertionError, match=r"at_most_once\(t\.pay\)"):
