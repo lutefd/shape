@@ -55,7 +55,10 @@ def child_main(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> int:
     os.dup2(out, 1)
     os.dup2(out, 2)
     sys.stdout = sys.stderr = os.fdopen(1, "w", buffering=1, closefd=False)
-    ctx = api._Context(workdir, inc, make_choices(spec))
+    # Fairness: faults eventually stop. With restarts allowed, the last incarnation runs fault-free,
+    # so scenario_terminates asks whether the agent recovers, not whether the harness can outlast it.
+    quiet = scen.max_restarts > 0 and inc == scen.max_restarts
+    ctx = api._Context(workdir, inc, make_choices(spec), quiet)
     api.activate(ctx)
     watchdog = threading.Timer(INCARNATION_TIMEOUT, lambda: os._exit(TIMEOUT_EXIT))
     watchdog.daemon = True
@@ -163,6 +166,8 @@ def sweep(scen: api.Scenario, seeds: range, runs_dir: Path,
 
 def _parallel(seeds: list[int], jobs: int, one) -> list:
     workers = []
+    sys.stdout.flush()  # a forked worker must not inherit, and later flush, the parent's output
+    sys.stderr.flush()
     for chunk in (seeds[i::jobs] for i in range(jobs)):
         read, write = os.pipe()
         pid = os.fork()

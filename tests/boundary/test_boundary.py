@@ -194,3 +194,30 @@ def test_spawn_fallback_runs_incarnations_in_fresh_interpreters(tmp_path, monkey
     out = run_explicit(spawned, {"fault:t.op#0.0": fault("crash_after")}, tmp_path)
     assert out.ok, out.violations
     assert [e["how"] for e in out.entries if e["kind"] == "incarnation"] == ["crash", "done"]
+
+
+def test_last_incarnation_is_fault_free_so_a_recovering_agent_terminates(tmp_path):
+    explicit = {f"fault:t.mail#{i}.0": FAULTS.index("crash_before") + 1 for i in range(4)}
+    out = runner.execute(mail_with_approval, {"explicit": explicit}, tmp_path / "w")
+    assert out.completed
+    assert not [v for v in out.violations if v.invariant == "scenario_terminates"]
+
+
+
+def test_parallel_sweep_prints_the_same_report_as_a_serial_one(tmp_path):
+    import re
+    import subprocess
+    import sys
+    root = Path(__file__).resolve().parents[2]
+
+    def report(jobs: int) -> str:
+        out = subprocess.run(
+            [sys.executable, "-m", "shape.cli", "test", "examples/plain_python/checks.py",
+             "--seeds", "200", "--jobs", str(jobs), "--runs-dir", str(tmp_path / f"j{jobs}")],
+            check=False, cwd=root, capture_output=True, text=True,
+            env={"PYTHONPATH": str(root / "src"), "PATH": "/usr/bin:/bin"})
+        return re.sub(r"wall=\S+\s+\d+ seeds/s|j\d+", "", out.stdout)
+
+    serial = report(1)
+    assert "FAIL" in serial
+    assert report(4) == serial

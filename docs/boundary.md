@@ -62,7 +62,7 @@ Invariants:
 - `at_most_once(op)`: each scope has at most one real effect of `op`.
 - `exactly_once(op)`: at most once per scope, and when the scenario finished, at least one effect of `op` overall (a lost effect fails it).
 - `approved_before(op)`: every effect of `op` has an earlier approval with the same scope and argument hash.
-- `scenario_terminates()`: always on. The scenario must return within `max_restarts` restarts.
+- `scenario_terminates()`: always on. The scenario must return within `max_restarts` restarts. When `max_restarts > 0`, the last incarnation runs with faults off (faults eventually stop), so this checks that the agent recovers from whatever state the faults left, not that it survives unbounded faults. With `max_restarts=0` every fault is live and the agent must handle it inline.
 
 Approvals are recorded by the code that obtains them: `shape.approval(scope, args)` (for example, inside the node that receives the human decision). `args` is the dict of the effect's named arguments (without `self`); the hash is of its sorted JSON, so arguments must have stable reprs.
 

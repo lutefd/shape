@@ -87,8 +87,10 @@ class _Context:
     """One incarnation's view of the run. Counters, draws and log appends share one lock, so a
     framework that runs sync tools in a thread pool still gets stable per-op keys."""
 
-    def __init__(self, workdir: Path, incarnation: int, choices: ChoiceSource) -> None:
+    def __init__(self, workdir: Path, incarnation: int, choices: ChoiceSource,
+                 quiet: bool = False) -> None:
         self.incarnation = incarnation
+        self.quiet = quiet  # faults have stopped: the recovery incarnation draws nothing
         self.choices = choices
         self.lock = threading.Lock()
         self.counts: Counter[str] = Counter()
@@ -116,7 +118,7 @@ class _Context:
             n = self.counts[spec.op]
             self.counts[spec.op] += 1
             draw_key = f"fault:{spec.op}#{self.incarnation}.{n}"
-            value = self.choices.draw(draw_key, self.weights)
+            value = 0 if self.quiet else self.choices.draw(draw_key, self.weights)
             fault = FAULTS[value - 1] if value else None
             error = make_error(fault, spec.errors) if fault and "crash" not in fault else None
             if fault:
