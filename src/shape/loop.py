@@ -50,10 +50,11 @@ class SimLoop(asyncio.BaseEventLoop):
             heapq.heappop(scheduled)._scheduled = False
         if not self._ready and not self._stopping:
             if not scheduled:
-                raise Deadlock("nothing runnable, no timers, main task unfinished")
-            self._now = max(self._now, scheduled[0]._when)
-            if self._now > self._max_time:
-                raise TimeLimit(f"virtual time passed {self._max_time}")
+                self._on_idle()
+            else:
+                self._now = max(self._now, scheduled[0]._when)
+                if self._now > self._max_time:
+                    raise TimeLimit(f"virtual time passed {self._max_time}")
         while scheduled and scheduled[0]._when <= self._now:
             handle = heapq.heappop(scheduled)
             handle._scheduled = False
@@ -63,14 +64,7 @@ class SimLoop(asyncio.BaseEventLoop):
             ready.popleft()
         if not ready:
             return
-        index = 0
-        if len(ready) > 1:
-            n = len(ready)
-            weights = [1.0] + [0.1 / (n - 1) if self._reorder else 0.0] * (n - 1)
-            index = self._choices.draw(f"sched#{self._picks}", weights)
-            self._picks += 1
-            if index:
-                self._trace.add("sched", f"ran ready callback {index} of {n} first", index=index)
+        index = self._pick_ready() if len(ready) > 1 else 0
         if index:
             ready.rotate(-index)
             handle = ready.popleft()
@@ -79,6 +73,18 @@ class SimLoop(asyncio.BaseEventLoop):
             handle = ready.popleft()
         if not handle._cancelled:
             handle._run()
+
+    def _on_idle(self) -> None:
+        raise Deadlock("nothing runnable, no timers, main task unfinished")
+
+    def _pick_ready(self) -> int:
+        n = len(self._ready)
+        weights = [1.0] + [0.1 / (n - 1) if self._reorder else 0.0] * (n - 1)
+        index = self._choices.draw(f"sched#{self._picks}", weights)
+        self._picks += 1
+        if index:
+            self._trace.add("sched", f"ran ready callback {index} of {n} first", index=index)
+        return index
 
     def call_exception_handler(self, context: dict[str, Any]) -> None:
         # The default handler logs, and logging reads the real clock.

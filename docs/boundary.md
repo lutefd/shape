@@ -53,7 +53,7 @@ def test_place_order_is_crash_safe():
 
 `check(scenario, seeds=100, start=0, runs_dir="runs")`.
 
-`@shape.scenario(invariants=, max_restarts=3, actors=(), duplicate_trigger=False, expect_effects=True)`. `actors` and `duplicate_trigger` are described under Faults. `expect_effects=False` says the scenario may legitimately call no effect (a rejected request must do nothing); see Coverage.
+`@shape.scenario(invariants=, max_restarts=3, actors=(), duplicate_trigger=False, expect_effects=True, concurrent=())`. `actors` and `duplicate_trigger` are described under Faults, and `concurrent` under Concurrency. `expect_effects=False` says the scenario may legitimately call no effect (a rejected request must do nothing). See Coverage.
 
 ### Effects, scopes and idempotency keys
 
@@ -145,12 +145,12 @@ Failing seeds are grouped by root cause. The signature is the violated invariant
 ## How one seed runs
 
 1. The parent process imports the scenario module once. It starts no threads.
-2. For each seed, the parent forks a child per incarnation (spawn where fork is unavailable). Incarnation 0 runs the scenario with `run.restarts == 0`.
+2. For each seed, the parent forks a child per incarnation (spawn where fork is unavailable). A concurrent incarnation has one child per actor. Incarnation 0 runs with `run.restarts == 0`.
 3. Inside the child, each call to an `@shape.effect` function draws its fault from the choice source at key `fault:<op>#<incarnation>.<n>` (n counts calls to that op in this incarnation, under a lock, so threaded frameworks still get stable keys per op). The value is an index into `[nominal, *faults]` in the table order below; 0 runs the function normally. A call is recorded as an effect when the function returns (or when an after-commit fault is injected), so a function that raises is not an effect.
 4. A crash fault ends the child with `os._exit(137)`, either before the function runs or after it returns (the effect landed, the caller never sees it). Nothing in the child gets to clean up, flush, or checkpoint. That is the point.
 5. The parent sees the child died and forks the next incarnation with `run.restarts` incremented, up to `max_restarts`. An incarnation ends one of four ways: the scenario returned (done), an injected crash (exit 137), an uncaught exception (the process died, so it restarts like any other death; the trace shows the root cause: the exception shape injected, or the innermost one in its `__cause__`/`__context__` chain, with the framework wrapper that surfaced it in parentheses), or no return within 30 seconds (killed). A scenario that has not finished after `max_restarts` is a `scenario_terminates` failure, reported with the last exception. Each incarnation's stdout and stderr go to `run.dir/inc-<n>.out`.
 6. Every real effect and approval is appended and fsynced to the world log at `run.dir/world.jsonl` before the call returns to the agent, so the log survives the crash. Every call is also logged as an attempt before its fault is applied, and every nonzero draw is appended to `run.dir/realized.jsonl` the same way.
-7. After the last incarnation, the parent evaluates the invariants over the world log. A failing seed is first confirmed: its realized map replays through `ExplicitChoices` in a fresh run, and the replay must fail the same invariant and reach every recorded key. Then ddmin shrinks the map, the minimal map is replayed once more and checked the same way, and the failure is printed in the code's own words (function names and arguments, faults, deaths) and written to `seed-<n>.min.json`. The summary counts `deviations` (injected faults, model choices, a duplicate delivery) kept out of those the seed took. Failing seeds are first re-run to rule out flakiness and then grouped into distinct causes (see above).
+7. After the last incarnation, the parent evaluates the invariants over the world log. A failing seed is first confirmed: its realized map replays through `ExplicitChoices` in a fresh run, and the replay must fail the same invariant and reach every recorded key. Then ddmin shrinks the map, the minimal map is replayed once more and checked the same way, and the failure is printed in the code's own words (function names and arguments, faults, deaths) and written to `seed-<n>.min.json`. Deviations include injected faults, model choices, a duplicate delivery and scheduling changes. Failing seeds are first re-run to rule out flakiness and then grouped into distinct causes (see above).
 8. If either replay does not fail again or does not reach every recorded key, the run depends on something shape does not control. The report says `NOT MINIMIZED` with the original run and the reason, and claims no minimal trace.
 
 ## Faults at the boundary
@@ -172,7 +172,7 @@ The exception a fault raises is what the user's stack would really see. Each `@s
 
 ### Scenario-level faults and world actors
 
-`@shape.scenario(duplicate_trigger=True)` adds one more fault to the scenario, drawn once per seed at key `world:duplicate_trigger` (swarm applies; about one seed in four when enabled). The scenario's first incarnation is then started twice at the same moment on the same `run.dir`, as an at-least-once queue or webhook delivers a message twice. They are two forked twins. Their draw keys are namespaced per twin (`fault:<op>#0.<n>` for copy A, `fault:<op>#0t1.<n>` for copy B), so each replays deterministically. The trace shows both copies (`incarnation 0 (copy A of the duplicate delivery)`, `(copy B ...)`). The incarnation counts as finished if either copy finished; restarts, when needed, are single. It is opt-in because a one-shot job is not meant to survive double delivery. The real interleaving of the two copies is not controlled, so a failure that depends on it can show as FLAKY.
+`@shape.scenario(duplicate_trigger=True)` draws `world:duplicate_trigger` once per seed (swarm applies). On a double delivery, the first incarnation starts two copies of the scenario on the same `run.dir`, as an at-least-once queue or webhook might. The copies run under the actor scheduler below. They keep their own fault and model choice keys (`fault:<op>#0.<n>` for copy A, `fault:<op>#0t1.<n>` for copy B). Either copy can finish the delivery. Restarts use a single copy. If the scenario also declares concurrent actors, those run once per incarnation and must all finish.
 
 `@shape.actor` marks a function `fn(run)` that the parent process calls between incarnations (after one dies, before the next starts), with the `Run` of the incarnation about to start. It changes the user's state while the agent is down: edit a file or row, revoke an approval. It uses `shape.choose` so a seed decides what the user did:
 
@@ -192,9 +192,65 @@ Swarm testing applies: each seed enables a random subset of fault kinds. A call 
 
 Each fault is drawn independently, so a seed can crash or fail every incarnation; that shows up as a `scenario_terminates` failure whose minimal trace is all those faults.
 
-## What boundary mode does not control
+## Concurrency
 
-Threads, timers, and the model inside the agent process are not virtualized, and the simulation's `seal` (clock, random, socket guards) is not applied: your code and your test doubles run for real. Fault keys are per op and per incarnation, so a run is reproducible when the agent's sequence of calls to each op is reproducible, which holds for scripted models and sequential graphs. When a replay diverges, the report says so instead of claiming a minimal trace. For deterministic model perturbations, use `shape.choose` directly or the scripted models in [docs/adapters.md](adapters.md).
+### Processes
+
+```python
+def join(run: shape.Run) -> None:
+    shape.point("store Ada's lead")
+    store_lead(run.dir, "ada")
+
+@shape.scenario(concurrent=[join], invariants=[no_lost_leads])
+def daily_summary(run: shape.Run) -> None:
+    shape.point("read leads")
+    leads = list_leads(run.dir)
+    shape.point("post daily summary")
+    post_summary(leads)
+    shape.point("clear lead store")
+    clear_store(run.dir)
+```
+
+The scenario function and each callable in `concurrent` run in separate processes with the same
+`run.dir`. The scenario is actor 0, followed by the callables in declaration order. Each actor
+runs in that order up to its first point. Points are every `@shape.effect` call before it draws
+a fault and every `shape.point(label)`. Put a point before a shared read or other operation you
+want to interleave. The chosen actor runs until its next point or exit. Other actors stay parked.
+When multiple actors are waiting, shape draws `sched:actors#<incarnation>.<n>` to choose their
+order. Index 0 runs the lowest-numbered waiting actor. Nonzero draws interleave the actors and
+are stored, shrunk and replayed with the other deviations. The trace shows actor names and the
+points at which the order changed. A point has no effect when the process scheduler is inactive.
+Faults and model choices for extra actors use the actor's declaration position. The first
+extra actor's token in incarnation 0 is `0p1`.
+
+A crash kills the actor that took the fault. The remaining actors can finish their turns, and
+an incomplete incarnation restarts with fresh processes and the same `run.dir`.
+On the last recovery incarnation, faults stop and the scheduler uses nominal order. If an
+actor blocks until another actor can run, it needs to reach a point before that wait. The
+incarnation timeout kills and reaps stalled actors and reports the actor and the point where
+it was granted the turn, alongside the actors still waiting.
+
+### Asyncio
+
+Use `shape.run_async(coro)` in place of `asyncio.run(coro)` to explore races between asyncio
+tasks inside a scenario or actor. Shape uses a virtual clock for asyncio timers and draws
+`sched:tasks#<actor-token>.<n>` whenever two or more callbacks are ready. Index 0 is FIFO.
+The trace and coverage include the reordered callbacks, and replay and shrinking use their
+choice keys. A coroutine with no runnable callbacks, timers or pending executor work can
+raise `shape.loop.Deadlock`. Outside a shape run, `shape.run_async` delegates to `asyncio.run`.
+
+### Scheduling limits
+
+- Actors share durable data such as a SQLite file in `run.dir`. Each process has its own memory.
+- Process interleaving is at point granularity. Code between two points runs as a single step.
+- Executor work and user-created threads run on real threads. Their arrival order, blocking
+  waits and wall-clock behavior depend on the host. Use sequential work between actor points
+  for deterministic process interleavings.
+- The deterministic asyncio loop supports virtual asyncio timers and test doubles for I/O.
+  Use the ordinary event loop for real network or subprocess I/O.
+- Use `shape.choose` or the [scripted models](adapters.md) to control model outputs. Boundary
+  mode keeps the host clock, random sources and sockets available. Reruns and replay detect
+  some divergence from these inputs.
 
 ## Reading the output
 
