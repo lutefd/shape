@@ -19,6 +19,9 @@ from typing import Any
 from ..choices import ChoiceSource
 from ..trace import Trace
 from .faults import (
+    BURST_LENGTHS,
+    BURSTS,
+    CALL_CRASH_WEIGHT,
     CALL_FAULTS,
     CRASH_WEIGHT,
     MAX_CRASHES,
@@ -46,18 +49,19 @@ class Host:
         self.crashes = 0
         self.faults_on = True
         self._counts: dict[str, int] = {}
+        self._bursts: dict[str, tuple[str, int]] = {}  # op -> (burst fault, calls it still hits)
 
     def _next(self, name: str) -> int:
         n = self._counts.get(name, 0)
         self._counts[name] = n + 1
         return n
 
-    def crash_at(self, point: str) -> int:
+    def crash_at(self, point: str, weight: float = CRASH_WEIGHT) -> int:
         """Draw whether the process dies at `point`. Returns 0, 1 (before) or 2 (after)."""
         if not self.faults_on or self.crashes >= MAX_CRASHES:
             return 0
         n = self._next(f"crash:{point}")
-        on = CRASH_WEIGHT * self.choices.enabled("crash")
+        on = weight * self.choices.enabled("crash")
         mode = self.choices.draw(f"crash:{point}#{n}", [1.0, on, on])
         if mode:
             self.crashes += 1
@@ -69,18 +73,36 @@ class Host:
                    compensating: bool = False) -> dict[str, Any]:
         name = f"{tool}.{op}"
         self.trace.add("call", f"{name}({render_args(args)})  key={key}", tool=tool, op=op, key=key)
-        crash = self.crash_at(f"call:{name}")
+        crash = self.crash_at(f"call:{name}", CALL_CRASH_WEIGHT)
         if crash == 1:
             raise Crash(f"before {name}")
         fault = ""
         if self.faults_on:
             n = self._next(f"fault:{name}")
-            weights = call_weights(self.choices.enabled, compensating)
-            drawn = self.choices.draw(f"fault:{name}#{n}", weights)
-            if drawn:
-                fault = CALL_FAULTS[drawn - 1]
-                self.trace.add("fault", f"{fault} on {name}  [{PROVENANCE[fault]}]",
-                               fault=fault, tool=tool, op=op)
+            burst, left = self._bursts.pop(name, ("", 0))
+            if left:
+                # Inside a burst: the earlier draw decided this call, so nothing is drawn here.
+                kind = BURSTS[burst]
+                fault = kind
+                if left > 1:
+                    self._bursts[name] = (burst, left - 1)
+                self.trace.add("fault", f"{kind} on {name}  [{PROVENANCE[burst]}, burst continues]",
+                               fault=burst, tool=tool, op=op)
+            else:
+                weights = call_weights(self.choices.enabled, compensating)
+                drawn = self.choices.draw(f"fault:{name}#{n}", weights)
+                if drawn:
+                    fault = CALL_FAULTS[drawn - 1]
+                    note = ""
+                    if fault in BURSTS:
+                        size = BURST_LENGTHS[self.choices.draw(
+                            f"burst:{name}#{n}", [1.0] * len(BURST_LENGTHS))]
+                        if size > 1:
+                            self._bursts[name] = (fault, size - 1)
+                        note = f", {size} calls"
+                    self.trace.add("fault", f"{fault} on {name}  [{PROVENANCE[fault]}{note}]",
+                                   fault=fault, tool=tool, op=op)
+                    fault = BURSTS.get(fault, fault)
         await asyncio.sleep(CALL_LATENCY)
         if fault == "latency":
             jitter = self.choices.draw(f"jitter:latency#{self._next('jitter:latency')}", [1, 1, 1])

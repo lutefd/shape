@@ -16,6 +16,7 @@ This document fixes the data shapes. Code in `src/shape/` follows it, and a chan
 | `agent#<step>` | policy | a misbehavior kind instead of the nominal action |
 | `agent#<step>:arg` | policy | which wrong argument, which earlier call to duplicate |
 | `fault:<tool>.<op>#<n>` | host | index into `[nominal, *FAULTS]` (see `sim/faults.py`): which fault fires on the n-th call of that op |
+| `burst:<tool>.<op>#<n>` | host | only drawn when a burst fault fires on that call: index into the burst lengths `[2, 3, 4, 6, 8]` (0 = shortest). The next calls to the same op get the base fault without drawing |
 | `crash:call:<tool>.<op>#<n>` | host | 1 = the process dies before the call, 2 = after the effect lands, before the caller sees it |
 | `crash:durable:<table>#<n>` | store | 1 = the process dies before the durable write lands, 2 = just after |
 | `human:<request>` | simulated approver | 1 = reject, 2 = delay 30s, 3 = never answer. Drawn once per request, then fixed |
@@ -58,6 +59,8 @@ Each fault kind carries its provenance. A finding states the provenance of every
 ## Faults in the table
 
 `latency`, `timeout` (client gives up before commit), `timeout_after_commit` (commits, response lost), `duplicate_delivery`, `rate_limit`, `transient_5xx` (before commit), `compensation_failure` (applies to compensating calls only), plus `crash` and `external_modification` which are drawn at their own keys. Each seed enables a random half of the kinds (swarm testing).
+
+Independent faults never produce the failure runs real providers do, so two kinds are correlated. `rate_limit_burst` (429s while a shared quota stays exhausted, past the advertised retry-after) and `outage_burst` (5xx while a dependency is down) hit the drawing call and then the next 1 to 7 calls to the same op, longer than the runtime's four attempts. Their provenance is `observed`: the single 429 or 5xx is documented, the persistence is not. Process crashes inside a tool call are drawn five times as often as at a durable write (`CALL_CRASH_WEIGHT`), because a call is in flight for real time and a write is not.
 
 ## Saga end states
 
