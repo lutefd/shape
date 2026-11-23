@@ -140,8 +140,9 @@ Replay a checked-in `.min.json` regression trace in milliseconds with `shape.rep
 2. [Invariants](docs/guide/invariants.md): every built-in invariant with runnable examples, `claims_true` vs. `exactly_once`, and custom `@shape.invariant` checks over `shape.World`.
 3. [Reading a trace](docs/guide/reading-a-trace.md): line-by-line trace walkthrough, `.min.json` replay files, and a checklist to tell a real bug from a harness artifact.
 4. Framework guides: [Plain Python](docs/guide/plain-python.md), [LangGraph](docs/guide/langgraph.md), [OpenAI Agents SDK](docs/guide/openai-agents.md).
-5. [CI and pytest](docs/guide/ci.md): GitHub Actions, `--jobs`, exit codes, `shape.check`, and checked-in replay traces.
-6. [FAQ and honest limits](docs/guide/faq.md): when `shape` is the wrong tool, current limits, disk usage of `runs/`, and comparisons with other tools.
+5. [Provider fakes](docs/guide/fakes.md): reusable stdlib fakes for Stripe, SMTP/IMAP, Slack, GitHub, SendGrid, and Twilio, plus how to write custom fakes.
+6. [CI and pytest](docs/guide/ci.md): GitHub Actions, `--jobs`, exit codes, `shape.check`, and checked-in replay traces.
+7. [FAQ and honest limits](docs/guide/faq.md): when `shape` is the wrong tool, current limits, disk usage of `runs/`, and comparisons with other tools.
 
 ### Reference
 
