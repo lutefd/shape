@@ -178,3 +178,30 @@ def test_terminates_fails_on_deadlock():
     broken = run({}, WaitsForeverForApproval)
     assert fired(broken) == {"saga_terminates"}
     assert "did not finish" in broken.violations[0].message
+
+
+def test_terminates_fails_when_a_submitted_order_never_became_a_saga():
+    from shape.invariants import saga_terminates
+    from shape.runtime.store import Store
+
+    world = World()
+    world.submitted.append({"order": 17})
+    messages = saga_terminates(Outcome(world, Store(), Trace()))
+    assert any("submitted but no saga" in m for m in messages)
+
+
+class AcksBeforeTheFirstWrite(Runtime):
+    """Tells the client the order is accepted, then writes it: a crash in between loses it."""
+
+    async def run(self, order, policy, ack=lambda saga_id: None):
+        saga_id = f"saga-{order['order']}"
+        ack(saga_id)
+        await super().submit(order)
+        await self._drive(saga_id, policy)
+
+
+def test_terminates_checks_every_submitted_order_not_only_persisted_rows():
+    lost = run({"crash:durable:sagas#0": 1}, AcksBeforeTheFirstWrite)
+    assert not lost.store.sagas and lost.world.submitted
+    assert fired(lost) == {"saga_terminates"}
+    assert "submitted but no saga" in lost.violations[0].message

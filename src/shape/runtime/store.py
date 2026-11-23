@@ -66,6 +66,9 @@ class Store:
     def put_saga(self, saga: SagaRecord) -> None:
         self._write("sagas", lambda: self.sagas.__setitem__(saga.id, copy.deepcopy(saga)))
 
+    def has_saga(self, saga_id: str) -> bool:
+        return saga_id in self.sagas
+
     def saga(self, saga_id: str) -> SagaRecord:
         return copy.deepcopy(self.sagas[saga_id])
 
