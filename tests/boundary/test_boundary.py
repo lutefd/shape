@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 from scenarios import (
     always_raises,
+    async_never_awaited,
+    async_tool,
     cleanup_probe,
     hangs,
     mail_with_approval,
@@ -221,3 +223,52 @@ def test_parallel_sweep_prints_the_same_report_as_a_serial_one(tmp_path):
     serial = report(1)
     assert "FAIL" in serial
     assert report(4) == serial
+
+
+def test_async_crash_after_fires_after_the_awaited_body_ran(tmp_path):
+    out = run_explicit(async_tool, {"fault:t.apay#0.0": fault("crash_after")}, tmp_path)
+    effects = [e for e in out.entries if e["kind"] == "effect"]
+    assert [(e["inc"], e["fault"]) for e in effects] == [(0, "crash_after")]
+    assert effects[0]["call"].startswith("apay(order='1'")
+    # the body really ran before the process died (a wrapper that faults at coroutine creation
+    # kills the process before the body, so the effect would be logged with no body behind it)
+    assert (out.dir / "apay-body").read_text() == "body ran\n"
+    assert not out.violated("exactly_once(t.apay)")
+
+
+def test_async_crash_before_leaves_no_effect_and_no_body_run(tmp_path):
+    out = run_explicit(async_tool, {"fault:t.apay#0.0": fault("crash_before")}, tmp_path)
+    assert [e for e in out.entries if e["kind"] == "effect"] == []
+    assert not (out.dir / "apay-body").exists()
+
+
+def test_async_after_commit_fault_raises_from_the_await_with_the_body_run(tmp_path):
+    out = run_explicit(async_tool, {"fault:t.apay#0.0": fault("timeout_after_commit")}, tmp_path)
+    effects = [e for e in out.entries if e["kind"] == "effect"]
+    assert [(e["inc"], e["fault"]) for e in effects] == [(0, "timeout_after_commit")]
+    assert (out.dir / "apay-body").read_text() == "body ran\n"
+    assert any(e["kind"] == "error" and "TimeoutError" in e["text"] for e in out.entries)
+
+
+def test_async_before_commit_fault_raises_from_the_await_and_the_body_does_not_run(tmp_path):
+    out = run_explicit(async_tool, {"fault:t.apay#0.0": fault("timeout")}, tmp_path)
+    assert [e for e in out.entries if e["kind"] == "effect"] == []
+    assert not (out.dir / "apay-body").exists()
+    assert any(e["kind"] == "error" and "TimeoutError" in e["text"] for e in out.entries)
+    # incarnation 0 died with the timeout and the restart does not redo it: the effect is lost
+    assert out.violated("exactly_once(t.apay)")
+
+
+def test_a_coroutine_that_is_never_awaited_draws_no_fault_and_records_nothing(tmp_path):
+    out = run_explicit(async_never_awaited, {}, tmp_path)
+    assert out.completed
+    assert [e for e in out.entries if e["kind"] in ("effect", "fault")] == []
+
+
+def test_async_effect_is_the_plain_coroutine_function_outside_a_run():
+    import asyncio
+    import inspect
+
+    from scenarios import apay
+    assert inspect.iscoroutinefunction(apay)
+    assert asyncio.run(apay("9")) == "9"

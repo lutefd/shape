@@ -1,8 +1,10 @@
 """Scenarios the boundary tests run. A separate module so spawned children can import it."""
 
+import asyncio
 import atexit
 import sqlite3
 import time
+from pathlib import Path
 
 import shape
 
@@ -15,6 +17,14 @@ def tool(name: str) -> str:
 @shape.effect("t.pay", scope=lambda order, **_: f"order:{order}")
 def pay(order: str) -> None:
     return None
+
+
+@shape.effect("t.apay", scope=lambda order, **_: f"order:{order}")
+async def apay(order: str, marker: str | None = None) -> str:
+    await asyncio.sleep(0)
+    if marker:  # the body's real side effect, visible even if the process dies right after
+        Path(marker).write_text("body ran\n")
+    return order
 
 
 @shape.effect("t.mail", scope=lambda order, **_: f"order:{order}", irreversible=True)
@@ -82,3 +92,17 @@ def hangs(run: shape.Run) -> None:
 @shape.scenario(max_restarts=1)
 def spawned(run: shape.Run) -> None:
     tool("s")
+
+
+@shape.scenario(invariants=[shape.exactly_once("t.apay")], max_restarts=2)
+def async_tool(run: shape.Run) -> None:
+    """An `async def` effect awaited from an event loop, with progress saved only after it returns."""
+    if run.restarts == 0:
+        asyncio.run(apay("1", str(run.dir / "apay-body")))
+
+
+@shape.scenario(invariants=[], max_restarts=0)
+def async_never_awaited(run: shape.Run) -> None:
+    """Creates the coroutine and drops it: nothing ran, so nothing may be recorded or faulted."""
+    coro = apay("1", str(run.dir / "apay-body"))
+    coro.close()

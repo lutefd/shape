@@ -53,7 +53,7 @@ def test_place_order_is_crash_safe():
 
 ### Effects, scopes and idempotency keys
 
-`@shape.effect(op, scope=, key=, irreversible=, errors=)` marks the function that changes the outside world. Outside a shape run it is the plain function. `scope` and `key` are called with the call's named arguments (defaults applied), so `lambda order_id, **_: ...` works for any signature, methods included.
+`@shape.effect(op, scope=, key=, irreversible=, errors=)` marks the function that changes the outside world. It works on `def` and `async def` functions (an async effect is recorded when the awaited call returns). Outside a shape run it is the plain function. `scope` and `key` are called with the call's named arguments (defaults applied), so `lambda order_id, **_: ...` works for any signature, methods included.
 
 The world log counts real effects, not calls. Calls with the same `op`, `scope` and a non-null `key` are one effect, because the provider dedupes by key; calls without a key each count. This is what lets an idempotent retry pass `at_most_once` while a retry that drops the key fails it. shape trusts the key: a test double that ignores it is a bug in the double.
 
