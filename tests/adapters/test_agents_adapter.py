@@ -362,3 +362,16 @@ def test_agents_adapter_auto_detects_framework_error_string_as_not_landed(tmp_pa
     out = runner.execute(run_converted, {"explicit": {}}, tmp_path / "conv")
     assert [e for e in out.entries if e["kind"] == "effect"] == []
     assert len([e for e in out.entries if e["kind"] == "no_effect"]) >= 1
+
+
+def test_scenario_recovery_redelivers_agents_sdk_input(tmp_path):
+    @shape.scenario(recovery="celery-acks-late", max_restarts=1)
+    def scenario(run):
+        ctx = _Ctx(run.dir / "payments.db")
+        ctx.init_db()
+        shape.agents.drive(_build_agent(), "Please refund order 17.", run, context=ctx)
+
+    spec = {"explicit": {"fault:payments.refund#0.0": _fault("crash_after")}}
+    outcome = runner.execute(scenario, spec, tmp_path)
+    assert outcome.stats["effects"] == {"payments.refund": 2}
+    assert any("harness: Celery redelivered" in line for line in runner.story(outcome.entries)[0])

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ..choices import ChoiceSource
+from . import recovery as recovery_presets
 from .asyncio import BoundaryLoop
 from .faults import (
     AFTER_COMMIT,
@@ -43,6 +44,7 @@ class Run:
     dir: Path
     restarts: int
     seed: int | None = None
+    recovery: str | None = None
 
 
 class HarnessError(BaseException):
@@ -134,6 +136,7 @@ class Scenario:
     concurrent: Sequence[Callable[[Run], None]] = ()
     net: Sequence[Any] | None = None
     strict_scopes: bool = False
+    recovery: str | None = None
 
     def __call__(self, run: Run) -> None:
         self.fn(run)
@@ -143,7 +146,12 @@ def scenario(fn: Callable[[Run], None] | None = None, *, invariants: Sequence[An
              max_restarts: int = 3, actors: Sequence[Actor] = (),
              duplicate_trigger: bool = False, expect_effects: bool = True,
              concurrent: Sequence[Callable[[Run], None]] = (),
-             net: Sequence[Any] | None = None, strict_scopes: bool = False) -> Any:
+             net: Sequence[Any] | None = None, strict_scopes: bool = False,
+             recovery: str | None = None) -> Any:
+    if recovery is not None and recovery not in recovery_presets.PRESETS:
+        choices = ", ".join(recovery_presets.PRESETS)
+        raise ValueError(f"unknown recovery preset {recovery!r}; choose from {choices}")
+
     def wrap(f: Callable[[Run], None]) -> Scenario:
         checks = tuple(invariants)
         fakes = None if net is None else tuple(net)
@@ -155,7 +163,7 @@ def scenario(fn: Callable[[Run], None] | None = None, *, invariants: Sequence[An
         return Scenario(f, f.__name__, checks, max_restarts,
                         inspect.getsourcefile(f) or "", f.__module__, tuple(actors),
                         duplicate_trigger, expect_effects, tuple(concurrent), fakes,
-                        strict_scopes)
+                        strict_scopes, recovery)
     return wrap(fn) if fn is not None else wrap
 
 

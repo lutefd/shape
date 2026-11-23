@@ -93,7 +93,7 @@ def test_duplicate_trigger_is_found_by_seeds_and_shrunk_to_the_delivery(tmp_path
         shape.check(sc.webhook_handler_without_dedup, seeds=300, runs_dir=tmp_path)
     text = str(info.value)
     assert "invariant=at_most_once(t.hook_pay)" in text
-    assert "delivered twice" in text
+    assert "duplicate trigger:" in text
     minimal = [json.loads(f.read_text())["realized"]
                for f in (tmp_path / "webhook_handler_without_dedup").glob("seed-*.min.json")]
     assert {DUPLICATE_KEY: 1} in minimal  # the delivery alone, every injected fault shrunk away

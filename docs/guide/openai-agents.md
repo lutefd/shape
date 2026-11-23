@@ -81,6 +81,8 @@ shape.agents.drive(
 )
 ```
 
+To set a [scenario recovery preset](recovery.md), pass it to `@shape.scenario` and omit the driver's `on_restart=`.
+
 What `shape.agents.drive` handles for you:
 
 - **Distinct session per job by default:** Each `drive()` call in a scenario opens its own `SQLiteSession("shape-job-<n>", str(run.dir / "session.db"))` (`shape-job-0`, `shape-job-1`, ...), so running two independent jobs in one scenario never shares conversation history or causes the second job to skip its tool call. To share a session deliberately across turns (for example a multi-turn conversation), pass the same `session_id="conv-1"` to each `drive()` call (or supply `session_factory=`).
@@ -97,53 +99,27 @@ In [`examples/openai_agents/checks.py`](../../examples/openai_agents/checks.py),
 
 ## 4. Real findings in `examples/openai_agents/` and their fixes
 
-Run from `examples/openai_agents/`:
+Run from the repository root:
 
 ```sh
-cd examples/openai_agents
-.venv/bin/shape test checks.py::refund_unkeyed --seeds 300 --jobs 4
-.venv/bin/shape test checks.py::refund_keyed --seeds 300 --jobs 4
+examples/openai_agents/.venv/bin/shape test examples/openai_agents/checks.py::refund_unkeyed --seeds 300 --jobs 4
+examples/openai_agents/.venv/bin/shape test examples/openai_agents/checks.py::refund_keyed --seeds 300 --jobs 4
 ```
 
 ### Finding 1: Unkeyed refund double-refunds under model repeat, reply loss, and mid-tool crashes (`refund_unkeyed`)
 
-`refund_unkeyed` fails 52 of 300 seeds across 3 distinct causes, all violating `at_most_once(payments.refund)`:
-
-1. **Model choice (33 of 52 failing seeds, 0 faults):** The model repeats `issue_refund` twice in a row.
-2. **Reply lost (14 of 52 failing seeds — `connection_reset_after_commit` and `timeout_after_commit`):** The refund lands, the reply is lost so the SDK hands `"An error occurred while running the tool."` to the model, and the same process retries without a key.
-3. **Crash after commit (5 of 52 failing seeds — `crash_after`):** The process dies mid-tool before `SQLiteSession` saves the turn; on restart, the trace explicitly shows `harness redelivered the request (on_restart='redeliver')` before the second refund lands.
-
-Real output:
+`refund_unkeyed` fails 52 of 300 seeds with a duplicate refund. The same defect can follow model repeat, reply loss, or a crash.
 
 ```text
-scenario=refund_unkeyed  seeds=300 (from 0)  failing=52  wall=8.06s  37 seeds/s
-coverage over 300 seeds:
-  op                landed  attempts
-  payments.refund      362       427
-                   faults injected: client_error 10, connection_reset_after_commit 13, crash_after 18, crash_before 11, rate_limit 16, server_error 11, timeout 17, timeout_after_commit 13
-  model choices taken: after restart: call 1: lookup_order -> 'reissue' x5, call 1: lookup_order -> 'drop' x26, call 1: lookup_order -> 'repeat' x22, call 1: lookup_order -> 'swap' x20, call 2: issue_refund -> 'drop' x24, call 2: issue_refund -> 'repeat' x35, error at call 2: issue_refund -> 'retry_0' x5, error at call 2: issue_refund -> 'retry_2' x3
-  interleaving choices taken: none
-scope assignment:
-  payments.refund: explicit scope= (e.g. 'order:17')
-3 distinct causes across 52 failing seeds
+1 defect across 52 failing seeds
 
-cause 1 of 3: 33 of 52 failing seeds (4, 13, 20, 42, 43, ...)
-  needs: model choice
-FAIL checks.py::refund_unkeyed  seed=4  invariant=at_most_once(payments.refund)
-  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
-  minimized to 3 steps (1 of 1 deviations kept, 2 replays):
-    incarnation 0
-      1. model chose 'repeat' at 'call 2: issue_refund' (nominal: issue_refund(order_id='17', amount_cents=4200))
-      2. issue_refund(order_id='17', amount_cents=4200)
-           effect landed
-      3. issue_refund(order_id='17', amount_cents=4200)
-           effect landed
-      finished
-  replay: runs/refund_unkeyed/seed-4.min.json
-
-cause 2 of 3: 14 of 52 failing seeds (7, 15, 23, 63, 67, ...)
-  needs: reply lost (commit landed, caller saw an error: connection_reset_after_commit, timeout_after_commit)
-FAIL checks.py::refund_unkeyed  seed=7  invariant=at_most_once(payments.refund)
+defect 1 of 1: at_most_once(payments.refund)  op=payments.refund  scope=order:<id>  (52 of 52 failing seeds)
+  model choice: 30 seeds
+  reply lost: 15 seeds (connection_reset_after_commit, timeout_after_commit)
+  crash after commit: 8 seeds (crash_after)
+  before-commit fault: 3 seeds (client_error, rate_limit, server_error)
+  crash before: 1 seed (crash_before)
+FAIL examples/openai_agents/checks.py::refund_unkeyed  seed=7  invariant=at_most_once(payments.refund)
   payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
   minimized to 2 steps (1 of 1 deviations kept, 2 replays):
     incarnation 0
@@ -152,43 +128,27 @@ FAIL checks.py::refund_unkeyed  seed=7  invariant=at_most_once(payments.refund)
       2. issue_refund(order_id='17', amount_cents=4200)
            effect landed
       finished
-  replay: runs/refund_unkeyed/seed-7.min.json
-
-cause 3 of 3: 5 of 52 failing seeds (41, 65, 186, 271, 287)
-  needs: crash after commit (process died after the commit: crash_after)
-FAIL checks.py::refund_unkeyed  seed=41  invariant=at_most_once(payments.refund)
-  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
-  minimized to 2 steps (1 of 2 deviations kept, 5 replays):
-    incarnation 0
-      1. issue_refund(order_id='17', amount_cents=4200)
-           effect landed, then process killed after the effect landed, before the caller saw it
-      -> process died
-    incarnation 1 (restarted)
-      harness redelivered the request (on_restart='redeliver')
-      2. issue_refund(order_id='17', amount_cents=4200)
-           effect landed
-      finished
-  replay: runs/refund_unkeyed/seed-41.min.json
 ```
 
 **Fix (`refund_keyed`):** Pass a stable idempotency key derived from durable business facts (`f"{TICKET}:refund:{order_id}"`, not from a per-call `tool_call_id`). All 300 seeds pass (`failing=0`).
 
 ### Finding 2: Approval alone does not prevent duplicate refunds (`refund_approval_unkeyed`)
 
-With `needs_approval=True`, `approved_before(payments.refund)` holds across every seed, but `refund_approval_unkeyed` still fails `at_most_once(payments.refund)` on 54 of 300 seeds across distinct causes (model repeat, reply lost after commit, crash after commit reloading `paused-run.json`, and `crash_before` + post-restart model reissue).
+With `needs_approval=True`, `approved_before(payments.refund)` holds across every seed, but `refund_approval_unkeyed` still fails `at_most_once(payments.refund)` on 54 of 300 seeds. Triggers include model repeat, a lost reply, and a crash while a saved approval can still be reloaded.
 
 **Fix (`refund_approval_keyed`):** Combine `needs_approval=True` with the stable idempotency key. All 300 seeds pass (`failing=0`).
 
 ### Finding 3: Model substitutes an unauthorized order ID (`refund_wrong_order_unguarded`)
 
-With `alternatives={"order_id": ["18"]}`, `refund_wrong_order_unguarded` fails 20 of 300 seeds with zero injected faults:
+With `alternatives={"order_id": ["18"]}`, `refund_wrong_order_unguarded` fails 20 of 300 seeds. The smallest replay only needs a model choice.
 
 ```text
-cause 1 of 1: 20 of 20 failing seeds (43, 50, 58, 113, 130, ...)
-  needs: model choice
-FAIL checks.py::refund_wrong_order_unguarded  seed=50  invariant=approved_before(payments.refund)
+defect 1 of 1: approved_before(payments.refund)  op=payments.refund  scope=order:<id>  (20 of 20 failing seeds)
+  model choice: 20 seeds
+  crash before: 1 seed (crash_before)
+FAIL examples/openai_agents/checks.py::refund_wrong_order_unguarded  seed=43  invariant=approved_before(payments.refund)
   issue_refund(order_id='18', amount_cents=4200) ran with no earlier approval for scope 'order:18'
-  minimized to 3 steps (1 of 1 deviations kept, 3 replays):
+  minimized to 3 steps (1 of 3 deviations kept, 5 replays):
     incarnation 0
       1. approval recorded for 'order:17'
       2. model chose "substitute order_id='18'" at 'call 2: issue_refund' (nominal: issue_refund(order_id='17', amount_cents=4200))

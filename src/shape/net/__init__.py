@@ -5,9 +5,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import json
-import socket
 import sqlite3
-import ssl
 from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -130,44 +128,23 @@ def _patch(stack, target, name, fn):
     stack.callback(setattr, target, name, original)
 
 
-def _block_network(stack, capture):
-    def denied(*args, **kwargs):
-        capture.reject("net", "shape.net: real network I/O is disabled during capture")
-    for name in ("getaddrinfo", "getnameinfo", "gethostbyname", "gethostbyname_ex", "gethostbyaddr"):
-        _patch(stack, socket, name, denied)
-
-    def internet_only(method):
-        def guard(sock, *args, **kwargs):
-            if sock.family in (socket.AF_INET, socket.AF_INET6):
-                denied()
-            return method(sock, *args, **kwargs)
-        return guard
-
-    for name in ("bind", "listen", "accept", "connect", "connect_ex", "send", "sendall", "sendto",
-                 "sendmsg", "recv", "recv_into", "recvfrom", "recvfrom_into", "recvmsg",
-                 "recvmsg_into"):
-        if hasattr(socket.socket, name):
-            _patch(stack, socket.socket, name, internet_only(getattr(socket.socket, name)))
-    for name in ("send", "sendall", "write", "recv", "recv_into", "read", "do_handshake"):
-        _patch(stack, ssl.SSLSocket, name, internet_only(getattr(ssl.SSLSocket, name)))
-
-
 def _prepare():
-    from . import _http, _mail
+    from . import _http, _mail, _socket
 
     # Warm optional imports in the runner so forks inherit them.
     _http.optional_clients()
-    return _http, _mail
+    _socket.aiohttp_session()
+    return _http, _mail, _socket
 
 
 @contextlib.contextmanager
 def _capture(workdir, fakes):
-    http, mail = _prepare()
+    http, mail, sockets = _prepare()
     capture = _Capture(workdir, fakes)
     with contextlib.ExitStack() as stack:
         http.install(stack, capture)
         mail.install(stack, capture)
-        _block_network(stack, capture)
+        sockets.install(stack, capture, _patch)
         yield
 
 

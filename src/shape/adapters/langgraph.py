@@ -381,11 +381,18 @@ def _static_resume_input(snapshot: Any, reply: Any) -> tuple[bool, Any]:
 _VALID_ON_RESTART = frozenset({"resume", "none", "redeliver"})
 
 
-def _validate_on_restart(on_restart: str | Callable[[Run], Any]) -> None:
+def _restart_policy(run: Run, on_restart: str | Callable[[Run], Any] | None):
+    if on_restart is None:
+        if run.recovery in (None, "langgraph-resume"):
+            return "resume"
+        return "none" if run.recovery == "none" else "redeliver"
+    if run.recovery is not None:
+        raise ValueError("pass recovery= on the scenario or on_restart= to drive, not both")
     if not (callable(on_restart) or on_restart in _VALID_ON_RESTART):
         raise ValueError(
             f"on_restart must be 'resume', 'none', 'redeliver', or a callable; got {on_restart!r}"
         )
+    return on_restart
 
 
 def drive(
@@ -396,12 +403,13 @@ def drive(
     *,
     human: Callable[[Any], Any] | None = None,
     durability: str | None = None,
-    on_restart: str | Callable[[Run], Any] = "resume",
+    on_restart: str | Callable[[Run], Any] | None = None,
 ) -> Any:
     """Drive a compiled LangGraph graph under an explicit restart policy.
 
     - `run.restarts == 0`: calls `graph.invoke(input, config)`.
-    - `run.restarts > 0`, controlled by `on_restart`:
+    - A scenario's `recovery=` selects checkpoint resume or a new invocation with the same input.
+    - Without a scenario preset, `run.restarts > 0` is controlled by `on_restart`:
       - `"resume"` (default): calls `graph.invoke(None, config)` to resume from the checkpointer
         (LangGraph's own checkpoint recovery behavior).
       - `"none"`: does nothing and returns `None` (models an app without a supervisor).
@@ -415,16 +423,17 @@ def drive(
       or `None` -> `invoke(None)`, `False` -> denies pending tool calls or stops, `dict`/`Command`
       -> passed to `invoke`). Raises loudly if no `human=` callback was given or resume stalls.
     """
-    _validate_on_restart(on_restart)
+    policy = _restart_policy(run, on_restart)
     kwargs = {"durability": durability} if durability is not None else {}
     if run.restarts == 0:
         initial = input
-    elif on_restart == "none":
+    elif policy == "none":
         return None
-    elif callable(on_restart):
-        return on_restart(run)
-    elif on_restart == "redeliver":
-        api._note("harness redelivered the request (on_restart='redeliver')")
+    elif callable(policy):
+        return policy(run)
+    elif policy == "redeliver":
+        if run.recovery is None:
+            api._note("harness redelivered the request (on_restart='redeliver')")
         initial = input
     else:
         initial = None
@@ -481,22 +490,23 @@ async def adrive(
     *,
     human: Callable[[Any], Any] | None = None,
     durability: str | None = None,
-    on_restart: str | Callable[[Run], Any] = "resume",
+    on_restart: str | Callable[[Run], Any] | None = None,
 ) -> Any:
     """Async counterpart to `drive`, using `await graph.ainvoke(...)`."""
-    _validate_on_restart(on_restart)
+    policy = _restart_policy(run, on_restart)
     kwargs = {"durability": durability} if durability is not None else {}
     if run.restarts == 0:
         initial = input
-    elif on_restart == "none":
+    elif policy == "none":
         return None
-    elif callable(on_restart):
-        res = on_restart(run)
+    elif callable(policy):
+        res = policy(run)
         if inspect.isawaitable(res):
             res = await res
         return res
-    elif on_restart == "redeliver":
-        api._note("harness redelivered the request (on_restart='redeliver')")
+    elif policy == "redeliver":
+        if run.recovery is None:
+            api._note("harness redelivered the request (on_restart='redeliver')")
         initial = input
     else:
         initial = None

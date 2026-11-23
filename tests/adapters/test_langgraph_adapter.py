@@ -673,3 +673,43 @@ def test_drive_and_adrive_handle_static_interrupt_before_and_after(tmp_path):
 
     out_async = runner.execute(async_static, {"explicit": {}}, tmp_path / "async")
     assert out_async.ok, out_async.violations
+
+
+@pytest.mark.parametrize(("recovery", "starts"), [
+    ("langgraph-resume", 1),
+    ("cron-retick", 2),
+])
+def test_scenario_recovery_selects_checkpoint_resume_or_fresh_input(tmp_path, recovery, starts):
+    class State(TypedDict):
+        job: str
+
+    @shape.effect("jobs.send", scope=lambda: "job:17")
+    def send():
+        pass
+
+    @shape.scenario(recovery=recovery, max_restarts=1)
+    def scenario(run):
+        def prepare(state):
+            with (run.dir / "starts").open("a") as output:
+                output.write(f"{state['job']}\n")
+            return {}
+
+        def execute(state):
+            send()
+            return {}
+
+        builder = StateGraph(State)
+        builder.add_node("prepare", prepare)
+        builder.add_node("execute", execute)
+        builder.add_edge(START, "prepare")
+        builder.add_edge("prepare", "execute")
+        builder.add_edge("execute", END)
+        with SqliteSaver.from_conn_string(str(run.dir / "checkpoints.db")) as saver:
+            shape.langgraph.drive(builder.compile(checkpointer=saver), {"job": "17"},
+                                  {"configurable": {"thread_id": "job-17"}}, run, durability="sync")
+
+    spec = {"explicit": {"fault:jobs.send#0.0": _fault("crash_before")}}
+    outcome = runner.execute(scenario, spec, tmp_path)
+    assert outcome.ok
+    assert (tmp_path / "starts").read_text().splitlines() == ["17"] * starts
+    assert any(f"(recovery={recovery!r})" in line for line in runner.story(outcome.entries)[0])

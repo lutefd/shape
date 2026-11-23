@@ -66,11 +66,11 @@ async def handle(workdir: Path, order_id: str, charge) -> None:
 CHARGE_ONCE = [shape.at_most_once("payments.charge"), shape.exactly_once("payments.charge")]
 
 
-@shape.scenario(invariants=CHARGE_ONCE, max_restarts=3)
+@shape.scenario(invariants=CHARGE_ONCE, max_restarts=3, recovery="cron-retick")
 def async_per_attempt_key(run: shape.Run) -> None:
     asyncio.run(handle(run.dir, "o1", charge_per_attempt_key))
 
 
-@shape.scenario(invariants=CHARGE_ONCE, max_restarts=3)
+@shape.scenario(invariants=CHARGE_ONCE, max_restarts=3, recovery="cron-retick")
 def async_stable_key(run: shape.Run) -> None:
     asyncio.run(handle(run.dir, "o1", charge_stable_key))

@@ -67,6 +67,8 @@ def main() -> int:
              "--seeds", "200", "--runs-dir", str(runs)],
             expect=1,
             must_contain=[
+                "1 defect across 2 failing seeds",
+                "reply lost: 2 seeds",
                 "invariant=at_most_once(payments.charge)",
                 "connection reset after commit",
                 "seed-52.min.json",
@@ -114,6 +116,12 @@ def main() -> int:
                 "invariant=claims_true",
                 "invariant=refund_matches_request",
             ],
+        )
+        run(
+            [*shape_cmd, "test", "docs/guide/examples/async_agent.py::async_per_attempt_key",
+             "--start", "13", "--seeds", "1", "--runs-dir", str(runs)],
+            expect=1,
+            must_contain=["harness: cron re-ticked the job (recovery='cron-retick')"],
         )
         run([*pytest_cmd, "docs/guide/examples/test_async_agent.py"], expect=0)
 

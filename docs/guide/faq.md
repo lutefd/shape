@@ -22,7 +22,7 @@ By default, `shape test` stores artifacts under `runs/<scenario>/`:
 
 - **Passing seeds** are deleted immediately after they pass (along with any stale `seed-<n>` directory from an earlier failing run, and an empty `runs/<scenario>/` directory when all seeds pass).
 - **Failing seeds** keep `runs/<scenario>/seed-<n>/` (world log, realized log, `inc-*.out`, and any SQLite or state files your scenario wrote to `run.dir`).
-- **Minimized causes** also keep `seed-<n>.min/` and `seed-<n>.min.json`.
+- **Minimized seeds** also keep `seed-<n>.min/` and `seed-<n>.min.json`.
 - **Flaky seeds** keep their first failing run directory (`seed-<n>/`); rerun directories are cleaned up.
 - **Replays** write to `runs/<scenario>/replay/`.
 

@@ -124,7 +124,9 @@ incarnation 0
 
 ## Resume policies and assumptions
 
-### `shape.langgraph.drive(graph, input, config, run, *, human=None, durability=None, on_restart="resume")`
+A [scenario recovery preset](guide/recovery.md) controls both the runner and the adapter. Omit `on_restart=` from the driver when using a preset.
+
+### `shape.langgraph.drive(graph, input, config, run, *, human=None, durability=None, on_restart=None)`
 
 - On incarnation 0 (`run.restarts == 0`), calls `graph.invoke(input, config)`.
 - On restarts (`run.restarts > 0`), `on_restart` controls what happens:
@@ -137,7 +139,7 @@ incarnation 0
 - **Loud pause failures:** if the graph pauses with no `human=` callback, `drive` raises `RuntimeError("graph paused before node '<name>'; pass human=... to approve")` (or the dynamic `interrupt()` equivalent) instead of returning as finished. It also raises if resuming leaves the graph stuck at the same checkpoint.
 - `durability` is forwarded only when explicitly passed, so `durability=None` tests LangGraph's own default (`"async"`). `adrive` is the `async` counterpart (supporting the same `on_restart` values, including async callables).
 
-### `shape.agents.drive(agent, input, run, *, context=None, session_id=None, session_factory=None, human=None, context_serializer=None, max_turns=10, on_restart="none")`
+### `shape.agents.drive(agent, input, run, *, context=None, session_id=None, session_factory=None, human=None, context_serializer=None, max_turns=10, on_restart=None)`
 
 - **Distinct session per job by default:** Each `drive()` call in a scenario gets its own `SQLiteSession("shape-job-<n>", str(run.dir / "session.db"))` (`shape-job-0`, `shape-job-1`, ...), so two independent jobs in the same scenario do not share conversation history or skip each other's tool calls. To share a session deliberately across turns, pass the same `session_id="..."` (or `session_factory=...`).
 - **Explicit restart policy (`on_restart`):** The OpenAI Agents SDK does not checkpoint an in-flight tool call inside `Runner.run`, so `drive` never invents supervisor recovery you did not opt into:

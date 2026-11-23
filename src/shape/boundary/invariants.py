@@ -16,16 +16,16 @@ class Violation:
     invariant: str
     message: str
     op: str | None = None
+    scope: str | None = None
 
 
-class _OpMessage(str):
-    """A plain violation message string that also carries the op that violated the invariant."""
+class Finding(str):
+    """A custom invariant message with optional operation and scope for defect grouping."""
 
-    op: str
-
-    def __new__(cls, text: str, op: str) -> Self:
+    def __new__(cls, text: str, *, op: str | None = None, scope: str | None = None) -> Self:
         obj = super().__new__(cls, text)
         obj.op = op
+        obj.scope = scope
         return obj
 
 
@@ -140,11 +140,12 @@ def check_strict_scope(world: World, op: str) -> str | None:
         source = e.get("scope_source")
         if source == "fake_default":
             rule = e.get("scope_rule") or "default"
-            return (f"{op} used the fake's default scope rule ({rule}, e.g. {e['scope']!r}) "
-                    f"under strict_scopes=True; pass an explicit scope= callback to the fake")
+            return Finding(f"{op} used the fake's default scope rule ({rule}, e.g. {e['scope']!r}) "
+                    f"under strict_scopes=True; pass an explicit scope= callback to the fake",
+                           scope=e["scope"])
         if source == "effect_default":
-            return (f"{op} used the default empty scope under strict_scopes=True; pass an "
-                    f"explicit scope= callback to @shape.effect({op!r}, scope=...)")
+            return Finding(f"{op} used the default empty scope under strict_scopes=True; pass an "
+                    f"explicit scope= callback to @shape.effect({op!r}, scope=...)", scope="")
     return None
 
 
@@ -160,7 +161,9 @@ def at_most_once(op: str) -> Invariant:
         if (err := check_strict_scope(world, op)) is not None:
             return err
         if (hit := _repeated(world, op)) is not None:
-            return f"{op} happened {hit[1]} times for {_where(hit[0])} (at most 1 allowed)"
+            scope, count = hit
+            return Finding(f"{op} happened {count} times for {_where(scope)} (at most 1 allowed)",
+                           scope=scope)
         return None
     return Invariant(f"at_most_once({op})", check, (op,), duplicate_sensitive=True)
 
@@ -177,22 +180,26 @@ def exactly_once(op: str, *, failure_claim_ok: bool = False) -> Invariant:
         if (err := check_strict_scope(world, op)) is not None:
             return err
         if (hit := _repeated(world, op)) is not None:
-            return f"{op} happened {hit[1]} times for {_where(hit[0])} (it must happen exactly once)"
+            scope, count = hit
+            return Finding(f"{op} happened {count} times for {_where(scope)} "
+                           "(it must happen exactly once)", scope=scope)
         if world.completed and not world.effects(op):
             if failure_claim_ok:
                 op_claims = [c for c in world.claims if c["op"] == op]
                 pos = [c for c in op_claims if c.get("ok", True)]
                 if pos:
-                    return (f"{op} never happened, but the agent claimed it did for "
-                            f"{_where(pos[0]['scope'])}")
+                    scope = pos[0]["scope"]
+                    return Finding(f"{op} never happened, but the agent claimed it did for "
+                                   f"{_where(scope)}", scope=scope)
                 neg_scopes = {c["scope"] for c in op_claims if not c.get("ok", True)}
                 attempted_scopes = {a["scope"] for a in world.attempts(op)}
                 if attempted_scopes:
                     missing = sorted(attempted_scopes - neg_scopes)
                     if not missing:
                         return None
-                    return (f"{op} never happened for {_where(missing[0])}, and the agent "
-                            f"recorded no failure claim before finishing (a lost effect)")
+                    return Finding(f"{op} never happened for {_where(missing[0])}, and the agent "
+                                   "recorded no failure claim before finishing (a lost effect)",
+                                   scope=missing[0])
                 if neg_scopes:
                     return None
                 return (f"{op} never happened, and the agent recorded no failure claim before "
@@ -215,7 +222,8 @@ def approved_before(op: str, match: Callable[[dict], Any] | None = None) -> Inva
             elif e["kind"] == "effect" and e["op"] == op:
                 digest = args_hash(match(e["args"])) if match else e["args_hash"]
                 if (e["scope"], digest) not in approvals:
-                    return f"{e['call']} ran with no earlier approval for scope {e['scope']!r}"
+                    return Finding(f"{e['call']} ran with no earlier approval for scope "
+                                   f"{e['scope']!r}", scope=e["scope"])
         return None
     return Invariant(f"approved_before({op})", check, (op,))
 
@@ -231,7 +239,8 @@ def requires(op: str, before: str, same_scope: bool = True) -> Invariant:
                 landed.add(e["scope"])
             elif e["op"] == op and not (e["scope"] in landed if same_scope else landed):
                 where = f" for {_where(e['scope'])}" if same_scope else ""
-                return f"{e['call']} happened with no earlier {before} that landed{where}"
+                return Finding(f"{e['call']} happened with no earlier {before} that landed{where}",
+                               scope=e["scope"])
         return None
     return Invariant(f"requires({op}, before={before})", check, (op,))
 
@@ -244,7 +253,8 @@ def within_scopes(op: str, allowed: Any) -> Invariant:
         for e in world.effects(op):
             if e["scope"] not in ok:
                 shown = ", ".join(sorted(map(repr, ok))[:5]) or "none"
-                return f"{e['call']} acted on {e['scope']!r}, outside the allowed scopes ({shown})"
+                return Finding(f"{e['call']} acted on {e['scope']!r}, outside the allowed "
+                               f"scopes ({shown})", scope=e["scope"])
         return None
     return Invariant(f"within_scopes({op})", check, (op,))
 
@@ -261,8 +271,8 @@ def max_calls(op: str, n: int, per_scope: bool = True) -> Invariant:
     def check(world: World) -> str | None:
         for scope, calls in _grouped(world.attempts(op), per_scope).items():
             if len(calls) > n:
-                return (f"{op} was called {len(calls)} times for {_where(scope)}, failed calls "
-                        f"included (at most {n} allowed)")
+                return Finding(f"{op} was called {len(calls)} times for {_where(scope)}, failed calls "
+                               f"included (at most {n} allowed)", scope=scope)
         return None
     return Invariant(f"max_calls({op}, {n})", check, (op,))
 
@@ -273,7 +283,8 @@ def sum_le(op: str, field: str, limit: float, per_scope: bool = True) -> Invaria
         for scope, hits in _grouped(world.effects(op), per_scope).items():
             total = sum(v for e in hits if isinstance(v := e["args"].get(field), int | float))
             if total > limit:
-                return f"{op} {field} added up to {total} for {_where(scope)} (limit {limit})"
+                return Finding(f"{op} {field} added up to {total} for {_where(scope)} (limit {limit})",
+                               scope=scope)
         return None
     return Invariant(f"sum_le({op}.{field}, {limit})", check, (op,))
 
@@ -289,16 +300,16 @@ def claims_true() -> Invariant:
             elif e["kind"] == "claim":
                 present = (e["op"], e["scope"]) in landed
                 if e.get("ok", True) and not present:
-                    return _OpMessage(
+                    return Finding(
                         f"the agent told the user {e['op']} happened for {_where(e['scope'])}, "
                         f"but no such effect had landed",
-                        e["op"],
+                        op=e["op"], scope=e["scope"],
                     )
                 if not e.get("ok", True) and present:
-                    return _OpMessage(
+                    return Finding(
                         f"the agent told the user {e['op']} did not happen for "
                         f"{_where(e['scope'])}, but it had already landed",
-                        e["op"],
+                        op=e["op"], scope=e["scope"],
                     )
         return None
     return Invariant("claims_true", check)
