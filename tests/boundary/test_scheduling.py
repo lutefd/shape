@@ -191,12 +191,36 @@ def test_run_async_reports_an_idle_deadlock(tmp_path):
     @shape.scenario(max_restarts=0, expect_effects=False)
     def deadlocked(run):
         async def main():
+            await asyncio.to_thread(lambda: None)
             await asyncio.get_running_loop().create_future()
 
         shape.run_async(main())
 
     out = execute(deadlocked, {}, tmp_path / "run")
     assert "Deadlock: nothing runnable, no timers" in out.violations[0].message
+
+
+def test_run_async_waits_for_a_user_thread_to_post_back(tmp_path):
+    @shape.scenario(max_restarts=0, expect_effects=False)
+    def scenario(run):
+        async def main():
+            loop = asyncio.get_running_loop()
+            done = loop.create_future()
+
+            def worker():
+                threading.Event().wait(0.12)
+                loop.call_soon_threadsafe(done.set_result, 42)
+
+            thread = threading.Thread(target=worker)
+            thread.start()
+            try:
+                return await done
+            finally:
+                thread.join()
+
+        assert shape.run_async(main()) == 42
+
+    assert execute(scenario, {}, tmp_path / "run").ok
 
 
 def test_failing_scheduled_seed_can_still_be_flaky(tmp_path):

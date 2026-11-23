@@ -161,6 +161,7 @@ class _Context:
         if actor_slot:
             self.token += f"p{actor_slot}"
         self.gate = gate
+        self.watchdog: threading.Timer | None = None
         self.quiet = quiet  # faults have stopped: the recovery incarnation draws nothing
         self.choices = choices
         self.lock = threading.Lock()
