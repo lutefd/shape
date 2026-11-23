@@ -22,8 +22,12 @@ def of_run(world: Any, draws: list[dict]) -> dict:
         else:
             by_kind = faults[d["op"]]
             by_kind[d["fault"]] = by_kind.get(d["fault"], 0) + 1
+    no_effects = Counter(e["op"] for e in world.entries if e["kind"] == "no_effect")
+    harness_errors = Counter(e["text"] for e in world.entries if e["kind"] == "harness_error")
     return {"effects": dict(Counter(e["op"] for e in world.effects())),
             "attempts": dict(Counter(e["op"] for e in world.attempts())),
+            "no_effects": dict(no_effects),
+            "harness_errors": dict(harness_errors),
             "faults": dict(faults), "choices": dict(choices), "schedules": dict(schedules)}
 
 
@@ -32,6 +36,8 @@ class Coverage:
         self.seeds = 0
         self.effects: Counter[str] = Counter()
         self.attempts: Counter[str] = Counter()
+        self.no_effects: Counter[str] = Counter()
+        self.harness_errors: Counter[str] = Counter()
         self.faults: dict[str, Counter[str]] = defaultdict(Counter)
         self.choices: Counter[str] = Counter()
         self.schedules: Counter[str] = Counter()
@@ -40,6 +46,8 @@ class Coverage:
         self.seeds += 1
         self.effects.update(stats["effects"])
         self.attempts.update(stats["attempts"])
+        self.no_effects.update(stats.get("no_effects", {}))
+        self.harness_errors.update(stats.get("harness_errors", {}))
         self.choices.update(stats["choices"])
         self.schedules.update(stats["schedules"])
         for op, by_kind in stats["faults"].items():
@@ -48,6 +56,10 @@ class Coverage:
     @property
     def calls(self) -> int:
         return sum(self.attempts.values())
+
+    @property
+    def landed(self) -> int:
+        return sum(self.effects.values())
 
     def render(self) -> str:
         ops = sorted({*self.effects, *self.attempts, *self.faults})

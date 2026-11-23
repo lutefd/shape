@@ -27,8 +27,10 @@ class Effect:
     irreversible: bool = False
     errors: Mapping[str, Callable[[], Exception]] | None = None
     idempotent: bool = False
-    result: Callable[[Any], Any] | None = None
+    result: Callable[..., Any] | None = None
     hide: Sequence[str] = ()
+    landed: Callable[..., Any] | None = None
+    key_from_result: Callable[..., str | None] | None = None
 
 
 # Every option of `@shape.effect` is a field of `Effect`: unknown keys are rejected against the
@@ -66,6 +68,23 @@ def normalize_effect(tool_name: str, cfg: EffectConfig) -> Effect:
 def make_effect_decorator(spec: Effect) -> Callable:
     return api.effect(spec.op, **{f.name: getattr(spec, f.name)
                                   for f in fields(spec) if f.name != "op"})
+
+
+def compose_landed(
+    is_framework_error: Callable[[Any], bool],
+    user_landed: Callable[..., Any] | None,
+) -> Callable[..., Any]:
+    """Treat framework-converted error results as not landed, then apply any user `landed=`."""
+    if user_landed is None:
+        return lambda value: not is_framework_error(value)
+
+    def _check(value: Any, **kwargs: Any) -> bool:
+        if is_framework_error(value):
+            return False
+        return bool(api._invoke_result_callable(user_landed, value, kwargs))
+
+    _check.__shape_user_fn__ = user_landed  # type: ignore[attr-defined]
+    return _check
 
 
 def _call_text(step: _PendingStep) -> str:

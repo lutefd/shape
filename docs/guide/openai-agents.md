@@ -36,18 +36,15 @@ tools = shape.agents.effects(
 )
 ```
 
-Each entry in `ops` accepts an op string, a dict with any `@shape.effect` option (`op`, `scope`, `key`, `irreversible`, `errors`, `idempotent`, `result`, `hide`), or a `shape.agents.Effect(...)` dataclass.
+Each entry in `ops` accepts an op string, a dict with any `@shape.effect` option (`op`, `scope`, `key`, `key_from_result`, `landed`, `irreversible`, `errors`, `idempotent`, `result`, `hide`), or a `shape.agents.Effect(...)` dataclass.
 
-### What `shape.agents.effects` passes to `scope` and `key`
+### What `shape.agents.effects` passes to hooks
 
-`shape.agents.effects` wraps `FunctionTool.on_invoke_tool`, parses the JSON argument string sent by the model, and passes only those parsed JSON keys to `scope` and `key`.
+`shape.agents.effects` wraps `FunctionTool.on_invoke_tool` and passes both the model's parsed JSON arguments and the Agents SDK `ToolContext` (a `RunContextWrapper`, so `ctx.context` holds your run context state) into `scope`, `key`, `result`, `landed`, and `key_from_result`:
 
-That has two practical consequences today:
-
-- `scope` and `key` do **not** receive `ctx` (`RunContextWrapper`) or omitted Python default parameter values. If your key or scope depends on a ticket ID or tenant ID from `ctx.context`, capture it from the scenario via closure (as `examples/openai_agents/checks.py` does with `refund_key(order_id)`), or decorate your underlying client method with `@shape.effect` directly instead of wrapping the tool.
-- If a tool checks agent state first and returns early without calling the provider, or runs its own retry loop internally, put `@shape.effect` on the client method instead of calling `shape.agents.effects`.
-
-Passing `RunContextWrapper` context into `scope` and `key` from `shape.agents.effects` is planned.
+- Access the `ToolContext` via `ctx`, `context`, or your `@function_tool`'s own leading context parameter name (for example `wrapper`). It is hidden automatically from rendered calls, world log `args`, and `approved_before` hashes.
+- If any hook raises, `shape` raises `shape.HarnessError` (`BaseException`) so the SDK's failure-handling tool invoker never swallows it into `"An error occurred while running the tool."` — the run fails immediately pointing at your lambda.
+- If a tool checks agent state first and returns early or dedupes via state, prefer placing `@shape.effect` on the underlying API client method, or pass `landed=` / `key_from_result=` in `ops`.
 
 ## 2. Perturb the model with `ScriptedModel`
 
@@ -68,7 +65,7 @@ agent = build_agent(model, tools=tools)
 
 On nominal runs (all choices `0`), `ScriptedModel` emits each planned tool call in order and returns `final`. On seeded runs it tests repeat, drop, swap, argument substitution (`alternatives`), retry count after tool errors (`retry_1`, `retry_0`, `retry_2`), and post-restart re-issue.
 
-**Tool error detection:** `ScriptedModel` treats a tool output as an error when it starts with `"An error occurred while running the tool."` (the Agents SDK's default `default_tool_error_function`) or `"Error:"`, and as a rejection when it contains `"not approved"`. If a tool catches exceptions internally and returns a custom dict such as `{"ok": False}`, `ScriptedModel` treats it as success and `shape` records it as a landed effect (a `landed=` predicate on `@shape.effect` is planned).
+**Tool error detection:** `ScriptedModel` treats a tool output as an error when it starts with `"An error occurred while running the tool."` (the Agents SDK's default `default_tool_error_function`) or `"Error:"`, and as a rejection when it contains `"not approved"`. `shape.agents.effects` also auto-detects `"An error occurred while running the tool."` strings as not landed without needing `landed=`. If a tool catches exceptions internally and returns a custom refusal string or dict such as `{"ok": False}`, pass `landed=lambda res: ...` in `ops` so `shape` logs it as `returned without effect`.
 
 ## 3. Drive the agent with `shape.agents.drive`
 
@@ -106,24 +103,25 @@ cd examples/openai_agents
 
 ### Finding 1: Unkeyed refund double-refunds under model repeat, after-commit errors, and mid-tool crashes (`refund_unkeyed`)
 
-`refund_unkeyed` fails 52 of 300 seeds across 4 distinct causes, all violating `at_most_once(payments.refund)`:
+`refund_unkeyed` fails 52 of 300 seeds across 2 distinct causes, both violating `at_most_once(payments.refund)`:
 
-1. **Model repeat (33 of 52 failing seeds, 0 faults):** The model calls `issue_refund` twice in a row.
-2. **After-commit `ConnectionResetError` (7 of 52) and `TimeoutError` (7 of 52):** The refund lands, the tool raises, the Agents SDK hands `"An error occurred while running the tool."` to the model, and the model retries.
-3. **Mid-tool `crash_after` (5 of 52):** The process dies after the refund lands. Because the SDK did not save the in-flight turn to `SQLiteSession`, the restarted incarnation redelivers the customer message and refunds again.
+1. **Model choice (33 of 52 failing seeds, 0 faults):** The model repeats `issue_refund` twice in a row.
+2. **After-commit fault (19 of 52 failing seeds — `connection_reset_after_commit`, `crash_after`, and `timeout_after_commit` grouped together):** The refund lands, the caller never sees the commit (the SDK hands `"An error occurred while running the tool."` to the model, or the process dies mid-tool before `SQLiteSession` saves the turn), and the retry or restarted incarnation refunds again.
 
-Real output for causes 1 and 4:
+Real output:
 
 ```text
-scenario=refund_unkeyed  seeds=300 (from 0)  failing=52  wall=12.29s  24 seeds/s
+scenario=refund_unkeyed  seeds=300 (from 0)  failing=52  wall=16.67s  18 seeds/s
 coverage over 300 seeds:
   op                landed  attempts
   payments.refund      362       427
                    faults injected: client_error 10, connection_reset_after_commit 13, crash_after 18, crash_before 11, rate_limit 16, server_error 11, timeout 17, timeout_after_commit 13
   model choices taken: after restart: call 1: lookup_order -> 'reissue' x5, call 1: lookup_order -> 'drop' x26, call 1: lookup_order -> 'repeat' x22, call 1: lookup_order -> 'swap' x20, call 2: issue_refund -> 'drop' x24, call 2: issue_refund -> 'repeat' x35, error at call 2: issue_refund -> 'retry_0' x5, error at call 2: issue_refund -> 'retry_2' x3
-4 distinct causes across 52 failing seeds
+  interleaving choices taken: none
+2 distinct causes across 52 failing seeds
 
-cause 1 of 4: 33 of 52 failing seeds (4, 13, 20, 42, 43, ...)
+cause 1 of 2: 33 of 52 failing seeds (4, 13, 20, 42, 43, ...)
+  needs: model choice
 FAIL checks.py::refund_unkeyed  seed=4  invariant=at_most_once(payments.refund)
   payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
   minimized to 3 steps (1 of 1 deviations kept, 3 replays):
@@ -134,28 +132,27 @@ FAIL checks.py::refund_unkeyed  seed=4  invariant=at_most_once(payments.refund)
       3. issue_refund(order_id='17', amount_cents=4200)
            effect landed
       finished
-```
+  replay: runs/refund_unkeyed/seed-4.min.json
 
-```text
-cause 4 of 4: 5 of 52 failing seeds (41, 65, 186, 271, 287)
-FAIL checks.py::refund_unkeyed  seed=41  invariant=at_most_once(payments.refund)
+cause 2 of 2: 19 of 52 failing seeds (7, 15, 23, 41, 63, ...)
+  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, crash_after, timeout_after_commit)
+FAIL checks.py::refund_unkeyed  seed=7  invariant=at_most_once(payments.refund)
   payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
-  minimized to 2 steps (1 of 2 deviations kept, 5 replays):
+  minimized to 2 steps (1 of 1 deviations kept, 3 replays):
     incarnation 0
       1. issue_refund(order_id='17', amount_cents=4200)
-           effect landed, then process killed after the effect landed, before the caller saw it
-      -> process died
-    incarnation 1 (restarted)
+           effect landed, then connection reset after commit: the caller saw ConnectionResetError
       2. issue_refund(order_id='17', amount_cents=4200)
            effect landed
       finished
+  replay: runs/refund_unkeyed/seed-7.min.json
 ```
 
 **Fix (`refund_keyed`):** Pass a stable idempotency key derived from durable business facts (`f"{TICKET}:refund:{order_id}"`, not from a per-call `tool_call_id`). All 300 seeds pass (`failing=0`).
 
 ### Finding 2: Approval alone does not prevent duplicate refunds (`refund_approval_unkeyed`)
 
-With `needs_approval=True`, `approved_before(payments.refund)` holds across every seed, but `refund_approval_unkeyed` still fails `at_most_once(payments.refund)` on 54 of 300 seeds (including `crash_after`, where reloading `paused-run.json` executes the approved refund a second time, matching the SDK's own human-in-the-loop documentation).
+With `needs_approval=True`, `approved_before(payments.refund)` holds across every seed, but `refund_approval_unkeyed` still fails `at_most_once(payments.refund)` on 54 of 300 seeds across 3 distinct causes (model repeat, after-commit faults including `crash_after` reloading `paused-run.json`, and `crash_before` + post-restart model reissue).
 
 **Fix (`refund_approval_keyed`):** Combine `needs_approval=True` with the stable idempotency key. All 300 seeds pass (`failing=0`).
 
@@ -165,6 +162,7 @@ With `alternatives={"order_id": ["18"]}`, `refund_wrong_order_unguarded` fails 2
 
 ```text
 cause 1 of 1: 20 of 20 failing seeds (43, 50, 58, 113, 130, ...)
+  needs: model choice
 FAIL checks.py::refund_wrong_order_unguarded  seed=50  invariant=approved_before(payments.refund)
   issue_refund(order_id='18', amount_cents=4200) ran with no earlier approval for scope 'order:18'
   minimized to 3 steps (1 of 1 deviations kept, 3 replays):

@@ -2,6 +2,7 @@
 
 from .api import (
     Actor,
+    HarnessError,
     Run,
     Scenario,
     actor,
@@ -27,11 +28,12 @@ from .invariants import (
     sum_le,
     within_scopes,
 )
-from .runner import check
+from .runner import check, replay
 
 __all__ = [
     "Actor",
     "ClientError",
+    "HarnessError",
     "RateLimited",
     "Run",
     "Scenario",
@@ -50,6 +52,7 @@ __all__ = [
     "invariant",
     "max_calls",
     "point",
+    "replay",
     "requires",
     "run_async",
     "scenario",

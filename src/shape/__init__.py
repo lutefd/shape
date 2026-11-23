@@ -3,6 +3,7 @@
 from .boundary import (
     Actor,
     ClientError,
+    HarnessError,
     RateLimited,
     Run,
     ServerError,
@@ -20,6 +21,7 @@ from .boundary import (
     invariant,
     max_calls,
     point,
+    replay,
     requires,
     run_async,
     scenario,
@@ -31,6 +33,7 @@ from .boundary import (
 __all__ = [
     "Actor",
     "ClientError",
+    "HarnessError",
     "RateLimited",
     "Run",
     "ServerError",
@@ -48,6 +51,7 @@ __all__ = [
     "invariant",
     "max_calls",
     "point",
+    "replay",
     "requires",
     "run_async",
     "scenario",

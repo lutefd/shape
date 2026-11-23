@@ -6,18 +6,19 @@ import asyncio
 import json
 import sqlite3
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Annotated, Literal, TypedDict
 
 import pytest
 
 pytest.importorskip("langgraph")
 pytest.importorskip("langgraph.checkpoint.sqlite")
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, StructuredTool, tool
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import InjectedState, ToolNode, ToolRuntime, tools_condition
 from langgraph.types import Command, interrupt
 
 import shape
@@ -399,3 +400,276 @@ def test_drive_interrupt_with_shape_choose_human_callback(tmp_path):
     out = runner.execute(missing_human, {"explicit": {}}, tmp_path / "missing")
     assert not out.completed
     assert any("no human=" in e.get("text", "") for e in out.entries if e["kind"] == "error")
+
+
+def test_langgraph_adapter_passes_config_injected_state_runtime_and_handles_tool_errors(tmp_path):
+    @tool
+    def plain_with_cfg(order_id: str) -> str:
+        """Tool that does NOT declare config, yet scope/key read config."""
+        return json.dumps({"case_id": f"CMP-{order_id}"})
+
+    @tool
+    def stateful_tool(
+        order_id: str,
+        state: Annotated[dict, InjectedState],
+        config: RunnableConfig,
+        runtime: ToolRuntime,
+    ) -> str:
+        """Tool declaring InjectedState, RunnableConfig, and ToolRuntime."""
+        assert isinstance(state, dict) and "messages" in state
+        assert config["configurable"]["thread_id"] == "th-42"
+        assert runtime.config["configurable"]["thread_id"] == "th-42"
+        return f"ok:{order_id}"
+
+    @tool
+    def returns_error_message(order_id: str) -> ToolMessage:
+        """Returns a LangChain ToolMessage(status='error') directly."""
+        return ToolMessage(
+            content=f"cannot process {order_id}",
+            tool_call_id="call_3",
+            name="returns_error_message",
+            status="error",
+        )
+
+    wrapped = shape.langgraph.effects(
+        [plain_with_cfg, stateful_tool, returns_error_message],
+        ops={
+            "plain_with_cfg": {
+                "op": "cases.open",
+                "scope": lambda config, order_id, **_: (
+                    f"{config['configurable']['thread_id']}:{order_id}"
+                ),
+                "key_from_result": lambda res, config, **_: (
+                    f"{config['configurable']['thread_id']}:{json.loads(res)['case_id']}"
+                ),
+            },
+            "stateful_tool": {
+                "op": "orders.update",
+                "scope": lambda state, runtime, order_id, **_: (
+                    f"{runtime.config['configurable']['thread_id']}:{len(state['messages'])}:{order_id}"
+                ),
+            },
+            "returns_error_message": {
+                "op": "orders.fail_msg",
+                "scope": lambda order_id, **_: f"order:{order_id}",
+            },
+        },
+    )
+    model = shape.langgraph.ScriptedChatModel(
+        [
+            ("plain_with_cfg", {"order_id": "17"}),
+            ("plain_with_cfg", {"order_id": "17"}),
+            ("stateful_tool", {"order_id": "17"}),
+            ("returns_error_message", {"order_id": "17"}),
+        ],
+        final="done",
+    ).bind_tools(wrapped)
+
+    @shape.scenario(
+        invariants=[
+            shape.at_most_once("cases.open"),
+            shape.exactly_once("orders.update"),
+            shape.at_most_once("orders.fail_msg"),
+        ],
+        max_restarts=0,
+    )
+    def run_all(run: shape.Run) -> None:
+        b = StateGraph(MessagesState)
+        b.add_node("agent", lambda s: {"messages": [model.invoke(s["messages"])]})
+        b.add_node("tools", ToolNode(wrapped, handle_tool_errors=True))
+        b.add_edge(START, "agent")
+        b.add_conditional_edges("agent", tools_condition)
+        b.add_edge("tools", "agent")
+        shape.langgraph.drive(
+            b.compile(),
+            {"messages": [HumanMessage(content="go")]},
+            {"configurable": {"thread_id": "th-42"}},
+            run,
+        )
+
+    out = runner.execute(run_all, {"explicit": {}}, tmp_path / "ctx")
+    assert out.ok, out.violations
+    open_effects = [e for e in out.entries if e["kind"] == "effect" and e["op"] == "cases.open"]
+    assert len(open_effects) == 2
+    assert open_effects[0]["scope"] == "th-42:17"
+    assert open_effects[0]["key"] == "th-42:CMP-17"
+    upd_effect = next(
+        e for e in out.entries if e["kind"] == "effect" and e["op"] == "orders.update"
+    )
+    assert upd_effect["scope"].startswith("th-42:")
+    # InjectedState / ToolRuntime / RunnableConfig must be hidden from call and args
+    assert "state" not in upd_effect["args"] and "runtime" not in upd_effect["args"]
+    assert "config" not in upd_effect["args"]
+    # ToolMessage(status="error") auto-detected as not landed without user writing landed=
+    assert [e for e in out.entries if e["kind"] == "effect" and e["op"] == "orders.fail_msg"] == []
+    assert len(
+        [e for e in out.entries if e["kind"] == "no_effect" and e["op"] == "orders.fail_msg"]
+    ) >= 1
+
+    # Harness error in scope= must NOT be swallowed by ToolNode(handle_tool_errors=True)
+    bad_wrapped = shape.langgraph.effects(
+        [plain_with_cfg],
+        ops={"plain_with_cfg": {"op": "cases.open", "scope": lambda nope: nope}},
+    )
+    bad_model = shape.langgraph.ScriptedChatModel(
+        [("plain_with_cfg", {"order_id": "17"})], final="done"
+    ).bind_tools(bad_wrapped)
+
+    @shape.scenario(invariants=[shape.at_most_once("cases.open")], max_restarts=2)
+    def bad_scope(run: shape.Run) -> None:
+        b = StateGraph(MessagesState)
+        b.add_node("agent", lambda s: {"messages": [bad_model.invoke(s["messages"])]})
+        b.add_node("tools", ToolNode(bad_wrapped, handle_tool_errors=True))
+        b.add_edge(START, "agent")
+        b.add_conditional_edges("agent", tools_condition)
+        b.add_edge("tools", "agent")
+        shape.langgraph.drive(
+            b.compile(),
+            {"messages": [HumanMessage(content="go")]},
+            {"configurable": {"thread_id": "th-42"}},
+            run,
+        )
+
+    out_bad = runner.execute(bad_scope, {"explicit": {}}, tmp_path / "bad_scope")
+    assert not out_bad.ok
+    assert out_bad.violations[0].invariant == "harness_error"
+    assert "your scope for cases.open raised TypeError:" in out_bad.violations[0].message
+    assert "test_langgraph_adapter.py:" in out_bad.violations[0].message
+
+
+def test_drive_and_adrive_handle_static_interrupt_before_and_after(tmp_path):
+    @tool
+    def send_refund(order_id: str) -> str:
+        """Issue a refund."""
+        return f"refunded:{order_id}"
+
+    def build_static_graph(cp, *, interrupt_before=None, interrupt_after=None):
+        wrapped = shape.langgraph.effects(
+            [send_refund],
+            ops={
+                "send_refund": {
+                    "op": "payments.refund",
+                    "scope": lambda order_id, **_: f"order:{order_id}",
+                    "key": lambda order_id, **_: f"k:{order_id}",
+                }
+            },
+        )
+        model = shape.langgraph.ScriptedChatModel(
+            [("send_refund", {"order_id": "17"})], final="done"
+        ).bind_tools(wrapped)
+        b = StateGraph(MessagesState)
+        b.add_node("agent", lambda s: {"messages": [model.invoke(s["messages"])]})
+        b.add_node("sensitive_tools", ToolNode(wrapped))
+        b.add_edge(START, "agent")
+        b.add_conditional_edges(
+            "agent", tools_condition, {"tools": "sensitive_tools", END: END}
+        )
+        b.add_edge("sensitive_tools", "agent")
+        return b.compile(
+            checkpointer=cp,
+            interrupt_before=interrupt_before,
+            interrupt_after=interrupt_after,
+        )
+
+    # 1. Missing human= fails loudly instead of returning as finished
+    @shape.scenario(invariants=[shape.at_most_once("payments.refund")], max_restarts=0)
+    def missing_human_static(run: shape.Run) -> None:
+        with SqliteSaver.from_conn_string(str(run.dir / "ckpt.db")) as cp:
+            g = build_static_graph(cp, interrupt_before=["sensitive_tools"])
+            shape.langgraph.drive(
+                g,
+                {"messages": [HumanMessage(content="refund 17")]},
+                {"configurable": {"thread_id": "t1"}},
+                run,
+            )
+
+    out_missing = runner.execute(missing_human_static, {"explicit": {}}, tmp_path / "missing")
+    assert not out_missing.completed
+    assert any(
+        "graph paused before node 'sensitive_tools'; pass human=... to approve" in e.get("text", "")
+        for e in out_missing.entries
+        if e["kind"] == "error"
+    )
+
+    # 2. Approved via human(snapshot) -> resumes and completes (for both interrupt_before and after)
+    for label, kw in [
+        ("before", {"interrupt_before": ["sensitive_tools"]}),
+        ("after", {"interrupt_after": ["agent"]}),
+    ]:
+        @shape.scenario(
+            invariants=[
+                shape.approved_before("payments.refund"),
+                shape.exactly_once("payments.refund"),
+            ],
+            max_restarts=2,
+        )
+        def approved_static(run: shape.Run, _kw=kw) -> None:
+            with SqliteSaver.from_conn_string(str(run.dir / "ckpt.db")) as cp:
+                g = build_static_graph(cp, **_kw)
+
+                def human(snapshot) -> bool:
+                    if "sensitive_tools" in snapshot.next:
+                        tc = snapshot.values["messages"][-1].tool_calls[0]
+                        shape.approval(f"order:{tc['args']['order_id']}", tc["args"])
+                    return True
+
+                shape.langgraph.drive(
+                    g,
+                    {"messages": [HumanMessage(content="refund 17")]},
+                    {"configurable": {"thread_id": "t1"}},
+                    run,
+                    human=human,
+                    durability="sync",
+                )
+
+        out_ok = runner.execute(approved_static, {"explicit": {}}, tmp_path / f"ok_{label}")
+        assert out_ok.ok, out_ok.violations
+        # Crash right after sensitive_tools commits -> restarts cleanly
+        out_crash = runner.execute(
+            approved_static,
+            {"explicit": {"fault:payments.refund#0.0": _fault("crash_after")}},
+            tmp_path / f"crash_{label}",
+        )
+        assert out_crash.ok, out_crash.violations
+
+    # 3. Rejected via human=lambda snap: False -> denies tool call, effect never lands
+    @shape.scenario(
+        invariants=[shape.approved_before("payments.refund")],
+        max_restarts=0,
+        expect_effects=False,
+    )
+    def rejected_static(run: shape.Run) -> None:
+        with SqliteSaver.from_conn_string(str(run.dir / "ckpt.db")) as cp:
+            g = build_static_graph(cp, interrupt_before=["sensitive_tools"])
+            res = shape.langgraph.drive(
+                g,
+                {"messages": [HumanMessage(content="refund 17")]},
+                {"configurable": {"thread_id": "t1"}},
+                run,
+                human=lambda _snap: False,
+                durability="sync",
+            )
+            assert "not approved" in res["messages"][-1].content
+
+    out_rej = runner.execute(rejected_static, {"explicit": {}}, tmp_path / "rej")
+    assert out_rej.ok, out_rej.violations
+    assert [e for e in out_rej.entries if e["kind"] == "effect"] == []
+
+    # 4. Async adrive handles static interrupt_before too
+    @shape.scenario(invariants=[shape.exactly_once("payments.refund")], max_restarts=0)
+    def async_static(run: shape.Run) -> None:
+        from langgraph.checkpoint.memory import MemorySaver
+
+        g = build_static_graph(MemorySaver(), interrupt_before=["sensitive_tools"])
+        asyncio.run(
+            shape.langgraph.adrive(
+                g,
+                {"messages": [HumanMessage(content="refund 17")]},
+                {"configurable": {"thread_id": "t1"}},
+                run,
+                human=lambda _snap: True,
+            )
+        )
+
+    out_async = runner.execute(async_static, {"explicit": {}}, tmp_path / "async")
+    assert out_async.ok, out_async.violations

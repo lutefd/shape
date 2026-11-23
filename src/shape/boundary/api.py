@@ -4,12 +4,15 @@ that every wrapped call goes through."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import functools
 import inspect
 import os
 import threading
+import traceback
 from collections import Counter, deque
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +45,41 @@ class Run:
     seed: int | None = None
 
 
+class HarnessError(BaseException):
+    """A user-supplied shape hook (`scope`, `key`, `result`, `landed`, `key_from_result`) raised.
+
+    Subclasses `BaseException` rather than `Exception` so agent frameworks (Agents SDK error
+    handlers, LangGraph `ToolNode(handle_tool_errors=True)`) cannot swallow it as a tool failure.
+    """
+
+    def __init__(self, hook: str, op: str, message: str) -> None:
+        self.hook = hook
+        self.op = op
+        super().__init__(message)
+
+
+_extra_context: contextvars.ContextVar[Mapping[str, Any] | None] = contextvars.ContextVar(
+    "shape_extra_context", default=None
+)
+
+
+@contextlib.contextmanager
+def with_context(extra: Mapping[str, Any] | None) -> Iterator[None]:
+    """Attach adapter-level framework context (e.g. Agents SDK `ctx`, LangGraph `config`) to the
+    current call so `scope`, `key`, `result`, `landed`, and `key_from_result` receive it without
+    changing the tool's signature or rendered call."""
+    if not extra:
+        yield
+        return
+    prev = _extra_context.get()
+    merged = {**(prev or {}), **extra}
+    token = _extra_context.set(merged)
+    try:
+        yield
+    finally:
+        _extra_context.reset(token)
+
+
 @dataclass(frozen=True)
 class EffectSpec:
     op: str
@@ -50,8 +88,10 @@ class EffectSpec:
     irreversible: bool
     errors: Mapping[str, Callable[[], Exception]]
     idempotent: bool = False
-    result: Callable[[Any], Any] | None = None
+    result: Callable[..., Any] | None = None
     hide: frozenset[str] = frozenset()
+    landed: Callable[..., Any] | None = None
+    key_from_result: Callable[..., str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -134,15 +174,95 @@ def _callback_name(handle: asyncio.Handle) -> str:
     return getattr(callback, "__qualname__", type(callback).__name__)
 
 
-def _result(spec: EffectSpec, value: Any) -> Any:
-    """What the effect returned to the world, as `result=` describes it. A `result=` that raises
-    must not lose an effect that already landed, so its error is logged in its place."""
-    if spec.result is None:
-        return None
+def _fn_location(fn: Callable, exc: BaseException) -> str:
+    """Point at the user's hook (`file.py:42`): traceback frame inside the hook if it ran, else
+    the hook's definition line (for signature TypeErrors before the body enters)."""
+    target = getattr(fn, "__shape_user_fn__", fn)
+    tb = traceback.extract_tb(exc.__traceback__)
+    for frame in reversed(tb):
+        if frame.filename != __file__ and not frame.filename.endswith(
+            ("adapters/_plan.py", "adapters/agents.py", "adapters/langgraph.py")
+        ):
+            return f" ({Path(frame.filename).name}:{frame.lineno})"
     try:
-        return spec.result(value)
-    except Exception as exc:  # noqa: BLE001 - the user's callable; the effect is logged regardless
-        return f"<result= raised {type(exc).__name__}: {exc}>"
+        src = inspect.getsourcefile(target)
+        _, lineno = inspect.getsourcelines(target)
+        if src:
+            return f" ({Path(src).name}:{lineno})"
+    except (OSError, TypeError):
+        pass
+    return ""
+
+
+def _invoke_args_callable(fn: Callable, named: Mapping[str, Any], extra: Mapping[str, Any]) -> Any:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(**named)
+    params = sig.parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return fn(**{**extra, **named})
+    call_kw = dict(named)
+    for k, v in extra.items():
+        if k in params and k not in call_kw:
+            call_kw[k] = v
+    return fn(**call_kw)
+
+
+def _invoke_result_callable(fn: Callable, value: Any, all_args: Mapping[str, Any]) -> Any:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(value)
+    params = list(sig.parameters.values())
+    has_varkw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+    first_name = (
+        params[0].name
+        if params and params[0].kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        else None
+    )
+    if has_varkw:
+        kw = {k: v for k, v in all_args.items() if k != first_name}
+        return fn(value, **kw)
+    start = 1 if params and params[0].kind in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.VAR_POSITIONAL,
+    ) else 0
+    extra_names = [
+        p.name
+        for p in params[start:]
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    ]
+    if extra_names:
+        kw = {k: all_args[k] for k in extra_names if k in all_args}
+        return fn(value, **kw)
+    return fn(value)
+
+
+def _harness_fail(ctx: _Context, hook: str, fn: Callable, op: str, exc: Exception) -> None:
+    msg = f"your {hook} for {op} raised {type(exc).__name__}: {exc}{_fn_location(fn, exc)}"
+    ctx.append(ctx.world, {"kind": "harness_error", "op": op, "hook": hook, "text": msg})
+    raise HarnessError(hook, op, msg) from exc
+
+
+def _call_args_hook(ctx: _Context, hook: str, fn: Callable, op: str,
+                    named: Mapping[str, Any], extra: Mapping[str, Any]) -> Any:
+    try:
+        return _invoke_args_callable(fn, named, extra)
+    except Exception as exc:  # noqa: BLE001 - user hook error must fail loudly, never silently
+        _harness_fail(ctx, hook, fn, op, exc)
+
+
+def _call_result_hook(ctx: _Context, hook: str, fn: Callable, op: str,
+                      value: Any, all_args: Mapping[str, Any]) -> Any:
+    try:
+        return _invoke_result_callable(fn, value, all_args)
+    except Exception as exc:  # noqa: BLE001 - user hook error must fail loudly, never silently
+        _harness_fail(ctx, hook, fn, op, exc)
 
 
 class _Context:
@@ -230,14 +350,22 @@ class _Context:
             if self.gate:
                 self.gate.point(fn.__qualname__)
             return None  # let the real function raise its own error
+        extra = _extra_context.get() or {}
+        all_args = {**extra, **named}
         hidden = HIDDEN_ARGS | spec.hide
         shown = {k: v for k, v in named.items() if k not in hidden}
         label = fn.__qualname__.rsplit("<locals>.", 1)[-1]
         call = f"{label}({', '.join(f'{k}={_short(v)}' for k, v in shown.items())})"
         if self.gate:
             self.gate.point(call)
-        scope = spec.scope(**named) if spec.scope else ""
-        key = spec.key(**named) if spec.key else None
+        scope = (
+            _call_args_hook(self, "scope", spec.scope, spec.op, named, extra)
+            if spec.scope else ""
+        )
+        key = (
+            _call_args_hook(self, "key", spec.key, spec.op, named, extra)
+            if spec.key else None
+        )
         with self.lock:
             n = self.counts[spec.op]
             self.counts[spec.op] += 1
@@ -257,15 +385,34 @@ class _Context:
             os._exit(CRASH_EXIT)
         if error is not None and fault not in AFTER_COMMIT:
             raise error
-        return spec, shown, call, scope, key, fault, error
+        return spec, shown, all_args, call, scope, key, fault, error
 
     def after(self, pending: tuple, value: Any) -> None:
         """Record the effect that just landed, then apply the faults that fire after it."""
-        spec, shown, call, scope, key, fault, error = pending
+        spec, shown, all_args, call, scope, key, fault, error = pending
+        if spec.landed is not None:
+            is_landed = bool(
+                _call_result_hook(self, "landed", spec.landed, spec.op, value, all_args)
+            )
+            if not is_landed:
+                self.append(self.world, {
+                    "kind": "no_effect", "op": spec.op, "scope": scope, "call": call,
+                })
+                return
+        if key is None and spec.key_from_result is not None:
+            derived = _call_result_hook(
+                self, "key_from_result", spec.key_from_result, spec.op, value, all_args
+            )
+            if derived is not None:
+                key = derived
+        res = (
+            _call_result_hook(self, "result", spec.result, spec.op, value, all_args)
+            if spec.result is not None else None
+        )
         self.append(self.world, {
             "kind": "effect", "op": spec.op, "scope": scope, "key": key, "call": call,
             "irreversible": spec.irreversible, "idempotent": spec.idempotent, "args": shown,
-            "args_hash": args_hash(shown), "result": _result(spec, value),
+            "args_hash": args_hash(shown), "result": res,
             "fault": fault, "raised": type(error).__name__ if error else None})
         if fault == "crash_after":
             os._exit(CRASH_EXIT)
@@ -326,21 +473,25 @@ def run_async[T](coro: Coroutine[Any, Any, T]) -> T:
 def effect(op: str, *, scope: Callable[..., str] | None = None,
            key: Callable[..., str | None] | None = None, irreversible: bool = False,
            errors: Mapping[str, Callable[[], Exception]] | None = None,
-           idempotent: bool = False, result: Callable[[Any], Any] | None = None,
-           hide: Sequence[str] = ()) -> Callable:
+           idempotent: bool = False, result: Callable[..., Any] | None = None,
+           hide: Sequence[str] = (), landed: Callable[..., Any] | None = None,
+           key_from_result: Callable[..., str | None] | None = None) -> Callable:
     """Mark a side-effecting function (sync or `async def`). Outside a shape run it is the plain
     function.
 
     `scope` names the business thing the effect applies to. `key` returns the idempotency key
     the call carries: effects with the same op, scope and key are one effect, because the
-    provider dedupes them. `idempotent=True` makes repeating a call with the same scope and
+    provider dedupes them. `key_from_result` derives a dedupe key from the return value (for tools
+    that dedupe via state and return the same resource id on a repeat call). `landed` inspects the
+    return value and returns False when the call returned without side effect (e.g. a refusal
+    string or error dict). `idempotent=True` makes repeating a call with the same scope and
     arguments one effect (a PUT-style write). `result` maps the return value to what the world
     log records as the effect's `result`, for invariants to read. `hide` names more arguments to
     leave out of the rendered call, on top of the ones frameworks inject. `errors` maps a fault
     name to a zero-argument exception factory.
     """
     spec = EffectSpec(op, scope, key, irreversible, dict(errors or {}), idempotent, result,
-                      frozenset(hide))
+                      frozenset(hide), landed, key_from_result)
 
     def wrap(fn: Callable) -> Callable:
         sig = inspect.signature(fn)
@@ -386,14 +537,17 @@ def choose(label: str, options: Sequence[Any], weights: Sequence[float] | None =
     return options[ctx.choose(label, options, weights, nominal)]
 
 
-def claim(scope: str, op: str) -> None:
-    """Record that the agent told the user `op` happened for `scope` ("I've refunded order 17").
+def claim(scope: str, op: str, *, ok: bool = True) -> None:
+    """Record what the agent told the user about `op` for `scope`.
 
-    Call it where the agent makes the statement. `shape.claims_true()` checks every claim has
-    a matching effect."""
+    `ok=True` (default): "I've refunded order 17" — `shape.claims_true()` checks an effect landed.
+    `ok=False`: "I couldn't refund order 17" — `shape.claims_true()` checks no effect landed, and
+    `shape.exactly_once(op, failure_claim_ok=True)` accepts a lost effect when the agent explicitly
+    reported failure for that scope.
+    """
     ctx = _active
     if ctx is not None:
-        ctx.append(ctx.world, {"kind": "claim", "scope": scope, "op": op})
+        ctx.append(ctx.world, {"kind": "claim", "scope": scope, "op": op, "ok": bool(ok)})
 
 
 def approval(scope: str, args: Mapping[str, Any] | None = None) -> None:

@@ -33,6 +33,7 @@ except ImportError as exc:  # pragma: no cover - verified by missing-dep test
         "shape.agents requires openai-agents; install with: pip install 'agent-shape[agents]'"
     ) from exc
 
+from ..boundary import api
 from ..boundary.api import Run
 from ._plan import (
     Call,
@@ -45,6 +46,7 @@ from ._plan import (
     HistoryUser,
     PlanRunner,
     PlanStep,
+    compose_landed,
     make_effect_decorator,
     normalize_effect,
 )
@@ -65,9 +67,35 @@ def _parse_json_args(raw: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _is_error_result(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(_DEFAULT_TOOL_ERROR)
+
+
+def _context_param_name(tool: FunctionTool) -> str | None:
+    """If the underlying `@function_tool` callable declares a leading context parameter
+    (`RunContextWrapper` / `ToolContext`), return its name so hooks can refer to it directly."""
+    invoker = tool.on_invoke_tool
+    if isinstance(invoker, _FailureHandlingFunctionToolInvoker):
+        raw = getattr(invoker._invoke_tool_impl, _FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER, None)
+    else:
+        raw = getattr(invoker, _FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER, None)
+    if not callable(raw):
+        return None
+    try:
+        params = list(inspect.signature(raw).parameters.values())
+    except (TypeError, ValueError):
+        return None
+    if not params:
+        return None
+    first = params[0].name
+    props = (tool.params_json_schema or {}).get("properties") or {}
+    return first if first not in props else None
+
+
 def _wrap_function_tool(tool: FunctionTool, dec: Callable) -> FunctionTool:
     tool_name = tool.name
     invoker = tool.on_invoke_tool
+    ctx_param = _context_param_name(tool)
 
     def make_impl(raw_impl: Callable[[Any, str], Any]) -> Callable[[Any, str], Any]:
         async def wrapped_impl(ctx: Any, input: str) -> Any:
@@ -80,7 +108,11 @@ def _wrap_function_tool(tool: FunctionTool, dec: Callable) -> FunctionTool:
 
             _invoke.__name__ = tool_name
             _invoke.__qualname__ = tool_name
-            return await dec(_invoke)(**parsed)
+            extra: dict[str, Any] = {"ctx": ctx, "context": ctx}
+            if ctx_param is not None:
+                extra[ctx_param] = ctx
+            with api.with_context(extra):
+                return await dec(_invoke)(**parsed)
 
         for attr in ("__agents_prepare_arguments__", _FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER):
             if hasattr(raw_impl, attr):
@@ -118,6 +150,7 @@ def effects(tools: Sequence[Any], ops: Mapping[str, EffectConfig]) -> list[Any]:
                 f"tool {name!r} must be a FunctionTool; got {type(tool).__name__}"
             )
         spec = normalize_effect(name, ops[name])
+        spec = dataclasses.replace(spec, landed=compose_landed(_is_error_result, spec.landed))
         out.append(_wrap_function_tool(tool, make_effect_decorator(spec)))
     return out
 

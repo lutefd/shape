@@ -7,15 +7,17 @@ When a scenario fails, `shape` shrinks the failure to a small set of deviations,
 Here is the real output from running `examples/plain_python/checks.py::checkout_buggy`:
 
 ```text
-scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=1.10s  181 seeds/s
+scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=3.65s  55 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      202       252
                    faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
   model choices taken: none
+  interleaving choices taken: none
 2 distinct causes across 2 failing seeds
 
 cause 1 of 2: 1 of 2 failing seeds (52)
+  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, timeout_after_commit)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 3 steps (2 of 3 deviations kept, 6 replays):
@@ -32,10 +34,10 @@ FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most
 
 Reading it top to bottom:
 
-1. **Summary line** (`scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=1.10s  181 seeds/s`): How many seeds ran, starting seed, how many failed reproducibly, wall-clock time, and throughput. If any seed failed inconsistently on re-run, `flaky=N` appears here too.
-2. **Coverage block** (`coverage over 200 seeds:`): Per-op counts of `landed` (real deduplicated effects) and `attempts` (all calls including failed and killed ones), every fault kind actually injected, and every non-nominal `shape.choose` decision taken. Check this first to confirm your sweep exercised the faults and model choices you expect.
-3. **Cause count** (`2 distinct causes across 2 failing seeds`): Failing seeds grouped by `(invariant, ordered deviation kinds)`.
-4. **Cause heading** (`cause 1 of 2: 1 of 2 failing seeds (52)`): How many failing seeds matched this cause and up to five example seed numbers, sorted ascending.
+1. **Summary line** (`scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=3.65s  55 seeds/s`): How many seeds ran, starting seed, how many failed reproducibly, wall-clock time, and throughput. If any seed failed inconsistently on re-run, `flaky=N` appears here too.
+2. **Coverage block** (`coverage over 200 seeds:`): Per-op counts of `landed` (real deduplicated effects) and `attempts` (all calls including failed and killed ones), every fault kind actually injected, every non-nominal `shape.choose` decision taken, and any scheduling interleaving choices taken. Check this first to confirm your sweep exercised the faults and model choices you expect.
+3. **Cause count** (`2 distinct causes across 2 failing seeds`): Failing seeds grouped by `(invariant, violating op, coarse deviation classes)`.
+4. **Cause heading and trigger label** (`cause 1 of 2: 1 of 2 failing seeds (52)` + `needs: after-commit fault (...)`): How many failing seeds matched this cause, up to five sorted seed numbers, what class of deviation it took to trigger (with exact fault kinds listed), or `nominal path (0 faults, 0 model choices): a plain unit test catches this` printed last when zero faults and zero model choices triggered the failure.
 5. **Failure header** (`FAIL ... seed=52  invariant=at_most_once(payments.charge)`): The representative seed (fewest deviations in this cause) and the violated invariant.
 6. **Violation message** (`payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)`): Plain-language explanation from the invariant.
 7. **Shrink summary** (`minimized to 3 steps (2 of 3 deviations kept, 6 replays):`):
@@ -148,13 +150,13 @@ Before filing a bug or changing production code, run through this checklist:
 1. **Does the output say `FLAKY` or `NOT MINIMIZED`?**
    Your scenario depends on something `shape` does not control: thread scheduling, wall-clock timers, random numbers, a live LLM, or state stored outside `run.dir`. Move all persistence into `run.dir` and replace live models with `shape.choose` or a scripted model.
 2. **Does the output say `NOTHING TESTED` or `note: an invariant watches ...`?**
-   No seed called your `@shape.effect` function. Inspect `inc-0.out` for early validation failures, check that your `op` string matches between `@shape.effect` and the invariant, or set `expect_effects=False` if zero effects is expected (such as a rejected approval).
+   Either no seed attempted an `@shape.effect` function, or attempts ran but zero effects ever landed. The `NOTHING TESTED` line tells you which happened (0 attempts, returned without effect via `landed=`, or every attempt raised before completing). Inspect `inc-0.out`, verify your `op` string matches between `@shape.effect` and the invariant, or set `expect_effects=False` if zero effects is expected (such as a rejected approval).
 3. **Is `@shape.effect` on the right function?**
-   If you decorated an outer tool that checks local state and returns early without calling the provider, `shape` logs a fake effect on every no-op return. Move `@shape.effect` to the client method that actually talks to the provider.
+   If you decorated an outer tool that checks local state and returns early without calling the provider, `shape` logs a fake effect on every no-op return. Move `@shape.effect` to the client method that actually talks to the provider, or pass `key_from_result=` if the tool returns an existing resource ID on deduped repeats.
 4. **Did a tool report failure by returning a value instead of raising?**
-   A wrapped function that catches an error and returns `{"ok": False}` counts as a landed effect. Move `@shape.effect` onto the inner call that raises, or inspect `result=` in a custom invariant.
+   Pass `landed=lambda res: ...` on `@shape.effect` (or in `effects(tools, ops)`) so refusal strings and error dicts log as `returned without effect` instead of landed effects. LangChain `ToolMessage(status="error")` and OpenAI Agents SDK `"An error occurred while running the tool."` strings are auto-detected as not landed without writing `landed=`.
 5. **Did `key=` return `None` unexpectedly?**
-   Look at the trace line: `effect landed (idempotency key '...')` appears only when `key=` returned a non-null string. If your code passed a key but the trace omits `(idempotency key ...)`, check your `key=` lambda. With `shape.agents.effects`, `key=` receives only the model's JSON arguments, not `RunContextWrapper`.
+   Look at the trace line: `effect landed (idempotency key '...')` appears only when `key=` or `key_from_result=` returned a non-null string. If your code passed a key but the trace omits `(idempotency key ...)`, check your `key=` lambda. Both adapters pass framework context (`ctx`/`context` in `shape.agents`, `config`/injected state/runtime in `shape.langgraph`), and any exception in `scope`/`key`/`result`/`landed`/`key_from_result` fails immediately with `harness_error` pointing at your lambda.
 6. **Did your retry code miss a fault because of exception types?**
    By default, `shape` raises `TimeoutError`, `ConnectionResetError`, `shape.RateLimited`, `shape.ServerError`, and `shape.ClientError`. If your production retry policy only catches `httpx.ReadTimeout` or `stripe.APIConnectionError`, configure `errors=` on `@shape.effect`.
 7. **Did `scenario_terminates` fail with `max_restarts=0`?**

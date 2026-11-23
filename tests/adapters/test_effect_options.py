@@ -24,9 +24,24 @@ def test_effect_has_a_field_for_every_shape_effect_option():
 
 
 def test_normalize_effect_keeps_the_new_options_and_still_rejects_unknown_keys():
-    cfg = {"op": "x.put", "idempotent": True, "result": len, "hide": ["secret"]}
+    landed = lambda reply: reply > 0
+    key_from_result = lambda reply: f"k:{reply}"
+    cfg = {
+        "op": "x.put",
+        "idempotent": True,
+        "result": len,
+        "hide": ["secret"],
+        "landed": landed,
+        "key_from_result": key_from_result,
+    }
     e = normalize_effect("t", cfg)
-    assert (e.idempotent, e.result, tuple(e.hide)) == (True, len, ("secret",))
+    assert (e.idempotent, e.result, tuple(e.hide), e.landed, e.key_from_result) == (
+        True,
+        len,
+        ("secret",),
+        landed,
+        key_from_result,
+    )
     with pytest.raises(ValueError, match="unknown effect option"):
         normalize_effect("t", {"op": "x", "idempotency": True})
 

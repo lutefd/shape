@@ -70,7 +70,7 @@ Practical defaults:
 
 ## Running from `pytest`
 
-Call `shape.check(scenario, seeds=200, start=0, runs_dir=tmp_path)` inside a regular pytest function. When a seed fails, is flaky, or hits `NOTHING TESTED`, `shape.check` raises `AssertionError` containing the coverage table and minimized traces.
+Call `shape.check(scenario, seeds=200, start=0, runs_dir=tmp_path, jobs=1)` inside a regular pytest function. Pass `jobs=4` for parallel forked execution on Unix. When a seed fails, is flaky, or hits `NOTHING TESTED`, `shape.check` raises `AssertionError` containing the coverage table and minimized traces.
 
 [`docs/guide/examples/test_async_agent.py`](examples/test_async_agent.py):
 
@@ -92,8 +92,6 @@ def test_per_attempt_key_double_charges(tmp_path):
 
 Passing `runs_dir=tmp_path` keeps your working tree clean and lets pytest delete failure directories automatically.
 
-Note: `shape.check` currently runs seeds serially (`jobs=1`). For parallel sweeps in CI, invoke the `shape test --jobs 4` CLI.
-
 ## Keeping `.min.json` files as regression tests
 
 When `shape` finds a real bug, copy `runs/<scenario>/seed-<n>.min.json` into your repository (for example `tests/traces/refund-crash-after.min.json`) and replay it in CI after you ship the fix:
@@ -108,21 +106,19 @@ Because `--replay` runs a single explicit execution instead of a full sweep, it 
 - Exit `1`: the bug regressed.
 - Exit `2`: the code refactored past the old call sequence; regenerate or retire the trace.
 
-You can also run a checked-in trace from pytest using `shape.boundary.runner.replay_file(scenario, path, tmp_path)`:
+You can also run a checked-in trace directly from pytest using `shape.replay(scenario, path, runs_dir=tmp_path)`, which returns `None` on pass and raises `AssertionError` if the bug regresses or the trace diverges:
 
 ```python
-from pathlib import Path
-from shape.boundary import runner
+import shape
 
 def test_refund_crash_regression(tmp_path):
-    code, text = runner.replay_file(
+    shape.replay(
         refund_agent,
-        Path("tests/traces/refund-crash-after.min.json"),
-        tmp_path,
+        "tests/traces/refund-crash-after.min.json",
+        runs_dir=tmp_path,
     )
-    assert code == 0, text
 ```
 
 ## Disk usage of `runs/`
 
-Passing seed directories are deleted immediately after each seed passes. Failing seeds, `.min` directories, flaky seeds, and `replay/` stay under `--runs-dir` (default `runs/`). Add `runs/` to `.gitignore` and use `--runs-dir /tmp/shape-runs` in CI or `runs_dir=tmp_path` in pytest.
+Passing seed directories are deleted immediately after each seed passes (along with any stale `seed-<n>` directory from an earlier failing run, and empty scenario directories). Failing seeds, `.min` directories, flaky seeds, and `replay/` stay under `--runs-dir` (default `runs/`). Add `runs/` to `.gitignore`, clean with `rm -rf runs/`, and use `--runs-dir /tmp/shape-runs` in CI or `runs_dir=tmp_path` in pytest.

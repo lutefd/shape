@@ -4,6 +4,7 @@ renders it in the code's own words."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -18,7 +19,7 @@ from pathlib import Path
 from ..choices import ChoiceSource, ExplicitChoices, SeededChoices
 from ..shrink import shrink
 from . import api, coverage, schedule
-from .failure import Cause, Failure, Report, kinds, raw_kinds
+from .failure import Cause, Failure, Report, coarse_kinds, kinds, raw_coarse_kinds
 from .faults import CRASH_EXIT, DUPLICATE_KEY, DUPLICATE_TRIGGER, FAULT_TEXT
 from .invariants import Violation, World, scenario_terminates
 from .log import PARENT_SEQ, REALIZED, WORLD, JsonlWriter, event_order, read_jsonl
@@ -26,6 +27,7 @@ from .rootcause import describe
 
 INCARNATION_TIMEOUT = 30.0  # seconds; a hung incarnation counts as one that never finished
 TIMEOUT_EXIT = 124
+HARNESS_EXIT = 78  # a user-supplied shape hook (scope/key/result/landed) raised
 RERUNS = 2  # a failing seed must fail the same way this many more times to count as a failure
 MAX_INVESTIGATED = 200  # failing seeds minimized per sweep, fewest deviations first
 
@@ -79,6 +81,9 @@ def child_main(scen: api.Scenario, spec: dict, workdir: Path, inc: int, twin: in
             gate.point("entry")
         (fn if fn is not None else scen.fn)(api.Run(workdir, inc, spec.get("seed")))
         return 0
+    except api.HarnessError as exc:
+        sys.stderr.write(f"harness error: {exc}\n")
+        return HARNESS_EXIT
     except BaseException as exc:  # noqa: BLE001 - anything that kills the agent is a death to log
         ctx.append(ctx.world, {"kind": "error", "text": describe(exc)})
         sys.stderr.write(traceback.format_exc())
@@ -86,7 +91,12 @@ def child_main(scen: api.Scenario, spec: dict, workdir: Path, inc: int, twin: in
 
 
 def _classify(code: int) -> str:
-    return {0: "done", CRASH_EXIT: "crash", TIMEOUT_EXIT: "timeout"}.get(code, "error")
+    return {
+        0: "done",
+        CRASH_EXIT: "crash",
+        TIMEOUT_EXIT: "timeout",
+        HARNESS_EXIT: "harness_error",
+    }.get(code, "error")
 
 
 def _fork_incarnation(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> int:
@@ -114,13 +124,13 @@ def _spawn_incarnation(scen: api.Scenario, spec: dict, workdir: Path, inc: int) 
 
 
 def _incarnate(scen: api.Scenario, spec: dict, workdir: Path, inc: int, copies: int,
-              world: JsonlWriter) -> bool:
+               world: JsonlWriter) -> str:
     use_fork = hasattr(os, "fork") and os.environ.get("SHAPE_START_METHOD") != "spawn"
     if copies == 1 and not scen.concurrent:
         code = (_fork_incarnation if use_fork else _spawn_incarnation)(scen, spec, workdir, inc)
         world.write({"kind": "incarnation", "inc": inc, "twin": 0, "seq": PARENT_SEQ,
                      "how": _classify(code)})
-        return code == 0
+        return "harness_error" if code == HARNESS_EXIT else ("done" if code == 0 else "retry")
     actors = schedule.run_processes(
         scen, spec, workdir, inc, copies, use_fork=use_fork, choices=make_choices(spec),
         quiet=scen.max_restarts > 0 and inc == scen.max_restarts,
@@ -128,8 +138,12 @@ def _incarnate(scen: api.Scenario, spec: dict, workdir: Path, inc: int, copies: 
     for a in actors:
         world.write(a.event(inc, PARENT_SEQ, kind="incarnation", how=_classify(a.code)))
     codes = [a.code for a in actors]
-    return (0 in codes[:copies] and all(code == 0 for code in codes[copies:])
-            and TIMEOUT_EXIT not in codes)
+    if HARNESS_EXIT in codes:
+        return "harness_error"
+    if (0 in codes[:copies] and all(code == 0 for code in codes[copies:])
+            and TIMEOUT_EXIT not in codes):
+        return "done"
+    return "retry"
 
 
 def _delivered_twice(scen: api.Scenario, spec: dict, workdir: Path) -> bool:
@@ -173,13 +187,16 @@ def _run_actors(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> None
 def execute(scen: api.Scenario, spec: dict, workdir: Path) -> Outcome:
     """Run one seed (or one explicit replay) in `workdir`, restarting after every death."""
     shutil.rmtree(workdir, ignore_errors=True)
-    workdir.mkdir(parents=True)
+    workdir.mkdir(parents=True, exist_ok=True)
     parent = JsonlWriter(workdir / WORLD, fsync=False)
     copies = 2 if _delivered_twice(scen, spec, workdir) else 1
     completed, incarnations = False, 0
     for inc in range(scen.max_restarts + 1):
         incarnations += 1
-        if _incarnate(scen, spec, workdir, inc, copies if inc == 0 else 1, parent):
+        state = _incarnate(scen, spec, workdir, inc, copies if inc == 0 else 1, parent)
+        if state == "harness_error":
+            break
+        if state == "done":
             completed = True
             break
         if inc < scen.max_restarts:
@@ -190,13 +207,19 @@ def execute(scen: api.Scenario, spec: dict, workdir: Path) -> Outcome:
     world = World(entries, completed, incarnations, scen.max_restarts,
                   api.Run(workdir, incarnations - 1, spec.get("seed")))
     violations = []
-    for inv in [scenario_terminates(), *scen.invariants]:
-        try:
-            message = inv.check(world)
-        except Exception as exc:  # noqa: BLE001 - a broken invariant is a finding, not a crash
-            message = f"the invariant itself raised {describe(exc)}"
-        if message:
-            violations.append(Violation(inv.name, message))
+    harness_errors = [e for e in entries if e["kind"] == "harness_error"]
+    if harness_errors:
+        first_err = harness_errors[0]
+        violations.append(Violation("harness_error", first_err["text"], first_err.get("op")))
+    else:
+        for inv in [scenario_terminates(), *scen.invariants]:
+            try:
+                message = inv.check(world)
+            except Exception as exc:  # noqa: BLE001 - a broken invariant is a finding, not a crash
+                message = f"the invariant itself raised {describe(exc)}"
+            if message:
+                op = getattr(message, "op", None) or (inv.ops[0] if len(inv.ops) == 1 else None)
+                violations.append(Violation(inv.name, str(message), op))
     return Outcome(workdir, completed, entries + draws, {d["key"]: d["value"] for d in draws},
                    violations, coverage.of_run(world, draws))
 
@@ -204,9 +227,16 @@ def execute(scen: api.Scenario, spec: dict, workdir: Path) -> Outcome:
 def run_seed(scen: api.Scenario, seed: int, runs_dir: Path) -> Outcome:
     base = runs_dir / scen.name
     work = base / f".work-{os.getpid()}-{seed}"
-    out = execute(scen, {"seed": seed}, work)
+    try:
+        out = execute(scen, {"seed": seed}, work)
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
     if out.ok:
-        shutil.rmtree(work)
+        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(base / f"seed-{seed}", ignore_errors=True)
+        shutil.rmtree(base / f"seed-{seed}.min", ignore_errors=True)
+        (base / f"seed-{seed}.min.json").unlink(missing_ok=True)
     else:
         kept = base / f"seed-{seed}"
         shutil.rmtree(kept, ignore_errors=True)
@@ -222,16 +252,35 @@ class Sweep:
     flaky: list[int]  # failed once, did not fail the same way when re-run
     cov: coverage.Coverage
     wall: float
+    failing_ops: dict[int, str | None] = field(default_factory=dict)
 
     def problems(self, scen: api.Scenario) -> list[str]:
         """Reasons a sweep that found no failure still proved nothing."""
         if self.failing or self.flaky:
             return []
-        if scen.expect_effects and not self.cov.calls:
+        if not scen.expect_effects:
+            return []
+        if self.cov.harness_errors:
+            sample = next(iter(self.cov.harness_errors))
+            return [(f"NOTHING TESTED: harness hook raised across {self.seeds} seeds "
+                     f"({sample}), so no effect could be checked.")]
+        if not self.cov.calls:
             return [("NOTHING TESTED: no @shape.effect function was called in any of "
-                     f"{self.seeds} seeds, so every invariant passed vacuously. Check that the "
-                     "agent reaches its tools (a model output that fails validation never gets "
-                     "there). A scenario that must do nothing sets expect_effects=False.")]
+                     f"{self.seeds} seeds (0 attempts), so every invariant passed vacuously. "
+                     "Check that the agent reaches its tools (a model output that fails "
+                     "validation never gets there). A scenario that must do nothing sets "
+                     "expect_effects=False.")]
+        if not self.cov.landed:
+            no_eff = sum(self.cov.no_effects.values())
+            if no_eff:
+                reason = (f"{no_eff} returned without effect; check landed= or whether your tool "
+                          "is refusing every call")
+            else:
+                reason = ("every attempt raised before completing; check whether the tool or "
+                          "framework is failing every call")
+            return [(f"NOTHING TESTED: {self.cov.calls} effect attempts ran across {self.seeds} "
+                     f"seeds, but 0 landed ({reason}), so every invariant passed vacuously. "
+                     "A scenario that must do nothing sets expect_effects=False.")]
         return []
 
     def notes(self, scen: api.Scenario) -> list[str]:
@@ -255,7 +304,14 @@ def run_sweep(scen: api.Scenario, seeds: range, runs_dir: Path, jobs: int = 1) -
 
     def one(seed: int) -> list:
         out = run_seed(scen, seed, runs_dir)
-        return [seed, None if out.ok else out.violations[0].invariant, out.realized, out.stats]
+        first = None if out.ok else out.violations[0]
+        return [
+            seed,
+            None if first is None else first.invariant,
+            None if first is None else first.op,
+            out.realized,
+            out.stats,
+        ]
 
     if jobs <= 1 or not hasattr(os, "fork"):
         rows = [one(s) for s in seeds]
@@ -263,10 +319,12 @@ def run_sweep(scen: api.Scenario, seeds: range, runs_dir: Path, jobs: int = 1) -
         rows = _parallel(list(seeds), jobs, one)
     cov = coverage.Coverage()
     failed = []
-    for seed, invariant, realized, stats in rows:
+    failed_ops: dict[int, str | None] = {}
+    for seed, invariant, op, realized, stats in rows:
         cov.add(stats)
         if invariant is not None:
             failed.append((seed, invariant, realized))
+            failed_ops[seed] = op
     again = {seed: invariant for seed, invariant, _ in failed}
 
     def rerun(seed: int) -> list:
@@ -279,7 +337,11 @@ def run_sweep(scen: api.Scenario, seeds: range, runs_dir: Path, jobs: int = 1) -
         verdicts = dict(_parallel(seeds_failed, jobs, rerun))
     failing = [f for f in failed if verdicts[f[0]]]
     flaky = [f[0] for f in failed if not verdicts[f[0]]]
-    return Sweep(len(seeds), failing, flaky, cov, time.perf_counter() - started)
+    failing_ops = {f[0]: failed_ops[f[0]] for f in failing}
+    if not failing and not flaky:
+        with contextlib.suppress(OSError):
+            (runs_dir / scen.name).rmdir()
+    return Sweep(len(seeds), failing, flaky, cov, time.perf_counter() - started, failing_ops)
 
 
 def sweep(scen: api.Scenario, seeds: range, runs_dir: Path,
@@ -324,8 +386,8 @@ def _parallel(seeds: list[int], jobs: int, one) -> list:
 def story(entries: list[dict]) -> tuple[list[str], int]:
     """The trace in the code's words, and its step count (calls, approvals and deaths)."""
     events = [e for e in entries
-              if e["kind"] in ("effect", "approval", "claim", "choice", "error", "incarnation",
-                               "point", "schedule")
+              if e["kind"] in ("effect", "no_effect", "approval", "claim", "choice", "error",
+                               "harness_error", "incarnation", "point", "schedule")
               or (e["kind"] == "fault" and e["fault"] not in api.AFTER_COMMIT)]
     events.sort(key=event_order)
     copies = any(e.get("twin") for e in events)  # the trigger was delivered twice
@@ -350,6 +412,9 @@ def story(entries: list[dict]) -> tuple[list[str], int]:
                 landed = "effect landed" + (f" (idempotency key {e['key']!r})" if e["key"] else "")
                 note = f"{landed}, then {note}" if fault else landed
             lines += [f"  {steps}. {e['call']}", f"       {note}"]
+        elif kind == "no_effect":
+            steps += 1
+            lines += [f"  {steps}. {e['call']}", "       returned without effect"]
         elif kind == "choice":
             steps += 1
             by = f" [world actor {e['actor']}]" if e.get("actor") else ""
@@ -367,7 +432,10 @@ def story(entries: list[dict]) -> tuple[list[str], int]:
             lines.append(f"  {steps}. approval recorded for {e['scope']!r}")
         elif kind == "claim":
             steps += 1
-            lines.append(f"  {steps}. agent told the user {e['op']} happened for {e['scope']!r}")
+            verdict = "happened" if e.get("ok", True) else "did not happen"
+            lines.append(f"  {steps}. agent told the user {e['op']} {verdict} for {e['scope']!r}")
+        elif kind == "harness_error":
+            lines.append(f"  harness error: {e['text']}")
         elif kind == "error":
             lines.append(f"  process raised: {e['text']}")
         elif e["how"] == "done":
@@ -383,6 +451,12 @@ def _consumed(spec_keys: dict[str, int], out: Outcome) -> bool:
     return all(k in out.realized for k in spec_keys)
 
 
+def _signature(invariant: str, op: str | None, coarse_devs: tuple[str, ...]) -> tuple:
+    if op and op not in invariant:
+        return (invariant, f"op:{op}", *coarse_devs)
+    return (invariant, *coarse_devs)
+
+
 def investigate(scen: api.Scenario, seed: int, invariant: str, realized: dict[str, int],
                 runs_dir: Path, target: str) -> Failure:
     """Confirm a failing seed by replay, shrink it, and describe the minimal run."""
@@ -396,60 +470,93 @@ def investigate(scen: api.Scenario, seed: int, invariant: str, realized: dict[st
         replays += 1
         return execute(scen, {"explicit": candidate}, work).violated(invariant)
 
-    def failure(entries: list[dict], message: str, small: dict[str, int], problem: str | None):
+    def failure(entries: list[dict], message: str, op: str | None, small: dict[str, int],
+                problem: str | None) -> Failure:
         path = base / f"seed-{seed}.min.json"
         path.write_text(json.dumps({
             "scenario": scen.name, "file": scen.file, "invariant": invariant, "seed": seed,
             "realized": small, "reproduces": problem is None}, indent=2))
         trace, steps = story(entries)
-        shutil.rmtree(work, ignore_errors=True)
+        coarse_devs = coarse_kinds(entries)
+        exact = kinds(entries)
         return Failure(scen.name, target, seed, invariant, message, trace, steps, len(small),
-                       len(realized), replays, path, problem, (invariant, *kinds(entries)))
+                       len(realized), replays, path, problem,
+                       _signature(invariant, op, coarse_devs), op, coarse_devs, exact)
 
-    first = execute(scen, {"explicit": realized}, work)
-    replays += 1
-    original = read_story(kept)
-    message = next((v.message for v in first.violations if v.invariant == invariant), "")
-    if not first.violated(invariant) or not _consumed(realized, first):
-        why = ("replaying its recorded draws " + ("did not fail again"
-               if not first.violated(invariant) else "reached only some of the recorded keys")
-               + ": the run depends on something shape does not control (time, threads,"
-               " an unscripted model), so it cannot be replayed or minimized")
-        return failure(original, message or "(did not reproduce)", realized, why)
+    try:
+        first = execute(scen, {"explicit": realized}, work)
+        replays += 1
+        original = read_story(kept)
+        first_v = next((v for v in first.violations if v.invariant == invariant), None)
+        message = first_v.message if first_v else ""
+        op = first_v.op if first_v else None
+        if not first.violated(invariant) or not _consumed(realized, first):
+            why = ("replaying its recorded draws " + ("did not fail again"
+                   if not first.violated(invariant) else "reached only some of the recorded keys")
+                   + ": the run depends on something shape does not control (time, threads,"
+                   " an unscripted model), so it cannot be replayed or minimized")
+            return failure(original, message or "(did not reproduce)", op, realized, why)
 
-    small = shrink(realized, fails)
-    final_dir = base / f"seed-{seed}.min"
-    final = execute(scen, {"explicit": small}, final_dir)
-    replays += 1
-    message = next((v.message for v in final.violations if v.invariant == invariant), "")
-    if not final.violated(invariant) or not _consumed(small, final):
-        return failure(read_story(kept), message, realized,
-                       "the minimized run diverged on replay, so the minimal trace is not trusted")
-    return failure(final.entries, message, small, None)
+        small = shrink(realized, fails)
+        final_dir = base / f"seed-{seed}.min"
+        final = execute(scen, {"explicit": small}, final_dir)
+        replays += 1
+        final_v = next((v for v in final.violations if v.invariant == invariant), None)
+        message = final_v.message if final_v else ""
+        op = final_v.op if final_v else op
+        if not final.violated(invariant) or not _consumed(small, final):
+            shutil.rmtree(final_dir, ignore_errors=True)
+            return failure(read_story(kept), message, op, realized,
+                           "the minimized run diverged on replay, so the minimal trace is not trusted")
+        return failure(final.entries, message, op, small, None)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _cause_op_matches(cause: Cause, seed_op: str | None, has_ops: bool) -> bool:
+    if has_ops:
+        return cause.failure.op == seed_op
+    op = cause.failure.op
+    if op is None or op in cause.failure.invariant:
+        return True
+    return bool(cause.deviations) and all(k.startswith(f"{op}:") for k in cause.deviations)
 
 
 def investigate_all(scen: api.Scenario, failing: list[tuple[int, str, dict]], runs_dir: Path,
-                    target: str, limit: int = MAX_INVESTIGATED) -> Report:
-    """Group failing seeds by root cause: the invariant plus the ordered deviations of the
-    minimized run. Seeds go fewest deviations first. A seed that still contains every deviation
-    of a cause already found (same invariant) joins that cause without being shrunk again; any
-    other seed is minimized, which is what finds the next cause."""
+                    target: str, limit: int = MAX_INVESTIGATED,
+                    failing_ops: dict[int, str | None] | None = None) -> Report:
+    """Group failing seeds by root cause: the invariant, violating op, and coarse deviation
+    classes of the minimized run. Seeds go fewest deviations first. A seed that still contains
+    every coarse deviation of a cause already found (same invariant and op) joins that cause
+    without being shrunk again; any other seed is minimized, which is what finds the next cause.
+    Nominal-path causes (0 deviations) are listed last so shape-only findings stand out."""
     ordered = sorted(failing, key=lambda f: (len(f[2]), f[0]))
     causes: dict[tuple, Cause] = {}
     investigated = skipped = 0
     for seed, invariant, realized in ordered:
-        raw = raw_kinds(realized)
-        home = next((c for c in causes.values() if c.failure.invariant == invariant
-                     and not c.failure.problem and c.deviations <= raw), None)
+        raw_coarse = raw_coarse_kinds(realized)
+        has_ops = failing_ops is not None and seed in failing_ops
+        seed_op = failing_ops[seed] if has_ops else None
+        home = next(
+            (c for c in causes.values()
+             if c.failure.invariant == invariant
+             and not c.failure.problem
+             and _cause_op_matches(c, seed_op, has_ops)
+             and c.deviations <= raw_coarse),
+            None,
+        )
         if home is not None:
             home.seeds.append(seed)
+            home.record_exact(realized)
         elif investigated >= limit:
             skipped += 1
         else:
             found = investigate(scen, seed, invariant, realized, runs_dir, target)
             investigated += 1
-            causes.setdefault(found.signature, Cause(found)).seeds.append(seed)
-    ranked = sorted(causes.values(), key=lambda c: (-len(c.seeds), c.failure.seed))
+            cause = causes.setdefault(found.signature, Cause(found))
+            cause.seeds.append(seed)
+            cause.exact_kinds.update(found.exact_kinds)
+    ranked = sorted(causes.values(), key=lambda c: (c.is_nominal, -len(c.seeds), c.failure.seed))
     return Report(len(failing), ranked, skipped)
 
 
@@ -488,18 +595,30 @@ def render_flaky(flaky: list[int]) -> str:
             f"were not minimized; their first runs are kept under the runs dir.")
 
 
+def replay(scen: api.Scenario, path: str | Path, runs_dir: str | Path = "runs") -> None:
+    """Replay a saved `.min.json` regression trace. Returns None if the recorded invariant no
+    longer fails and all recorded deviations were reached; raises AssertionError otherwise."""
+    code, text = replay_file(scen, Path(path), Path(runs_dir))
+    if code != 0:
+        raise AssertionError(text)
+
+
 def check(scen: api.Scenario, seeds: int = 100, start: int = 0,
-          runs_dir: str | Path = "runs") -> None:
-    """Run `seeds` seeds. Raises AssertionError carrying the minimized trace on failure."""
+          runs_dir: str | Path = "runs", jobs: int = 1) -> None:
+    """Run `seeds` seeds (in `jobs` forked workers where available). Raises AssertionError
+    carrying the minimized trace on failure."""
     runs = Path(runs_dir)
-    swept = run_sweep(scen, range(start, start + seeds), runs)
+    swept = run_sweep(scen, range(start, start + seeds), runs, jobs=jobs)
     problems = swept.problems(scen)
     if not (swept.failing or swept.flaky or problems):
         return
     parts = [f"{len(swept.failing)} of {seeds} seeds failed"
              + (f", {len(swept.flaky)} flaky" if swept.flaky else ""), swept.cov.render()]
     if swept.failing:
-        parts.append(investigate_all(scen, swept.failing, runs, scen.name).render())
+        parts.append(
+            investigate_all(scen, swept.failing, runs, scen.name,
+                            failing_ops=swept.failing_ops).render()
+        )
     if swept.flaky:
         parts.append(render_flaky(swept.flaky))
     raise AssertionError("\n\n".join(parts + problems))

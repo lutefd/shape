@@ -64,15 +64,17 @@ def checkout_buggy(run: shape.Run) -> None:
 
 ```console
 $ .venv/bin/shape test examples/plain_python/checks.py::checkout_buggy --seeds 200
-scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=1.10s  181 seeds/s
+scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=3.65s  55 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      202       252
                    faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
   model choices taken: none
+  interleaving choices taken: none
 2 distinct causes across 2 failing seeds
 
 cause 1 of 2: 1 of 2 failing seeds (52)
+  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, timeout_after_commit)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 3 steps (2 of 3 deviations kept, 6 replays):
@@ -115,10 +117,10 @@ import shape
 from checks import checkout_fixed
 
 def test_checkout_is_crash_safe(tmp_path):
-    shape.check(checkout_fixed, seeds=200, runs_dir=tmp_path)
+    shape.check(checkout_fixed, seeds=200, runs_dir=tmp_path, jobs=4)
 ```
 
-See [Running `shape` in CI and pytest](docs/guide/ci.md) for a GitHub Actions workflow, seed budgets, exit codes, and regression replay files.
+Replay a checked-in `.min.json` regression trace in milliseconds with `shape.replay(checkout_fixed, "tests/traces/seed-52.min.json", runs_dir=tmp_path)`. See [Running `shape` in CI and pytest](docs/guide/ci.md) for a GitHub Actions workflow, seed budgets, exit codes, and regression replay files.
 
 ## What `shape` catches and does not catch
 
@@ -127,8 +129,8 @@ See [Running `shape` in CI and pytest](docs/guide/ci.md) for a GitHub Actions wo
 | Double charges, duplicate emails, and over-refunds after timeouts, resets, retries, or crashes (`at_most_once`, `sum_le`). | Bugs in read-only agents or nominal-path business logic without external side effects. |
 | Lost effects when progress is recorded before an effect lands (`exactly_once`). | Real provider API mismatches when your test double does not faithfully mirror the provider's idempotency or error rules. |
 | Unapproved or tampered irreversible actions (`approved_before`, `@shape.actor`). | Crashes at arbitrary bytecode instructions between `@shape.effect` calls. |
-| Out-of-order effects, wrong-target IDs, retry storms, and false user claims (`requires`, `within_scopes`, `max_calls`, `claims_true`). | Thread timing races or wall-clock bugs (reported as `FLAKY` or `NOT MINIMIZED` rather than deterministic traces). |
-| Model misbehaviors: repeated calls, skipped calls, swapped order, wrong arguments, and post-restart re-issues (`shape.choose`, scripted models). | Live LLM prompt quality or hallucinations outside the choices modeled in your scripted model. |
+| Out-of-order effects, wrong-target IDs, retry storms, and false user claims (`requires`, `within_scopes`, `max_calls`, `claims_true`). | Host thread timing races or wall-clock bugs outside `shape.point` / `shape.run_async` (reported as `FLAKY` or `NOT MINIMIZED`). |
+| Model misbehaviors (`shape.choose`, scripted models) and concurrent process / `asyncio` races (`concurrent=[...]`, `shape.point`, `shape.run_async`; see [Concurrency](docs/boundary.md#concurrency) and [`examples/races/`](examples/races/)). | Live LLM prompt quality or hallucinations outside the choices modeled in your scripted model. |
 
 ## Documentation
 

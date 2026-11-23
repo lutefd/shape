@@ -51,39 +51,47 @@ def test_place_order_is_crash_safe():
     shape.check(place_order, seeds=200)    # raises AssertionError carrying the minimized trace
 ```
 
-`check(scenario, seeds=100, start=0, runs_dir="runs")`.
+`check(scenario, seeds=100, start=0, runs_dir="runs", jobs=1)` runs seeds (optionally in `jobs` forked workers) and raises `AssertionError` on failure. `replay(scenario, path, runs_dir="runs")` replays a saved `.min.json` regression trace and raises `AssertionError` if the failure still reproduces or diverges.
 
 `@shape.scenario(invariants=, max_restarts=3, actors=(), duplicate_trigger=False, expect_effects=True, concurrent=())`. `actors` and `duplicate_trigger` are described under Faults, and `concurrent` under Concurrency. `expect_effects=False` says the scenario may legitimately call no effect (a rejected request must do nothing). See Coverage.
 
 ### Effects, scopes and idempotency keys
 
-`@shape.effect(op, scope=, key=, irreversible=, errors=, idempotent=, result=, hide=)` marks the function that changes the outside world. It works on `def` and `async def` functions (an async effect is recorded when the awaited call returns). Outside a shape run it is the plain function. `scope` and `key` are called with the call's named arguments (defaults applied), so `lambda order_id, **_: ...` works for any signature, methods included.
+`@shape.effect(op, scope=, key=, irreversible=, errors=, idempotent=, result=, hide=, landed=, key_from_result=)` marks the function that changes the outside world. It works on `def` and `async def` functions (an async effect is recorded when the awaited call returns). Outside a shape run it is the plain function. `scope` and `key` are called with the call's named arguments (defaults applied), so `lambda order_id, **_: ...` works for any signature, methods included; `result`, `landed`, and `key_from_result` take the return value and may also accept any named argument (including adapter-supplied framework context) via keyword parameters or `**kwargs`.
+
+**Mark the layer that touches the outside world.** Prefer putting `@shape.effect` on the API client or repository call that actually mutates external state, rather than on a higher-level agent-facing tool that dedupes via agent state or catches errors into strings. That way shape faults the real network boundary and sees every real mutation directly. When you can only wrap the tool layer (for instance through `shape.langgraph.effects` or `shape.agents.effects`), use `landed=` and `key_from_result=` so shape's world log still reflects what actually happened.
 
 The world log counts real effects, not calls. Calls with the same `op`, `scope` and a non-null `key` are one effect, because the provider dedupes by key; calls without a key each count. This is what lets an idempotent retry pass `at_most_once` while a retry that drops the key fails it. shape trusts the key: a test double that ignores it is a bug in the double.
 
+- `landed=fn`: for tools that report failure or refusal via return values instead of raising (e.g. `"not the owner"` or `{"ok": False, "error": "..."}`). When `fn(return_value)` is falsy, the call is logged as an attempt that did not land — not an effect — and traces show `returned without effect`. After-commit faults are not injected on a call that did not land.
+- `key_from_result=fn`: for tools that dedupe through agent or server state and return the existing resource id on a repeat call (e.g. `key_from_result=lambda r: r.get("case_id")` returning `"CMP-5170"`). The derived key is recorded in the world log, so two calls for the same `op` and `scope` whose results yield the same key count as one effect.
 - `idempotent=True`: repeating a call with the same op, scope and arguments is one effect (a PUT-style write), whether or not it carries a key. The same op and scope with different arguments are two effects.
-- `result=fn`: `fn(return_value)` is stored as the effect's `result` in the world log, for invariants to read. Without it `result` is `None`. If `fn` raises, the effect is still logged, with the error text in `result`.
-- `hide=("secret", ...)`: arguments left out of the rendered call, the world log and the argument hash. These names are always hidden because frameworks inject them: `self`, `cls`, `config`, `runtime`, `callbacks`, `run_manager`, `tool_call_id`, `context`. `scope`, `key`, `result` and the fault `errors` still see every argument; approvals hash the visible ones, so `shape.approval(scope, args)` names the business arguments only.
+- `result=fn`: `fn(return_value)` is stored as the effect's `result` in the world log, for invariants to read. Without it `result` is `None`.
+- `hide=("secret", ...)`: arguments left out of the rendered call, the world log and the argument hash. These names are always hidden because frameworks inject them: `self`, `cls`, `config`, `runtime`, `callbacks`, `run_manager`, `tool_call_id`, `context`. `scope`, `key`, `result`, `landed`, `key_from_result` and the fault `errors` still see every argument; approvals hash the visible ones, so `shape.approval(scope, args)` names the business arguments only.
 
-`attempts` are the other half of the log: every call is logged before its fault is applied, so failed and killed calls are visible to `max_calls` and custom invariants even though they are not effects.
+**Harness errors never fail silently.** If `scope`, `key`, `result`, `landed`, or `key_from_result` raises, shape raises `shape.HarnessError` (a `BaseException`, so framework error handlers cannot swallow it into `"An error occurred while running the tool."`) and fails the run immediately with `your <hook> for <op> raised <Type>: ... (file.py:line)` pointing at your lambda.
+
+`attempts` are the other half of the log: every call is logged before its fault is applied, so failed, refused, and killed calls are visible to `max_calls` and custom invariants even though they are not effects.
 
 Invariants:
 
 - `at_most_once(op)`: each scope has at most one real effect of `op`.
-- `exactly_once(op)`: at most once per scope, and when the scenario finished, at least one effect of `op` overall (a lost effect fails it).
+- `exactly_once(op, failure_claim_ok=False)`: at most once per scope, and when the scenario finished, at least one effect of `op` overall (a lost effect fails it). With `failure_claim_ok=True`, a lost effect is acceptable when the agent explicitly recorded `shape.claim(scope, op, ok=False)` (telling the user it could not complete the action) for every attempted scope and never claimed success; claiming success or finishing silently is still a violation.
 - `approved_before(op)`: every effect of `op` has an earlier approval with the same scope and argument hash.
 - `approved_before(op, match=None)`: with `match(effect_args)`, the effect's named arguments (hidden ones left out) are mapped to what the human approved before hashing, for effects that sit at a lower layer than the tool the human saw (a raw API body vs the tool's arguments). The scope must still match.
 - `requires(op, before=other_op, same_scope=True)`: every `op` effect has an earlier `other_op` effect that landed, for the same scope (any scope with `same_scope=False`). "Landed" means it is in the world log, so a charge that timed out after commit counts and a charge that timed out before commit does not. Catches "emailed 'you were charged' when the charge never landed".
 - `within_scopes(op, allowed)`: every `op` effect acts on a scope in `allowed`, a collection of scopes or a function of the final `shape.Run` that returns one (it can read `run.dir`). Catches wrong-target actions under model perturbation.
 - `max_calls(op, n, per_scope=True)`: at most `n` calls of `op` (per scope or in total), failed and killed calls included. Catches retry storms.
 - `sum_le(op, field, limit, per_scope=True)`: the numeric argument `field` of real `op` effects sums to at most `limit`. Catches over-refunds. Non-numeric or missing values count as 0.
-- `claims_true()`: every `shape.claim(scope, op)` the agent recorded when it told the user an action happened has an earlier effect of `op` for `scope` that landed. Catches "I've refunded you" when no refund exists.
+- `claims_true()`: every `shape.claim(scope, op)` (`ok=True`) the agent recorded when it told the user an action happened has an earlier effect of `op` for `scope` that landed, and every `shape.claim(scope, op, ok=False)` ("I couldn't do it") has no earlier effect that landed. Catches both false success claims and "sorry, it failed" after a commit actually landed.
 - `@shape.invariant`: turns `fn(world) -> str | None` into an invariant; return a one-line plain-words message when the run is wrong. The function name is the invariant's name. An invariant that raises is reported as a violation ("the invariant itself raised ..."). See World below.
 - `scenario_terminates()`: always on. The scenario must return within `max_restarts` restarts. When `max_restarts > 0`, the last incarnation runs with faults off (faults eventually stop), so this checks that the agent recovers from whatever state the faults left, not that it survives unbounded faults. With `max_restarts=0` every fault is live and the agent must handle it inline.
 
+**Choosing between `exactly_once` and `claims_true`:** plain `exactly_once(op)` is for background workflows and queues that must drive an action to completion. For a user-facing agent that may legitimately reply "I couldn't refund your order right now" when a downstream provider returns a 4xx or stays down, plain `exactly_once(op)` produces false positives on clean before-commit failures. Use `claims_true()` (paired with `at_most_once(op)`), or `exactly_once(op, failure_claim_ok=True)` with `shape.claim(scope, op, ok=False)` when the agent reports failure to the user.
+
 Each failure message is one line in plain words, for example `t.notify(order='1') happened with no earlier t.charge that landed for scope 'order:1'`. `exactly_once` has its own wording ("it must happen exactly once") and does not reuse `at_most_once`'s.
 
-Claims are recorded where the agent makes the statement: `shape.claim(scope, op)`.
+Claims are recorded where the agent makes the statement: `shape.claim(scope, op)` for success (`ok=True`) and `shape.claim(scope, op, ok=False)` for reported failure.
 
 Approvals are recorded by the code that obtains them: `shape.approval(scope, args)` (for example, inside the node that receives the human decision). `args` is the dict of the effect's named arguments (without `self`); the hash is of its sorted JSON, so arguments must have stable reprs.
 
@@ -132,7 +140,7 @@ coverage over 200 seeds:
   model choices taken: after_refund -> 'refund_again' x5
 ```
 
-A pass that tested nothing is not a pass. When no seed called any `@shape.effect` function (for example the model's output failed validation and the agent never reached its tools) and nothing failed, the sweep fails with `NOTHING TESTED` and exits 1. A scenario that must legitimately do nothing sets `expect_effects=False`. When an invariant watches an op that no seed ever called, the report adds a `note:` line (it does not fail: "this must never run" is a valid thing to assert).
+A pass that tested nothing is not a pass. When no seed called any `@shape.effect` function, or when attempts ran but zero effects ever landed, and nothing failed, the sweep fails with `NOTHING TESTED` and exits 1. The message explains which case occurred: zero attempts (the agent never reached its tools), attempts that returned without effect (check `landed=` or whether the tool refused every call), attempts that all raised before completing, or harness hook errors. A scenario that must legitimately do nothing sets `expect_effects=False`. When an invariant watches an op that no seed ever called, the report adds a `note:` line (it does not fail: "this must never run" is a valid thing to assert).
 
 ### Flaky seeds
 
@@ -140,7 +148,23 @@ Boundary mode does not control threads, timers or an unscripted model, so a fail
 
 ### Distinct causes
 
-Failing seeds are grouped by root cause. The signature is the violated invariant plus the ordered `(op, fault)` and `(model label, choice)` deviations of the minimized run. The report starts with `N distinct causes across M failing seeds`, then prints one minimized trace per cause with how many seeds reached it. Seeds go fewest deviations first; a seed that still contains every deviation of a cause already found joins it without being shrunk again (counts are attributions by deviation kind, not separate replays); any other seed is minimized. At most 200 seeds are minimized per sweep, and the report says how many were not.
+Failing seeds are grouped by root cause. The signature is the violated invariant, the op that violated it, and the coarse class of each deviation of the minimized run:
+
+- **after-commit fault** (`the caller did not see the commit`): `timeout_after_commit`, `connection_reset_after_commit`, and `crash_after` group together, with the exact fault kinds observed listed inside the cause.
+- **before-commit fault** (`the call failed cleanly`): `timeout`, `rate_limit`, `server_error`, and `client_error` group together, with exact kinds listed.
+- **crash** (`died before the call`): `crash_before`.
+- **interleaving**: scheduling choices (`sched:actors`, `sched:tasks`) from concurrent processes or `shape.run_async`.
+- **model choice** and **duplicate delivery**: grouped by choice / trigger.
+
+Each cause is labeled by what it took to trigger (`needs: after-commit fault (...)`, `needs: model choice`, etc.). Causes that fail on the nominal path with 0 faults and 0 model choices are printed **last**, labeled `nominal path (0 faults, 0 model choices): a plain unit test catches this`, so findings that only fault injection or model perturbation can produce stand out first. Seeds go fewest deviations first; a seed that still contains every coarse deviation of a cause already found joins it without being shrunk again and adds its exact fault kinds to that cause; any other seed is minimized. At most 200 seeds are minimized per sweep, and the report says how many were not.
+
+### Disk usage and cleaning runs
+
+Each scenario writes run state under `--runs-dir` (default `runs/<scenario>/`). Passing seeds' directories are deleted as soon as they pass (along with any stale `seed-<n>` directory from an earlier failing run), and an empty scenario directory is removed when the sweep passes. Only failing seeds (`seed-<n>/`), flaky seeds, minimized traces (`seed-<n>.min.json`, `seed-<n>.min/`), and replays (`replay/`) are kept on disk. To remove all saved run artifacts:
+
+```sh
+rm -rf runs/
+```
 
 ## How one seed runs
 
@@ -252,6 +276,15 @@ threads can raise `shape.loop.Deadlock`. Outside a shape run, `shape.run_async` 
 - Use `shape.choose` or the [scripted models](adapters.md) to control model outputs. Boundary
   mode keeps the host clock, random sources and sockets available. Reruns and replay detect
   some divergence from these inputs.
+
+## When shape is the wrong tool
+
+shape is built for side-effecting agents whose failures involve crashes, ambiguous tool timeouts, retries, duplicate delivery, or model misbehavior around tools. It is the wrong tool when:
+
+- **There are no external side effects** (read-only RAG, Q&A, summarization): there is no world log to check; use standard evals or unit tests.
+- **You are grading prose or prompt quality**: shape tests invariants over effects, approvals, and claims — not whether an answer sounds polite or helpful.
+- **The bug happens on the nominal path with 0 faults and 0 model choices**: a plain pytest unit test is faster and simpler (shape labels such failures last as `nominal path (0 faults, 0 model choices): a plain unit test catches this`).
+- **You are calling a live, non-deterministic LLM**: shape cannot replay or shrink an unscripted remote model; swap in a scripted model with `shape.choose(...)` (or `ScriptedChatModel` / `ScriptedModel`) to test the agent's control flow and guards.
 
 ## Reading the output
 

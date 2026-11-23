@@ -21,9 +21,11 @@ Outside a `shape` run, the decorator returns the plain function with no overhead
 - **op**: A dot-separated name for the action, such as `"payments.charge"` or `"email.send"`. Invariants reference this name.
 - **scope**: A function returning a string that identifies the business entity affected, such as `"order:17"`. Invariants like `at_most_once` and `requires` group effects by scope. If omitted, the scope is `""` (the whole run).
 - **key**: A function returning the idempotency key sent to the external provider, or `None`. Calls with the same `op`, `scope`, and non-null `key` count as **one real effect** in the world log, because the provider deduplicates them. Calls with `key=None` (or distinct keys) each count as a separate effect.
+- **key_from_result**: A function `fn(return_value) -> str | None` that derives a deduplication key from the return value (for tools that dedupe via state and return the same resource ID such as `"CMP-5170"` on a repeat call). The derived key is recorded in `world.jsonl`, so repeat calls yielding the same ID count as one effect.
+- **landed**: A predicate `fn(return_value) -> bool` for tools that report refusal or failure via return values instead of raising. When falsy, the call is logged as an attempt that `returned without effect`, not a landed effect.
 - **idempotent**: Pass `idempotent=True` for PUT-style writes where repeating the same `op`, `scope`, and visible arguments produces one effect even without an idempotency key. Calling the same `op` and `scope` with different arguments still counts as two effects.
 
-`scope` and `key` receive the call's bound arguments as keyword arguments, with defaults applied and `**kwargs` unpacked. Always accept `**_` so the lambda works on any signature, including methods with `self`.
+`scope` and `key` receive the call's bound arguments as keyword arguments, with defaults applied and `**kwargs` unpacked (plus adapter-supplied framework context). Always accept `**_` so the lambda works on any signature, including methods with `self`. `result`, `landed`, and `key_from_result` take the return value and may also accept any named argument or framework context via keyword parameters or `**kwargs`. If any hook raises, `shape` raises `shape.HarnessError` (`BaseException`) and fails the run immediately pointing at your lambda — framework error handlers never swallow it.
 
 ### Where to put `@shape.effect`
 
@@ -32,18 +34,22 @@ Put `@shape.effect` on the function that actually touches the outside world, suc
 - checks agent state first and returns early without calling the provider (marking the outer tool would log a fake effect and inject faults on the no-op path), or
 - runs its own retry loop around the client (marking the outer tool hides the inner attempts from `shape`, so `shape` cannot fault individual retries).
 
-The framework adapters (`shape.langgraph.effects` and `shape.agents.effects`) wrap tool objects directly for convenience when each tool makes one external call. If a tool retries internally or short-circuits on local state, decorate the client method with `@shape.effect` instead.
+The framework adapters (`shape.langgraph.effects` and `shape.agents.effects`) wrap tool objects directly for convenience when each tool makes one external call. When you can only wrap an agent-facing tool that dedupes via state or returns refusals as strings/dicts, pass `key_from_result=` and `landed=` so the world log still matches reality.
 
 ### Tools that report failure via return values
 
-`shape` records a call as a landed effect whenever the wrapped function returns without raising an exception. If your tool catches exceptions internally and returns a failure payload such as `{"ok": False, "error": "declined"}`, `shape` treats that return as a landed effect.
+By default, `shape` records a call as a landed effect whenever the wrapped function returns without raising an exception. If your tool reports refusals or errors by returning a value (such as `"not the owner"` or `{"ok": False, "error": "declined"}`), pass `landed=lambda res: ...`:
 
-To handle this today:
+```python
+@shape.effect(
+    "orders.cancel",
+    scope=lambda order_id, **_: f"order:{order_id}",
+    landed=lambda res: bool(res.get("ok")),
+)
+def cancel_order(order_id: str) -> dict: ...
+```
 
-- Place `@shape.effect` on the lower-level client call that raises before the tool catches and converts the error.
-- Or pass `result=lambda reply: reply` on `@shape.effect` and check `e["result"]` inside a custom `@shape.invariant`.
-
-A `landed=` predicate on `@shape.effect` to decide from the return value whether an effect landed is planned.
+When `landed` returns `False`, the call is logged as an attempt that did not land (`returned without effect` in traces), not an effect, and after-commit faults are not injected. In the framework adapters, LangChain `ToolMessage(status="error")` responses and OpenAI Agents SDK `"An error occurred while running the tool."` error strings are detected as not landed automatically without writing `landed=`.
 
 ## World log vs. the agent's beliefs
 
@@ -108,7 +114,7 @@ A `timeout` factory also serves `timeout_after_commit` unless you override `time
 
 Two additional fault mechanisms operate at the scenario level:
 
-- **Duplicate delivery (`duplicate_trigger=True`)**: On roughly 1 in 4 seeds when enabled on `@shape.scenario`, incarnation `0` starts as two forked copies at the same moment on the same `run.dir`. This models an at-least-once webhook or job queue delivering the same trigger twice. Copy A draws under `#0.<n>` and copy B draws under `#0t1.<n>`. The real OS interleaving between the two processes is not controlled, so race-dependent failures can surface as `FLAKY`. Deterministic concurrency control (`shape.point` and `run_async`) is planned.
+- **Duplicate delivery (`duplicate_trigger=True`) and concurrent actors (`concurrent=[...]`)**: On roughly 1 in 4 seeds when `duplicate_trigger=True` is enabled on `@shape.scenario`, incarnation `0` starts as two forked copies at the same moment on the same `run.dir`, modeling an at-least-once webhook or job queue delivering the same trigger twice. Both duplicate copies and explicit `concurrent=[...]` actors run under `shape`'s process scheduler, yielding at `@shape.effect` calls and `shape.point(label)` markers (`sched:actors#<inc>.<n>`) so interleavings replay and shrink deterministically. For in-process `asyncio` task races, use `shape.run_async(coro)` (`sched:tasks`). See [Concurrency in docs/boundary.md](../boundary.md#concurrency) and [`examples/races/`](../../examples/races/).
 - **World actors (`@shape.actor`)**: Functions passed in `@shape.scenario(actors=[...])` run in the parent process between incarnations (after one incarnation dies and before the next starts), with faults off. Use `shape.choose` inside an actor to model external state changes while the agent is down, such as a user editing an order amount or revoking an approval.
 
 ## Model choices (`shape.choose`)
@@ -167,7 +173,7 @@ coverage over 200 seeds:
   model choices taken: none
 ```
 
-- **`NOTHING TESTED`**: If no seed called any `@shape.effect` function and nothing failed, the sweep fails with `NOTHING TESTED` and exits `1`. This stops silent vacuous passes (for example, a broken prompt or validation error that prevented the agent from ever calling a tool). If a scenario legitimately expects zero effects, such as a rejected approval flow, set `@shape.scenario(..., expect_effects=False)`.
+- **`NOTHING TESTED`**: If no seed called any `@shape.effect` function, or if attempts ran but zero effects ever landed, and nothing failed, the sweep fails with `NOTHING TESTED` and exits `1`. The message explains why when known: zero attempts (the agent never reached its tools), attempts that returned without effect (check `landed=` or tool refusals), attempts that all raised before completing, or harness hook errors. If a scenario legitimately expects zero effects, such as a rejected approval flow, set `@shape.scenario(..., expect_effects=False)`.
 - **`note:` lines**: If an invariant watches an `op` that no seed ever called, `shape` prints `note: an invariant watches <op>, which no seed ever called`. This is informational and does not fail the sweep.
 
 ## `FLAKY` seeds
@@ -183,8 +189,14 @@ If a seed does not violate the same invariant on all re-runs, `shape` classifies
 
 ## Distinct causes
 
-Many seeds in a sweep often trigger the same bug. `shape` groups failing seeds by **cause**: the violated invariant plus the ordered sequence of deviation kinds (`(op, fault)` and `(model label, choice)`) in the minimized run.
+Many seeds in a sweep often trigger the same bug. `shape` groups failing seeds by **cause**: the violated invariant, the op that violated it, and the coarse class of each deviation in the minimized run:
 
-Seeds are processed in order of fewest deviations first. Once a minimized cause is found, any remaining failing seed with the same invariant whose raw deviations are a superset of that cause's deviations is attributed to that cause without running `ddmin` again. At most 200 failing seeds are minimized per sweep. The report prints `N distinct causes across M failing seeds` and one minimized trace per cause, ranked by seed count.
+- **after-commit fault** (`the caller did not see the commit`): `timeout_after_commit`, `connection_reset_after_commit`, and `crash_after` group into one cause, with the exact fault kinds seen across those seeds listed inside it.
+- **before-commit fault** (`the call failed cleanly`): `timeout`, `rate_limit`, `server_error`, and `client_error` group into one cause, with exact kinds listed.
+- **crash** (`died before the call`): `crash_before`.
+- **interleaving**: scheduling choices (`sched:actors`, `sched:tasks`) from concurrent processes or `shape.run_async`.
+- **model choice** and **duplicate delivery**: grouped by choice / trigger.
 
-Because the signature includes the exact fault kind, two after-commit faults that expose the same missing idempotency key (such as `timeout_after_commit` and `crash_after`) currently appear as separate causes. Coarser cause grouping is planned.
+Each cause is labeled by what it took to trigger (`needs: after-commit fault (...)`, `needs: model choice`, etc.). Causes that fail on the nominal path with 0 faults and 0 model choices are printed **last** under `nominal path (0 faults, 0 model choices): a plain unit test catches this`, so findings that only fault injection or model perturbation can produce stand out first.
+
+Seeds are processed in order of fewest deviations first. Once a minimized cause is found, any remaining failing seed with the same invariant and op whose raw coarse deviations are a superset of that cause's deviations joins it without running `ddmin` again (recording its exact fault kinds on that cause). At most 200 failing seeds are minimized per sweep. The report prints `N distinct causes across M failing seeds` and one minimized trace per cause.

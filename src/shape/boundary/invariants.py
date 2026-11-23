@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Self
 
 from .log import args_hash
 
@@ -15,6 +15,18 @@ from .log import args_hash
 class Violation:
     invariant: str
     message: str
+    op: str | None = None
+
+
+class _OpMessage(str):
+    """A plain violation message string that also carries the op that violated the invariant."""
+
+    op: str
+
+    def __new__(cls, text: str, op: str) -> Self:
+        obj = super().__new__(cls, text)
+        obj.op = op
+        return obj
 
 
 def _identities(e: dict) -> list[tuple]:
@@ -113,12 +125,36 @@ def at_most_once(op: str) -> Invariant:
     return Invariant(f"at_most_once({op})", check, (op,))
 
 
-def exactly_once(op: str) -> Invariant:
-    """At most once per scope, and, once the scenario finished, at least once overall."""
+def exactly_once(op: str, *, failure_claim_ok: bool = False) -> Invariant:
+    """At most once per scope, and, once the scenario finished, at least once overall.
+
+    With `failure_claim_ok=True`, a lost effect is acceptable when the agent explicitly recorded a
+    failure claim (`shape.claim(scope, op, ok=False)`) for every attempted scope (or any scope if
+    none was attempted) and never claimed success (`ok=True`). Still a violation if the agent
+    claimed success or finished without reporting failure.
+    """
     def check(world: World) -> str | None:
         if (hit := _repeated(world, op)) is not None:
             return f"{op} happened {hit[1]} times for {_where(hit[0])} (it must happen exactly once)"
         if world.completed and not world.effects(op):
+            if failure_claim_ok:
+                op_claims = [c for c in world.claims if c["op"] == op]
+                pos = [c for c in op_claims if c.get("ok", True)]
+                if pos:
+                    return (f"{op} never happened, but the agent claimed it did for "
+                            f"{_where(pos[0]['scope'])}")
+                neg_scopes = {c["scope"] for c in op_claims if not c.get("ok", True)}
+                attempted_scopes = {a["scope"] for a in world.attempts(op)}
+                if attempted_scopes:
+                    missing = sorted(attempted_scopes - neg_scopes)
+                    if not missing:
+                        return None
+                    return (f"{op} never happened for {_where(missing[0])}, and the agent "
+                            f"recorded no failure claim before finishing (a lost effect)")
+                if neg_scopes:
+                    return None
+                return (f"{op} never happened, and the agent recorded no failure claim before "
+                        f"finishing (a lost effect)")
             return f"{op} never happened, but the scenario finished (a lost effect)"
         return None
     return Invariant(f"exactly_once({op})", check, (op,))
@@ -201,15 +237,27 @@ def sum_le(op: str, field: str, limit: float, per_scope: bool = True) -> Invaria
 
 
 def claims_true() -> Invariant:
-    """Every `shape.claim(scope, op)` has an earlier effect of `op` for `scope` that landed."""
+    """Every `shape.claim(scope, op, ok=True)` has an earlier effect of `op` for `scope` that
+    landed, and every `shape.claim(scope, op, ok=False)` has no earlier effect that landed."""
     def check(world: World) -> str | None:
         landed: set[tuple[str, str]] = set()
         for e in world.entries:
             if e["kind"] == "effect":
                 landed.add((e["op"], e["scope"]))
-            elif e["kind"] == "claim" and (e["op"], e["scope"]) not in landed:
-                return (f"the agent told the user {e['op']} happened for {_where(e['scope'])}, "
-                        f"but no such effect had landed")
+            elif e["kind"] == "claim":
+                present = (e["op"], e["scope"]) in landed
+                if e.get("ok", True) and not present:
+                    return _OpMessage(
+                        f"the agent told the user {e['op']} happened for {_where(e['scope'])}, "
+                        f"but no such effect had landed",
+                        e["op"],
+                    )
+                if not e.get("ok", True) and present:
+                    return _OpMessage(
+                        f"the agent told the user {e['op']} did not happen for "
+                        f"{_where(e['scope'])}, but it had already landed",
+                        e["op"],
+                    )
         return None
     return Invariant("claims_true", check)
 
