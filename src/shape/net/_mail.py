@@ -114,6 +114,7 @@ def _smtp(stack, capture):
 
 def _imap(stack, capture):
     def open_connection(client, host="", port=imaplib.IMAP4_PORT, timeout=None):
+        host = host or "localhost"
         capture.provider(host, "command")
         client.host, client.port = host, port
 

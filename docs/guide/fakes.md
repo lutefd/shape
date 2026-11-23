@@ -6,6 +6,32 @@ When an agent charges a card, sends an email, posts to Slack, or opens a GitHub 
 
 > **Verification status:** These fakes are written directly from each provider's published API documentation and tested against their documented semantics, error shapes, and idempotency rules. **They are not yet verified against live provider sandboxes.** Automated contract tests that run the same suite against both each fake and the real provider sandbox are planned work (see [Core simulation design](../design.md#fakes)).
 
+## Capture an existing client
+
+Register a fake on the scenario and call your client as usual. Shape captures the write, injects faults at the transport, and uses the fake's default invariants. The client code needs no `@shape.effect`:
+
+```python
+import requests
+
+import shape
+from shape.fakes import StripeFake
+
+
+@shape.scenario(net=[StripeFake()])
+def checkout(run):
+    response = requests.post(
+        "https://api.stripe.com/v1/charges",
+        data={
+            "amount": 500, "currency": "usd", "source": "tok_visa",
+            "metadata[order_id]": "42",
+        },
+        headers={"Idempotency-Key": "order-42-charge"},
+    )
+    response.raise_for_status()
+```
+
+For a mail agent, use `net=[SmtpFake(), ImapFake(initial_messages=[sample_email_bytes])]` and point its existing clients at `smtp.example.com` and `imap.example.com`. If your application uses different hosts, set `hosts=` on each fake. Use a different host for each mail fake since their default `localhost` alias is shared. See [Network capture](../boundary.md#network-capture).
+
 ## Included providers
 
 | Fake | Module | Default hosts | Mirrored API version | Default invariants |

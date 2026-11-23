@@ -57,7 +57,7 @@ def test_place_order_is_crash_safe():
 
 ### Network capture
 
-Pass provider fake instances to `@shape.scenario(net=[fake, ...])`. Shape installs transport hooks for the scenario, concurrent actors, and world actors. Outside those calls, the clients operate normally. Shape routes by hostname, ignoring the port and comparing names case-insensitively. Aliases on the same fake share its state. Duplicate hostname registrations are configuration errors. A request without a registered fake raises `shape.net.UnregisteredHost`, a harness failure even if the agent catches ordinary client exceptions.
+Pass provider fake instances to `@shape.scenario(net=[fake, ...])`. Shape installs transport hooks for the scenario, concurrent actors, and world actors. Outside those calls, the clients operate normally. Shape routes by hostname, ignoring the port and comparing names case-insensitively. Aliases on the same fake share its state. Each called host must have one matching fake. A request without a registered fake raises `shape.net.UnregisteredHost`, a harness failure even if the agent catches ordinary client exceptions.
 
 | Client | Capture and fault behavior |
 | --- | --- |
