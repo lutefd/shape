@@ -1,6 +1,7 @@
 """client_error, duplicate_trigger and world actors."""
 
 import json
+from pathlib import Path
 
 import pytest
 import scenarios as sc
@@ -111,7 +112,6 @@ def test_duplicate_trigger_is_opt_in_per_scenario(tmp_path):
 
 
 def test_duplicate_trigger_with_the_spawn_fallback(tmp_path, monkeypatch):
-    from pathlib import Path
     monkeypatch.setenv("SHAPE_START_METHOD", "spawn")
     sc.webhook_handler_without_dedup.file = str(Path(sc.__file__))
     out = run(sc.webhook_handler_without_dedup, {DUPLICATE_KEY: 1}, tmp_path)
@@ -136,8 +136,10 @@ def test_a_world_actor_that_leaves_things_alone_passes_and_runs_between_incarnat
 def test_world_actor_choices_are_found_by_seeds_and_shrink_to_the_one_edit(tmp_path):
     with pytest.raises(AssertionError) as info:
         shape.check(sc.stale_approval, seeds=300, runs_dir=tmp_path)
-    assert "[world actor edit_amount_choice]" in str(info.value)
-    min_file = next((tmp_path / "stale_approval").glob("seed-*.min.json"))
+    text = str(info.value)
+    assert "[world actor edit_amount_choice]" in text
+    replay = next(line for line in text.splitlines() if line.startswith("  replay: "))
+    min_file = Path(replay.removeprefix("  replay: "))
     assert json.loads(min_file.read_text())["realized"] == {"model:user_edits_order#0a.0": 1}
 
 

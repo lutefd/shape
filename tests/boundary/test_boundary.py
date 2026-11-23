@@ -73,16 +73,17 @@ def test_at_most_once_violation_is_found_and_shrunk(tmp_path):
     text = str(info.value)
     assert "at_most_once(t.pay)" in text
     assert "NOT MINIMIZED" not in text
-    min_file = next((tmp_path / "naive_retry").glob("seed-*.min.json"))
-    data = json.loads(min_file.read_text())
+    replay = next(line for line in text.splitlines() if line.startswith("  replay: "))
+    data = json.loads(Path(replay.removeprefix("  replay: ")).read_text())
     assert len(data["realized"]) == 1
     assert next(iter(data["realized"])).startswith("fault:t.pay#0.0")
 
 
 def test_replay_of_min_json_reproduces(tmp_path):
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError) as info:
         shape.check(naive_retry, seeds=200, runs_dir=tmp_path)
-    min_file = next((tmp_path / "naive_retry").glob("seed-*.min.json"))
+    replay = next(line for line in str(info.value).splitlines() if line.startswith("  replay: "))
+    min_file = Path(replay.removeprefix("  replay: "))
     code, text = runner.replay_file(naive_retry, min_file, tmp_path)
     assert code == 1
     assert "at_most_once(t.pay)" in text
