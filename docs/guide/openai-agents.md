@@ -77,19 +77,23 @@ shape.agents.drive(
     context=ctx,
     session_factory=lambda d: SQLiteSession(TICKET, str(d / "session.db")),
     human=_approve if approval else None,
+    on_restart="redeliver",
 )
 ```
 
 What `shape.agents.drive` handles for you:
 
-- **Session persistence:** Opens `SQLiteSession("shape", str(run.dir / "session.db"))` by default, or calls `session_factory(run.dir)`.
-- **No mid-turn resume:** The OpenAI Agents SDK does not checkpoint an in-flight tool call inside `Runner.run`. On restart (`run.restarts > 0`), `drive` redelivers `input` to `Runner.run` with the same session, modeling an at-least-once queue or client retry.
-- **Human-in-the-loop (`needs_approval=True`):** When `Runner.run` pauses with `result.interruptions`, `drive` saves `result.to_state()` to `run.dir / "paused-run.json"` (defaulting `context_serializer` to `lambda _: {}` when `context` is supplied, and reloading with `context_override=context`). On restart, if `paused-run.json` exists, `drive` reloads that `RunState`, calls `human(item)` for each interruption (`True` calls `state.approve(item)`, `False` calls `state.reject(item)`), and deletes `paused-run.json` once the run completes with no remaining interruptions.
+- **Distinct session per job by default:** Each `drive()` call in a scenario opens its own `SQLiteSession("shape-job-<n>", str(run.dir / "session.db"))` (`shape-job-0`, `shape-job-1`, ...), so running two independent jobs in one scenario never shares conversation history or causes the second job to skip its tool call. To share a session deliberately across turns (for example a multi-turn conversation), pass the same `session_id="conv-1"` to each `drive()` call (or supply `session_factory=`).
+- **Explicit restart policy (`on_restart`):** The OpenAI Agents SDK does not checkpoint an in-flight tool call inside `Runner.run`, so `drive` does not invent supervisor recovery you did not configure:
+  - `on_restart="none"` (**default**): on a restarted incarnation (`run.restarts > 0`), `drive` does nothing and returns `None`, matching an app with no supervisor.
+  - `on_restart="redeliver"`: models an at-least-once queue or supervisor. On restart, `drive` logs `harness redelivered the request (on_restart='redeliver')` in the trace and reloads any saved approval `RunState` or resends `input` into the same session.
+  - `on_restart=callable`: calls `fn(run)` (sync or async) on restart so you can model your app's exact recovery logic.
+- **Human-in-the-loop (`needs_approval=True`):** When `Runner.run` pauses with `result.interruptions`, `drive` saves `result.to_state()` under `run.dir` (defaulting `context_serializer` to `lambda _: {}` when `context` is supplied, and reloading with `context_override=context`), calls `human(item)` for each interruption (`True` calls `state.approve(item)`, `False` calls `state.reject(item)`), and deletes the saved state file once the run completes with no remaining interruptions. With `on_restart="redeliver"`, a restarted incarnation reloads that saved `RunState`.
 - **No network or API key:** `drive` passes `RunConfig(tracing_disabled=True)` so local runs do not export traces.
 
 ### Worker scenarios vs. interactive chat agents
 
-In [`examples/openai_agents/checks.py`](../../examples/openai_agents/checks.py), the scenario models a support job worker that checks `if not payments.has_refund("17"): raise TicketUnresolved(...)` so a failed attempt triggers a restart and `exactly_once("payments.refund")` holds. If your agent is an interactive chat bot that may legitimately reply "I could not complete your refund" after repeated provider errors, use `shape.at_most_once("payments.refund")` and `shape.claims_true()` instead of `exactly_once` (see [Invariants](invariants.md#when-to-use-claims_true-instead-of-exactly_once)).
+In [`examples/openai_agents/checks.py`](../../examples/openai_agents/checks.py), the scenario models a support job worker behind an at-least-once queue (`on_restart="redeliver"` plus `if not payments.has_refund("17"): raise TicketUnresolved(...)`), so a crashed or unresolved attempt triggers a restart and `exactly_once("payments.refund")` holds. If your agent is an interactive chat bot with no supervisor that may legitimately reply "I could not complete your refund" after repeated provider errors, leave `on_restart="none"` and use `shape.at_most_once("payments.refund")` and `shape.claims_true()` instead of `exactly_once` (see [Invariants](invariants.md#when-to-use-claims_true-instead-of-exactly_once)).
 
 ## 4. Real findings in `examples/openai_agents/` and their fixes
 
@@ -101,30 +105,33 @@ cd examples/openai_agents
 .venv/bin/shape test checks.py::refund_keyed --seeds 300 --jobs 4
 ```
 
-### Finding 1: Unkeyed refund double-refunds under model repeat, after-commit errors, and mid-tool crashes (`refund_unkeyed`)
+### Finding 1: Unkeyed refund double-refunds under model repeat, reply loss, and mid-tool crashes (`refund_unkeyed`)
 
-`refund_unkeyed` fails 52 of 300 seeds across 2 distinct causes, both violating `at_most_once(payments.refund)`:
+`refund_unkeyed` fails 52 of 300 seeds across 3 distinct causes, all violating `at_most_once(payments.refund)`:
 
 1. **Model choice (33 of 52 failing seeds, 0 faults):** The model repeats `issue_refund` twice in a row.
-2. **After-commit fault (19 of 52 failing seeds — `connection_reset_after_commit`, `crash_after`, and `timeout_after_commit` grouped together):** The refund lands, the caller never sees the commit (the SDK hands `"An error occurred while running the tool."` to the model, or the process dies mid-tool before `SQLiteSession` saves the turn), and the retry or restarted incarnation refunds again.
+2. **Reply lost (14 of 52 failing seeds — `connection_reset_after_commit` and `timeout_after_commit`):** The refund lands, the reply is lost so the SDK hands `"An error occurred while running the tool."` to the model, and the same process retries without a key.
+3. **Crash after commit (5 of 52 failing seeds — `crash_after`):** The process dies mid-tool before `SQLiteSession` saves the turn; on restart, the trace explicitly shows `harness redelivered the request (on_restart='redeliver')` before the second refund lands.
 
 Real output:
 
 ```text
-scenario=refund_unkeyed  seeds=300 (from 0)  failing=52  wall=16.67s  18 seeds/s
+scenario=refund_unkeyed  seeds=300 (from 0)  failing=52  wall=8.06s  37 seeds/s
 coverage over 300 seeds:
   op                landed  attempts
   payments.refund      362       427
                    faults injected: client_error 10, connection_reset_after_commit 13, crash_after 18, crash_before 11, rate_limit 16, server_error 11, timeout 17, timeout_after_commit 13
   model choices taken: after restart: call 1: lookup_order -> 'reissue' x5, call 1: lookup_order -> 'drop' x26, call 1: lookup_order -> 'repeat' x22, call 1: lookup_order -> 'swap' x20, call 2: issue_refund -> 'drop' x24, call 2: issue_refund -> 'repeat' x35, error at call 2: issue_refund -> 'retry_0' x5, error at call 2: issue_refund -> 'retry_2' x3
   interleaving choices taken: none
-2 distinct causes across 52 failing seeds
+scope assignment:
+  payments.refund: explicit scope= (e.g. 'order:17')
+3 distinct causes across 52 failing seeds
 
-cause 1 of 2: 33 of 52 failing seeds (4, 13, 20, 42, 43, ...)
+cause 1 of 3: 33 of 52 failing seeds (4, 13, 20, 42, 43, ...)
   needs: model choice
 FAIL checks.py::refund_unkeyed  seed=4  invariant=at_most_once(payments.refund)
   payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
-  minimized to 3 steps (1 of 1 deviations kept, 3 replays):
+  minimized to 3 steps (1 of 1 deviations kept, 2 replays):
     incarnation 0
       1. model chose 'repeat' at 'call 2: issue_refund' (nominal: issue_refund(order_id='17', amount_cents=4200))
       2. issue_refund(order_id='17', amount_cents=4200)
@@ -134,11 +141,11 @@ FAIL checks.py::refund_unkeyed  seed=4  invariant=at_most_once(payments.refund)
       finished
   replay: runs/refund_unkeyed/seed-4.min.json
 
-cause 2 of 2: 19 of 52 failing seeds (7, 15, 23, 41, 63, ...)
-  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, crash_after, timeout_after_commit)
+cause 2 of 3: 14 of 52 failing seeds (7, 15, 23, 63, 67, ...)
+  needs: reply lost (commit landed, caller saw an error: connection_reset_after_commit, timeout_after_commit)
 FAIL checks.py::refund_unkeyed  seed=7  invariant=at_most_once(payments.refund)
   payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
-  minimized to 2 steps (1 of 1 deviations kept, 3 replays):
+  minimized to 2 steps (1 of 1 deviations kept, 2 replays):
     incarnation 0
       1. issue_refund(order_id='17', amount_cents=4200)
            effect landed, then connection reset after commit: the caller saw ConnectionResetError
@@ -146,13 +153,29 @@ FAIL checks.py::refund_unkeyed  seed=7  invariant=at_most_once(payments.refund)
            effect landed
       finished
   replay: runs/refund_unkeyed/seed-7.min.json
+
+cause 3 of 3: 5 of 52 failing seeds (41, 65, 186, 271, 287)
+  needs: crash after commit (process died after the commit: crash_after)
+FAIL checks.py::refund_unkeyed  seed=41  invariant=at_most_once(payments.refund)
+  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
+  minimized to 2 steps (1 of 2 deviations kept, 5 replays):
+    incarnation 0
+      1. issue_refund(order_id='17', amount_cents=4200)
+           effect landed, then process killed after the effect landed, before the caller saw it
+      -> process died
+    incarnation 1 (restarted)
+      harness redelivered the request (on_restart='redeliver')
+      2. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      finished
+  replay: runs/refund_unkeyed/seed-41.min.json
 ```
 
 **Fix (`refund_keyed`):** Pass a stable idempotency key derived from durable business facts (`f"{TICKET}:refund:{order_id}"`, not from a per-call `tool_call_id`). All 300 seeds pass (`failing=0`).
 
 ### Finding 2: Approval alone does not prevent duplicate refunds (`refund_approval_unkeyed`)
 
-With `needs_approval=True`, `approved_before(payments.refund)` holds across every seed, but `refund_approval_unkeyed` still fails `at_most_once(payments.refund)` on 54 of 300 seeds across 3 distinct causes (model repeat, after-commit faults including `crash_after` reloading `paused-run.json`, and `crash_before` + post-restart model reissue).
+With `needs_approval=True`, `approved_before(payments.refund)` holds across every seed, but `refund_approval_unkeyed` still fails `at_most_once(payments.refund)` on 54 of 300 seeds across distinct causes (model repeat, reply lost after commit, crash after commit reloading `paused-run.json`, and `crash_before` + post-restart model reissue).
 
 **Fix (`refund_approval_keyed`):** Combine `needs_approval=True` with the stable idempotency key. All 300 seeds pass (`failing=0`).
 
@@ -193,6 +216,7 @@ FAIL refund_unkeyed  invariant=at_most_once(payments.refund) (replayed)
          effect landed, then process killed after the effect landed, before the caller saw it
     -> process died
   incarnation 1 (restarted)
+    harness redelivered the request (on_restart='redeliver')
     2. issue_refund(order_id='17', amount_cents=4200)
          effect landed
     finished

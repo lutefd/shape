@@ -23,7 +23,7 @@ jobs:
           python-version: "3.12"
       - run: pip install "git+https://github.com/lutefd/shape"
       - name: Run crash-safety scenarios
-        run: shape test tests/shape_checks.py --seeds 300 --jobs 4 --runs-dir /tmp/shape-runs
+        run: shape test tests/shape_checks.py --seeds 300 --jobs 4 --strict-scopes --runs-dir /tmp/shape-runs
       - name: Upload minimized traces on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -49,7 +49,7 @@ Practical defaults:
 
 `--jobs J` forks workers on Unix. On platforms without `os.fork`, shape runs seeds serially. With a fixed seed set and no time budget, both modes inspect the same seeds.
 
-Use `--budget 30 --max-shrinks 10` to limit time and shrinking in a PR job. The budget covers seed execution, failure confirmation, and shrinking. Shape reports skipped seeds, confirmations, and shrinks. An incomplete seed sweep exits 1. `--max-shrinks 0` keeps original failing runs and skips minimization.
+Use `--budget 30 --max-shrinks 10` to limit time and shrinking in a PR job. The budget covers seed execution, failure confirmation, and shrinking. Shape reports skipped seeds, confirmations, and shrinks. An incomplete seed sweep exits 1. `--max-shrinks 0` keeps original failing runs and skips minimization. Pass `--strict-scopes` (or `@shape.scenario(..., strict_scopes=True)` / `shape.check(..., strict_scopes=True)`) in CI so duplicate-sensitive invariants refuse default/derived scopes instead of letting unrelated jobs collide into false duplicates.
 
 ## Exit codes
 

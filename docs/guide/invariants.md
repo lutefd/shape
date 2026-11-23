@@ -18,6 +18,8 @@ For exact signatures and world-log schema, see [docs/boundary.md](../boundary.md
 
 Each `scope` may have at most one real effect of `op`. Calls with the same `op`, `scope`, and non-null `key` deduplicate to one effect. Calls with `idempotent=True` and identical visible arguments also deduplicate to one effect.
 
+> **Strict business scopes:** Because `at_most_once`, `exactly_once`, and provider fake defaults judge duplicates per `scope`, a coarse default scope (such as SendGrid or SMTP's `to|subject` rule, or an `@shape.effect` without `scope=`) can merge two distinct legitimate jobs into one scope and report a false duplicate. After every sweep, `shape` prints a `scope assignment:` section and warns when a default rule is used with a duplicate-sensitive invariant. Pass `@shape.scenario(..., strict_scopes=True)` or `shape test --strict-scopes` in CI to refuse default scopes and require an explicit `scope=` callback.
+
 ```python
 @shape.scenario(invariants=[shape.at_most_once("payments.charge")], max_restarts=1)
 def retry_without_key(run: shape.Run) -> None:

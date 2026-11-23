@@ -37,7 +37,7 @@ For a mail agent, use `net=[SmtpFake(), ImapFake(initial_messages=[sample_email_
 | Fake | Module | Default hosts | Mirrored API version | Default invariants |
 | --- | --- | --- | --- | --- |
 | `StripeFake` | `shape.fakes.stripe` | `api.stripe.com` | `2024-06-20` | `at_most_once("stripe.charge")`, `at_most_once("stripe.refund")`, `stripe_refunds_le_charges` |
-| `SmtpFake` | `shape.fakes.smtp` | `smtp.example.com`, `localhost` | `RFC 5321 / RFC 5322` | `at_most_once("smtp.reply")` |
+| `SmtpFake` | `shape.fakes.smtp` | `smtp.example.com`, `localhost` | `RFC 5321 / RFC 5322` | `at_most_once("smtp.reply")`, `at_most_once("smtp.send")` |
 | `ImapFake` | `shape.fakes.imap` | `imap.example.com`, `localhost` | `RFC 3501 (IMAP4rev1)` | none (mailbox reads/flags/expunge) |
 | `SlackFake` | `shape.fakes.slack` | `slack.com`, `api.slack.com` | `Slack Web API (2024)` | `at_most_once("slack.chat.postMessage")` |
 | `GitHubFake` | `shape.fakes.github` | `api.github.com` | `2022-11-28` | `at_most_once("github.issue.create")` |
@@ -67,6 +67,8 @@ Each fake intentionally models only the semantics safety invariants depend on: r
   - Parsing `Message-ID`, `To`, `Subject`, `In-Reply-To`, and `References` headers; non-idempotent sends (retrying sends a duplicate email)
   - Configurable `reject_recipients` returning `550` refusals; `effect()` reports `landed=False` when every recipient is refused
   - Default scope for replies (`In-Reply-To` present) is `thread:<thread>|in_reply_to:<in_reply_to>` with op `smtp.reply`, enforcing at most one reply per `(thread, In-Reply-To)`
+  - Default scope for fresh sends (no `In-Reply-To`) is Message-ID-less `to:<recipients>|subject:<norm_subject>` with op `smtp.send`, enforcing `at_most_once("smtp.send")` (with a default-scope warning unless you pass `scope=`)
+  - Parsed headers passed to `scope(req, parsed)` include `headers` (lowercased header dict, e.g. `parsed["headers"]["x-job-id"]`), `subject`, `norm_subject`, `to_header`, `message_id`, `in_reply_to`, `references`, and `thread`
 - **`ImapFake` models:**
   - `SELECT` / `EXAMINE`, `SEARCH` (`ALL`, `SEEN`, `UNSEEN`, `FLAGGED`, `DELETED`, `ANSWERED`, `FROM`, `TO`, `SUBJECT`, `HEADER`), `FETCH` (`RFC822`, `BODY[]`, `BODY.PEEK[]`, `BODY[HEADER]`, `FLAGS`, `UID`), `STORE` (`+FLAGS`, `-FLAGS`, `FLAGS`, `.SILENT`), `APPEND`, `EXPUNGE`, `UID` variants, plus `LOGIN`, `LIST`, `CREATE`, `CLOSE`, `NOOP`, `LOGOUT`
   - Persistent UIDs and flags (`\Seen` set implicitly on non-`PEEK` body fetches or explicitly via `STORE`, surviving across crashed processes via JSON `state`)
@@ -107,10 +109,30 @@ Each fake intentionally models only the semantics safety invariants depend on: r
 
 ## Configuring scopes
 
-Invariants such as `at_most_once` group effects by `scope`. Every fake has a sensible default scope, and every fake accepts a `scope=` callable so you can bind scopes to your own business entity (such as an order ID, ticket ID, or run step):
+Invariants such as `at_most_once` group effects by `scope`. Every fake has a default scope heuristic so quick prototypes work out of the box, **but default heuristics can merge two legitimate jobs** (for example, two separate jobs sending emails with the same recipient and subject under SendGrid or SMTP's `to|subject` rule).
+
+After every sweep, `shape` prints a `scope assignment:` section showing how each op's scope was derived and warns when a default rule is used by a duplicate-sensitive invariant:
+
+```text
+scope assignment:
+  sendgrid.mail.send: fake default rule `to|subject` (e.g. 'to:alice@example.com|subject:Daily report')
+  warning: sendgrid.mail.send uses a default scope rule with at_most_once(sendgrid.mail.send); pass scope= to the fake or effect (or run with --strict-scopes)
+```
+
+In CI, pass `--strict-scopes` (or `@shape.scenario(..., strict_scopes=True)`) so duplicate-sensitive invariants refuse default rules and require an explicit business `scope=` on every fake:
 
 ```python
-from shape.fakes import GitHubFake, SendGridFake, SlackFake, StripeFake, TwilioFake
+from shape.fakes import GitHubFake, SendGridFake, SlackFake, SmtpFake, StripeFake, TwilioFake
+
+# SendGrid: bind scope to your business job/order ID in custom_args
+sendgrid = SendGridFake(
+    scope=lambda req, params: f"job:{params['custom_args']['job_id']}"
+)
+
+# SMTP: bind fresh sends (or replies) to a custom header such as X-Job-Id
+smtp = SmtpFake(
+    scope=lambda req, parsed: f"job:{parsed['headers']['x-job-id']}"
+)
 
 # Stripe: read scope from a specific metadata key, or pass a custom function
 stripe = StripeFake(scope_metadata_key="order_id")
@@ -130,10 +152,7 @@ github = GitHubFake(
     scope=lambda req, params: f"ticket:{params.get('title', '').split(':')[0]}",
 )
 
-# SendGrid and Twilio: scope per order or recipient+template
-sendgrid = SendGridFake(
-    scope=lambda req, params: f"order:{(params.get('custom_args') or {}).get('order_id', '')}"
-)
+# Twilio: scope per job or recipient
 twilio = TwilioFake(
     scope=lambda req, params: f"sms:{params.get('To', '')}"
 )
