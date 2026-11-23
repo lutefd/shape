@@ -39,7 +39,7 @@ jobs:
       - name: Mailtrap SDK example must find the false failure report
         run: |
           code=0
-          shape test examples/net/mailtrap.py::mailtrap_reports_last_result +            --start 931 --seeds 1 > mailtrap.out || code=$?
+          shape test examples/net/mailtrap.py::mailtrap_reports_last_result --start 931 --seeds 1 > mailtrap.out || code=$?
           cat mailtrap.out
           test "$code" -eq 1
           grep -q 'invariant=claims_true' mailtrap.out
