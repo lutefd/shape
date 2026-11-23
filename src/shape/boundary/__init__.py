@@ -1,11 +1,45 @@
 """Boundary mode: test agent code you already have by faulting and killing its side effects."""
 
-from .api import Run, Scenario, approval, choose, effect, scenario
-from .faults import RateLimited, ServerError
-from .invariants import approved_before, at_most_once, exactly_once, scenario_terminates
+from .api import Actor, Run, Scenario, actor, approval, choose, claim, effect, scenario
+from .faults import ClientError, RateLimited, ServerError
+from .invariants import (
+    World,
+    approved_before,
+    at_most_once,
+    claims_true,
+    exactly_once,
+    invariant,
+    max_calls,
+    requires,
+    scenario_terminates,
+    sum_le,
+    within_scopes,
+)
 from .runner import check
 
 __all__ = [
-    "RateLimited", "Run", "Scenario", "ServerError", "approval", "approved_before", "at_most_once",
-    "check", "choose", "effect", "exactly_once", "scenario", "scenario_terminates",
+    "Actor",
+    "ClientError",
+    "RateLimited",
+    "Run",
+    "Scenario",
+    "ServerError",
+    "World",
+    "actor",
+    "approval",
+    "approved_before",
+    "at_most_once",
+    "check",
+    "choose",
+    "claim",
+    "claims_true",
+    "effect",
+    "exactly_once",
+    "invariant",
+    "max_calls",
+    "requires",
+    "scenario",
+    "scenario_terminates",
+    "sum_le",
+    "within_scopes",
 ]

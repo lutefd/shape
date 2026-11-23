@@ -30,4 +30,5 @@ def scenarios_in(module) -> dict[str, api.Scenario]:
 if __name__ == "__main__":
     job = json.loads(sys.argv[1])
     scen = scenarios_in(load_module(job["file"]))[job["name"]]
-    os._exit(runner.child_main(scen, job["spec"], Path(job["workdir"]), job["inc"]))
+    os._exit(runner.child_main(scen, job["spec"], Path(job["workdir"]), job["inc"],
+                                   job.get("twin", 0)))

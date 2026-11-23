@@ -6,6 +6,9 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
+
+from .log import args_hash
 
 
 @dataclass(frozen=True)
@@ -14,74 +17,201 @@ class Violation:
     message: str
 
 
-class World:
-    """The merged, ordered world log of one seed plus whether the scenario finished."""
+def _identities(e: dict) -> list[tuple]:
+    """What makes two logged effects one: the same op, scope and idempotency key (the provider
+    dedupes by key), or, for an `idempotent=True` effect, the same op, scope and arguments."""
+    ids = []
+    if e["key"] is not None:
+        ids.append((e["op"], e["scope"], "key", e["key"]))
+    if e.get("idempotent"):
+        ids.append((e["op"], e["scope"], "args", e["args_hash"]))
+    return ids
 
-    def __init__(self, entries: list[dict], completed: bool, incarnations: int, max_restarts: int):
-        self.entries = sorted(entries, key=lambda e: (e["inc"], e["seq"]))
+
+class World:
+    """What really happened, as the code under test cannot misreport it. A custom invariant
+    (`@shape.invariant`) reads it. Entries are plain dicts in the order they were logged.
+
+    - `effects(op=None, scope=None)`: real effects, calls that are one effect counted once. Keys:
+      `op`, `scope`, `key`, `call` (rendered call), `args` (named arguments, hidden ones left
+      out), `result` (what `result=` returned), `fault` (the fault injected on that call, if
+      any; after-commit faults still landed), `inc` (incarnation).
+    - `attempts(op=None, scope=None)`: every call, failed and killed ones included. Keys: `op`,
+      `scope`, `call`, `fault`, `inc`.
+    - `approvals`: `shape.approval(...)` entries (`scope`, `args_hash`).
+    - `claims`: `shape.claim(...)` entries (`scope`, `op`).
+    - `completed`: the scenario returned. `run`: the final `shape.Run`, so you can read `run.dir`.
+    """
+
+    def __init__(self, entries: list[dict], completed: bool, incarnations: int, max_restarts: int,
+                 run: Any = None):
+        self.entries = entries
         self.completed = completed
         self.incarnations = incarnations
         self.max_restarts = max_restarts
+        self.run = run
 
-    def effects(self, op: str) -> list[dict]:
-        """Real effects of `op`. Calls that share a scope and an idempotency key are one."""
-        seen: set[tuple[str, str]] = set()
+    def _kind(self, kind: str, op: str | None, scope: str | None) -> list[dict]:
+        return [e for e in self.entries if e["kind"] == kind
+                and (op is None or e["op"] == op) and (scope is None or e["scope"] == scope)]
+
+    def effects(self, op: str | None = None, scope: str | None = None) -> list[dict]:
+        seen: set[tuple] = set()
         out = []
         for e in self.entries:
-            if e["kind"] != "effect" or e["op"] != op:
+            if e["kind"] != "effect":
                 continue
-            if e["key"] is not None:
-                if (e["scope"], e["key"]) in seen:
-                    continue
-                seen.add((e["scope"], e["key"]))
-            out.append(e)
+            ids = _identities(e)
+            if any(i in seen for i in ids):
+                continue
+            seen.update(ids)
+            if (op is None or e["op"] == op) and (scope is None or e["scope"] == scope):
+                out.append(e)
         return out
+
+    def attempts(self, op: str | None = None, scope: str | None = None) -> list[dict]:
+        return self._kind("attempt", op, scope)
+
+    @property
+    def approvals(self) -> list[dict]:
+        return [e for e in self.entries if e["kind"] == "approval"]
+
+    @property
+    def claims(self) -> list[dict]:
+        return [e for e in self.entries if e["kind"] == "claim"]
 
 
 @dataclass(frozen=True)
 class Invariant:
     name: str
     check: Callable[[World], str | None]
+    ops: tuple[str, ...] = ()  # the effect ops it watches, for the coverage report
 
 
-def _duplicates(world: World, op: str) -> str | None:
+def invariant(fn: Callable[[World], str | None]) -> Invariant:
+    """Turn `fn(world) -> str | None` into an invariant: return a plain-words message when the
+    run is wrong, None when it is fine. Use it in `@shape.scenario(invariants=[...])`."""
+    return Invariant(fn.__name__, fn)
+
+
+def _where(scope: str) -> str:
+    return f"scope {scope!r}" if scope else "the run"
+
+
+def _repeated(world: World, op: str) -> tuple[str, int] | None:
     by_scope: dict[str, int] = defaultdict(int)
     for e in world.effects(op):
         by_scope[e["scope"]] += 1
-    for scope, n in by_scope.items():
-        if n > 1:
-            where = f"scope {scope!r}" if scope else "the run"
-            return f"{op} happened {n} times for {where} (at most 1 allowed)"
-    return None
+    return next(((scope, n) for scope, n in by_scope.items() if n > 1), None)
 
 
 def at_most_once(op: str) -> Invariant:
-    return Invariant(f"at_most_once({op})", lambda w: _duplicates(w, op))
+    def check(world: World) -> str | None:
+        if (hit := _repeated(world, op)) is not None:
+            return f"{op} happened {hit[1]} times for {_where(hit[0])} (at most 1 allowed)"
+        return None
+    return Invariant(f"at_most_once({op})", check, (op,))
 
 
 def exactly_once(op: str) -> Invariant:
     """At most once per scope, and, once the scenario finished, at least once overall."""
     def check(world: World) -> str | None:
-        if (dup := _duplicates(world, op)) is not None:
-            return dup
+        if (hit := _repeated(world, op)) is not None:
+            return f"{op} happened {hit[1]} times for {_where(hit[0])} (it must happen exactly once)"
         if world.completed and not world.effects(op):
             return f"{op} never happened, but the scenario finished (a lost effect)"
         return None
-    return Invariant(f"exactly_once({op})", check)
+    return Invariant(f"exactly_once({op})", check, (op,))
 
 
-def approved_before(op: str) -> Invariant:
-    """Every effect of `op` has an earlier approval with the same scope and argument hash."""
+def approved_before(op: str, match: Callable[[dict], Any] | None = None) -> Invariant:
+    """Every effect of `op` has an earlier approval with the same scope and argument hash.
+
+    `match(effect_args)` maps the effect's named arguments to what the human approved, for when
+    the two differ (the effect sits at an API layer below the tool the human saw)."""
     def check(world: World) -> str | None:
         approvals: set[tuple[str, str]] = set()
         for e in world.entries:
             if e["kind"] == "approval":
                 approvals.add((e["scope"], e["args_hash"]))
-            elif (e["kind"] == "effect" and e["op"] == op
-                  and (e["scope"], e["args_hash"]) not in approvals):
-                return f"{e['call']} ran with no earlier approval for scope {e['scope']!r}"
+            elif e["kind"] == "effect" and e["op"] == op:
+                digest = args_hash(match(e["args"])) if match else e["args_hash"]
+                if (e["scope"], digest) not in approvals:
+                    return f"{e['call']} ran with no earlier approval for scope {e['scope']!r}"
         return None
-    return Invariant(f"approved_before({op})", check)
+    return Invariant(f"approved_before({op})", check, (op,))
+
+
+def requires(op: str, before: str, same_scope: bool = True) -> Invariant:
+    """Every `op` effect has an earlier effect of `before` that landed, for the same scope."""
+    def check(world: World) -> str | None:
+        landed: set[str] = set()
+        for e in world.entries:
+            if e["kind"] != "effect":
+                continue
+            if e["op"] == before:
+                landed.add(e["scope"])
+            elif e["op"] == op and not (e["scope"] in landed if same_scope else landed):
+                where = f" for {_where(e['scope'])}" if same_scope else ""
+                return f"{e['call']} happened with no earlier {before} that landed{where}"
+        return None
+    return Invariant(f"requires({op}, before={before})", check, (op,))
+
+
+def within_scopes(op: str, allowed: Any) -> Invariant:
+    """Every `op` effect acts on an allowed scope. `allowed` is a collection of scopes, or a
+    function of the final `shape.Run` that returns one."""
+    def check(world: World) -> str | None:
+        ok = allowed(world.run) if callable(allowed) else allowed
+        for e in world.effects(op):
+            if e["scope"] not in ok:
+                shown = ", ".join(sorted(map(repr, ok))[:5]) or "none"
+                return f"{e['call']} acted on {e['scope']!r}, outside the allowed scopes ({shown})"
+        return None
+    return Invariant(f"within_scopes({op})", check, (op,))
+
+
+def _grouped(entries: list[dict], per_scope: bool) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for e in entries:
+        groups[e["scope"] if per_scope else ""].append(e)
+    return groups
+
+
+def max_calls(op: str, n: int, per_scope: bool = True) -> Invariant:
+    """At most `n` calls of `op` (per scope), failed and killed calls included."""
+    def check(world: World) -> str | None:
+        for scope, calls in _grouped(world.attempts(op), per_scope).items():
+            if len(calls) > n:
+                return (f"{op} was called {len(calls)} times for {_where(scope)}, failed calls "
+                        f"included (at most {n} allowed)")
+        return None
+    return Invariant(f"max_calls({op}, {n})", check, (op,))
+
+
+def sum_le(op: str, field: str, limit: float, per_scope: bool = True) -> Invariant:
+    """The numeric argument `field` of real `op` effects sums to at most `limit` (per scope)."""
+    def check(world: World) -> str | None:
+        for scope, hits in _grouped(world.effects(op), per_scope).items():
+            total = sum(v for e in hits if isinstance(v := e["args"].get(field), int | float))
+            if total > limit:
+                return f"{op} {field} added up to {total} for {_where(scope)} (limit {limit})"
+        return None
+    return Invariant(f"sum_le({op}.{field}, {limit})", check, (op,))
+
+
+def claims_true() -> Invariant:
+    """Every `shape.claim(scope, op)` has an earlier effect of `op` for `scope` that landed."""
+    def check(world: World) -> str | None:
+        landed: set[tuple[str, str]] = set()
+        for e in world.entries:
+            if e["kind"] == "effect":
+                landed.add((e["op"], e["scope"]))
+            elif e["kind"] == "claim" and (e["op"], e["scope"]) not in landed:
+                return (f"the agent told the user {e['op']} happened for {_where(e['scope'])}, "
+                        f"but no such effect had landed")
+        return None
+    return Invariant("claims_true", check)
 
 
 def scenario_terminates() -> Invariant:
