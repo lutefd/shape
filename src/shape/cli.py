@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+import traceback
 from collections import Counter
 from pathlib import Path
 
@@ -96,12 +98,43 @@ def cmd_shrink(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_test(args: argparse.Namespace) -> int:
-    from .boundary import runner
+def _import_failure(path: str, exc: BaseException) -> str:
+    """One clean line for a scenario file that does not import, with where in the file it broke."""
+    from .boundary.rootcause import describe
+
+    here = Path(path).resolve().parent
+    if isinstance(exc, SyntaxError) and exc.lineno:
+        where = f" ({Path(exc.filename or path).name}:{exc.lineno})"
+    else:
+        mine = [f for f in traceback.extract_tb(exc.__traceback__)
+                if Path(f.filename).resolve().is_relative_to(here)]
+        where = f" ({Path(mine[-1].filename).name}:{mine[-1].lineno})" if mine else ""
+    return (f"shape: cannot import {path}: {describe(exc)}{where}\n"
+            f"(SHAPE_TRACEBACK=1 shows the full traceback)")
+
+
+def _load_scenarios(path: str) -> dict | None:
     from .boundary.child import load_module, scenarios_in
 
+    if not Path(path).is_file():
+        print(f"shape: no such file: {path}", file=sys.stderr)
+        return None
+    try:
+        return scenarios_in(load_module(path))
+    except (Exception, SystemExit) as exc:  # the user's module can fail any way
+        if os.environ.get("SHAPE_TRACEBACK"):
+            raise
+        print(_import_failure(path, exc), file=sys.stderr)
+        return None
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    from .boundary import runner
+
     path, _, name = args.target.partition("::")
-    found = scenarios_in(load_module(path))
+    found = _load_scenarios(path)
+    if found is None:
+        return 2
     if name and name not in found:
         known = ", ".join(found) or "none"
         print(f"no scenario {name!r} in {path}; found: {known}", file=sys.stderr)
@@ -119,18 +152,24 @@ def cmd_test(args: argparse.Namespace) -> int:
         return code
     failed = False
     for scen in chosen.values():
-        seeds = range(args.start, args.start + args.seeds)
-        failing, wall = runner.timed_sweep(scen, seeds, runs, args.jobs)
+        swept = runner.run_sweep(scen, range(args.start, args.start + args.seeds), runs, args.jobs)
+        flaky = f"  flaky={len(swept.flaky)}" if swept.flaky else ""
         print(f"scenario={scen.name}  seeds={args.seeds} (from {args.start})  "
-              f"failing={len(failing)}  wall={wall:.2f}s  {args.seeds / wall:.0f} seeds/s")
-        if not failing:
-            print("PASS")
-            continue
-        failed = True
-        for invariant in dict.fromkeys(f[1] for f in failing):
-            seed, _, realized = runner.pick(failing, invariant)
+              f"failing={len(swept.failing)}{flaky}  wall={swept.wall:.2f}s  "
+              f"{args.seeds / swept.wall:.0f} seeds/s")
+        print(swept.cov.render())
+        print("\n".join(swept.notes(scen)), end="\n" if swept.notes(scen) else "")
+        problems = swept.problems(scen)
+        if swept.failing:
             target = f"{path}::{scen.name}"
-            print(runner.investigate(scen, seed, invariant, realized, runs, target).render())
+            print(runner.investigate_all(scen, swept.failing, runs, target).render())
+        if swept.flaky:
+            print(runner.render_flaky(swept.flaky))
+        print("\n".join(problems), end="\n" if problems else "")
+        if swept.failing or swept.flaky or problems:
+            failed = True
+        else:
+            print("PASS")
     return 1 if failed else 0
 
 
@@ -163,6 +202,9 @@ def main(argv: list[str] | None = None) -> int:
     except Escape as escape:
         print(f"ESCAPE: {escape}", file=sys.stderr)
         return 2
+    except BrokenPipeError:  # `shape test ... | head`: the reader left, which is not an error
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())  # no flush error at exit
+        return 141
 
 
 if __name__ == "__main__":
