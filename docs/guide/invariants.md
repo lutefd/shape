@@ -41,11 +41,13 @@ FAIL docs/guide/examples/invariants.py::retry_without_key  seed=7  invariant=at_
       finished
 ```
 
-### `exactly_once(op)`
+### `exactly_once(op, failure_claim_ok=False)`
 
 **Bug it catches:** Both duplicate effects and lost effects (for example, marking a task done before the effect lands, then crashing or catching an error and never retrying).
 
 Checks two things: at most one real effect per scope, and when the scenario finishes cleanly (`world.completed`), at least one real effect of `op` overall.
+
+With `failure_claim_ok=True`, a lost effect is acceptable when the agent explicitly recorded a failure claim (`shape.claim(scope, op, ok=False)`) for every attempted scope and never claimed success (`ok=True`). Claiming success or finishing silently with no failure claim is still a violation.
 
 ```python
 @shape.scenario(invariants=[shape.exactly_once("payments.charge")], max_restarts=3)
@@ -217,11 +219,11 @@ FAIL docs/guide/examples/invariants.py::over_refund  seed=1  invariant=sum_le(pa
       finished
 ```
 
-### `claims_true()` and `shape.claim(scope, op)`
+### `claims_true()` and `shape.claim(scope, op, ok=True)`
 
-**Bug it catches:** An agent telling the user "I refunded your order" when the refund failed before commit or never ran.
+**Bug it catches:** An agent telling the user "I refunded your order" when the refund failed before commit or never ran — or telling the user "I couldn't refund your order" when the refund actually landed (for example after `timeout_after_commit`).
 
-Call `shape.claim(scope, op)` at the point where your agent tells the user that `op` happened for `scope`. `shape.claims_true()` checks that every claim has an earlier landed effect for that `(op, scope)`.
+Call `shape.claim(scope, op)` (`ok=True`) when your agent tells the user that `op` happened for `scope`, and `shape.claim(scope, op, ok=False)` when it tells the user `op` could not happen. `shape.claims_true()` checks that every `ok=True` claim has an earlier landed effect and every `ok=False` claim has no earlier landed effect.
 
 ```python
 @shape.scenario(invariants=[shape.claims_true()], max_restarts=1)
@@ -258,11 +260,10 @@ User-facing agents are different. When a payment API returns repeated errors or 
 
 For user-facing agents that may legitimately give up:
 
-1. Use `shape.at_most_once(op)` to prevent duplicates.
-2. Call `shape.claim(scope, op)` when your agent replies that the action succeeded (for example, after checking the final assistant response or the tool result it is reporting).
-3. Add `shape.claims_true()` instead of `shape.exactly_once(op)`.
+1. Use `shape.at_most_once(op)` + `shape.claims_true()` (calling `shape.claim(scope, op)` on success and `shape.claim(scope, op, ok=False)` on reported failure), **or**
+2. Use `shape.exactly_once(op, failure_claim_ok=True)` + `shape.claims_true()`, which requires either a landed effect or an explicit `shape.claim(scope, op, ok=False)` for every attempted scope (still failing if the agent claims success or exits silently).
 
-That allows the agent to apologize and exit cleanly when the provider is down, while still failing any run where the agent lies about an effect that did not land.
+That allows the agent to apologize and exit cleanly when the provider is down, while still failing any run where the agent lies about an effect or silently drops it.
 
 ## Custom invariants with `@shape.invariant`
 

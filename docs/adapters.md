@@ -39,7 +39,7 @@ def refund_check(run: shape.Run) -> None:
                               {"configurable": {"thread_id": "ticket-17"}}, run, durability="sync")
 ```
 
-For graphs that pause at `interrupt()`, pass `human=lambda payload: shape.choose("human", [True, False])` (or return an edit dict) to `shape.langgraph.drive(...)`. Async graphs use `await shape.langgraph.adrive(...)`.
+For graphs that pause at `interrupt()` or static `interrupt_before=` / `interrupt_after=` breakpoints, pass `human=...` to `shape.langgraph.drive(...)`. Async graphs use `await shape.langgraph.adrive(...)`.
 
 ## OpenAI Agents SDK in under 20 lines
 
@@ -73,15 +73,25 @@ For `needs_approval=True` tools, pass `human=approve_fn` (returning `True` to ap
 `effects(tools, ops={...})` returns a new list of tools with each tool named in `ops` wrapped in `@shape.effect(...)` (preserving sync and async execution, schemas, and error handlers). Unlisted tools pass through untouched. Each value in `ops` can be:
 
 - an op name string: `"payments.refund"`
-- a dict: `{"op": "payments.refund", "scope": ..., "key": ..., "irreversible": False, "errors": ..., "idempotent": False, "result": ..., "hide": ()}`
+- a dict: `{"op": "payments.refund", "scope": ..., "key": ..., "key_from_result": ..., "landed": ..., "irreversible": False, "idempotent": False, "result": ..., "hide": (), "errors": ...}`
 - an `Effect(...)` dataclass with the same fields.
 
 Unknown tool names in `ops` or unknown effect keys raise `ValueError`.
 
-What `scope` and `key` receive:
+### Framework context passed to hooks
 
-- `shape.langgraph.effects`: wraps `tool.func`/`tool.coroutine` (for `@tool`/`StructuredTool`) or `_run`/`_arun` (for custom `BaseTool`), so `scope` and `key` receive that function's bound arguments.
-- `shape.agents.effects`: parses the model's JSON argument string and passes only those parsed keys to `scope` and `key` (not `RunContextWrapper` or omitted Python defaults). Passing framework context into `scope` and `key` from adapters is planned.
+Both adapters pass framework context into `scope`, `key`, `result`, `landed`, and `key_from_result` without exposing it in rendered calls, world log `args`, or `approved_before` argument hashes:
+
+- **`shape.agents.effects`** (verified on `openai-agents` 0.25.0): passes the `ToolContext` (a `RunContextWrapper`, so `ctx.context` holds your run context object) under `ctx`, `context`, and your `@function_tool`'s own leading context parameter name (for example `wrapper`).
+- **`shape.langgraph.effects`** (verified on `langgraph` 1.2.24): passes `config` (`RunnableConfig`, even when your `@tool` does not declare a `config` parameter) plus any `InjectedState`, `InjectedStore`, and `ToolRuntime` arguments declared by the tool. All injected parameters are hidden from rendered calls and approval hashes.
+
+If a hook (`scope`, `key`, `result`, `landed`, `key_from_result`) raises, shape raises `shape.HarnessError` (a `BaseException`) so neither LangGraph's `ToolNode(handle_tool_errors=True)` nor the Agents SDK's failure-handling tool invoker can swallow it into an error string. The run fails immediately pointing at your hook.
+
+### Failure results and `landed=` / `key_from_result=`
+
+- **Auto-detected framework failures:** `shape.langgraph.effects` treats a returned `ToolMessage(status="error")` (or a `Command` updating `messages` with one) as not landed automatically; `shape.agents.effects` treats a converted `"An error occurred while running the tool..."` string the same way. You do not need to write `landed=` for these.
+- **Domain refusals returned as values:** if your tool returns a refusal string (`"not the owner"`) or error dict (`{"ok": False}`) instead of raising, pass `landed=lambda res: ...`. Calls where `landed` returns `False` are logged as attempts that `returned without effect`, not effects.
+- **State-deduped tools:** when you wrap an agent-facing tool that dedupes through agent state and returns an existing resource id on repeat calls (e.g. `"CMP-5170"`), pass `key_from_result=lambda res: ...` so repeat calls yielding the same id count as one effect. Whenever possible, still prefer placing `@shape.effect` on the underlying API client call that touches the outside world.
 
 ## Scripted models and perturbations
 
@@ -118,8 +128,10 @@ incarnation 0
 
 - On incarnation 0 (`run.restarts == 0`), calls `graph.invoke(input, config)`.
 - On restarts (`run.restarts > 0`), calls `graph.invoke(None, config)`, assuming the graph was compiled with a durable checkpointer (such as `SqliteSaver` under `run.dir`) and the same `thread_id` in `config`.
-- Whenever `graph.invoke` returns an `__interrupt__`, calls `human(payload)` and resumes with `Command(resume=reply)` in a loop. `human` may call `shape.choose(...)` to explore approve/reject/edit paths. Static `interrupt_before` / `interrupt_after` breakpoints are not detected by `drive` yet (planned); use a `graph.get_state(config).next` loop for static breakpoints.
-- `durability` is forwarded only when explicitly passed, so `durability=None` tests LangGraph's own default (`"async"`).
+- **Dynamic `interrupt()`:** whenever `graph.invoke` returns an `__interrupt__`, calls `human(payload)` and resumes with `Command(resume=reply)` in a loop. `human` may call `shape.choose(...)` to explore approve/reject/edit paths.
+- **Static `interrupt_before=` / `interrupt_after=`:** after each invoke on a checkpointed graph, `drive` checks `graph.get_state(config).next`. When the graph is paused before a node, `drive` calls `human(snapshot)` and resumes: `True` or `None` approves (`graph.invoke(None, config)`), `False` denies pending tool calls (injecting a denial `ToolMessage` when the last message has `tool_calls`, or stopping cleanly otherwise), and a `dict` or `Command` is passed directly to `graph.invoke(reply, config)`.
+- **Loud pause failures:** if the graph pauses with no `human=` callback, `drive` raises `RuntimeError("graph paused before node '<name>'; pass human=... to approve")` (or the dynamic `interrupt()` equivalent) instead of returning as finished. It also raises if resuming leaves the graph stuck at the same checkpoint.
+- `durability` is forwarded only when explicitly passed, so `durability=None` tests LangGraph's own default (`"async"`). `adrive` is the `async` counterpart.
 
 ### `shape.agents.drive(agent, input, run, *, context=None, session_factory=None, human=None, context_serializer=None, max_turns=10)`
 

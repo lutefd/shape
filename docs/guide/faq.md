@@ -14,22 +14,20 @@ Do not add `shape` when any of the following is true:
 - **No virtual clock, scheduler, or thread control.** Your code, threads, and timers run for real inside the child process. If a bug depends on thread timing or wall-clock races, a seed may show up as `FLAKY` or `NOT MINIMIZED`.
 - **Crashes only happen at `@shape.effect` boundaries.** `shape` injects `crash_before` and `crash_after` around marked effect calls. It does not kill the process at arbitrary Python bytecode instructions between effects.
 - **Your test double must honor idempotency keys truthfully.** `shape` counts two calls with the same `(op, scope, key)` as one effect because real providers deduplicate by key. If your real provider rejects that key format, expires keys early, or ignores keys on that endpoint, `shape` will not catch the mismatch. Verify your double's semantics against the real provider sandbox.
-- **Tools that return failure values instead of raising.** Today, any `@shape.effect` call that returns without raising counts as a landed effect. Put `@shape.effect` on the inner client method that raises, or inspect `result=` in a custom `@shape.invariant`. A `landed=` predicate on `@shape.effect` is planned.
 - **Duplicate delivery interleaving is OS-scheduled.** `@shape.scenario(duplicate_trigger=True)` forks two real processes on the same `run.dir` at the same time, without controlling their interleaving. Deterministic concurrency control (`shape.point` and `run_async`) is planned.
-- **Cause grouping splits by exact fault kind.** Two after-commit faults that trigger the same missing-key bug (`timeout_after_commit` and `crash_after`) currently appear as two distinct causes. Coarser cause grouping is planned.
 - **Fork vs. spawn performance.** On Unix, `shape` imports the scenario once and forks per incarnation. On Windows, or when `SHAPE_START_METHOD=spawn` is set, each incarnation spawns a fresh Python interpreter and re-imports the scenario file, which is slower and requires the scenario file to be safely importable at top level.
 
 ## How much disk space does `runs/` use?
 
 By default, `shape test` stores artifacts under `runs/<scenario>/`:
 
-- **Passing seeds** are deleted immediately after they pass.
+- **Passing seeds** are deleted immediately after they pass (along with any stale `seed-<n>` directory from an earlier failing run, and an empty `runs/<scenario>/` directory when all seeds pass).
 - **Failing seeds** keep `runs/<scenario>/seed-<n>/` (world log, realized log, `inc-*.out`, and any SQLite or state files your scenario wrote to `run.dir`).
 - **Minimized causes** also keep `seed-<n>.min/` and `seed-<n>.min.json`.
 - **Flaky seeds** keep their first failing run directory (`seed-<n>/`); rerun directories are cleaned up.
 - **Replays** write to `runs/<scenario>/replay/`.
 
-Add `runs/` to `.gitignore`. In CI, pass `--runs-dir /tmp/shape-runs` (or upload only `*.min.json` on failure). In pytest, pass `runs_dir=tmp_path` to `shape.check(...)` so pytest cleans up automatically.
+Add `runs/` to `.gitignore`, and clean all saved run directories with `rm -rf runs/`. In CI, pass `--runs-dir /tmp/shape-runs` (or upload only `*.min.json` on failure). In pytest, pass `runs_dir=tmp_path` to `shape.check(...)` so pytest cleans up automatically.
 
 ## Package name and installation
 
