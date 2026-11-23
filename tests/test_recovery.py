@@ -114,3 +114,22 @@ def test_the_pivot_guard_refuses_to_compensate_after_a_successful_send():
     assert "rollback_restores_state" in fired(run({}, type(
         "Both", (CompensatesAfterSend, NoPivotGuard), {})))
 
+
+
+# The TLC model found this after the first fix. Four rate limits exhaust the attempts and the
+# crash lands just after the intent is written `failed`. The replay then sends the email and
+# the process dies again before it sees the result. The intent still reads `failed`, not in
+# doubt, so the next replay's four rate limits made the saga compensate a delivered email.
+FAILED_INTENT_RETRIED_THEN_CRASHED = {
+    "fault:email.send#0": fault("rate_limit_burst"), "burst:email.send#0": BURST_OF_FOUR,
+    "crash:durable:intents#5": 2,
+    "crash:call:email.send#4": 2,
+    "fault:email.send#5": fault("rate_limit_burst"), "burst:email.send#5": BURST_OF_FOUR,
+}
+
+
+def test_a_failed_intent_that_is_called_again_is_in_doubt_after_the_next_crash():
+    result = run(FAILED_INTENT_RETRIED_THEN_CRASHED)
+    assert result.realized == FAILED_INTENT_RETRIED_THEN_CRASHED  # every deviation was reached
+    assert result.ok, [v.message for v in result.violations]
+    assert result.store.saga("saga-17").state == "escalated" and len(sent(result)) == 1

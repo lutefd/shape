@@ -277,6 +277,12 @@ class Runtime:
         assert intent is not None
         if intent.state == "done":
             return intent.result or {}
+        if intent.state == "failed":
+            # A failed intent is final only while no call is in flight. Calling again makes it a
+            # new attempt, and a crash during it must leave the intent started so that recovery
+            # marks it in doubt instead of trusting the old failure.
+            intent.state = "started"
+            self.store.put_intent(intent)
         for attempt in range(self.cfg.max_attempts):
             await self._audit_call(saga_id, intent)
             try:
