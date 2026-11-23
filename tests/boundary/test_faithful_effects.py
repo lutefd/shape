@@ -1,5 +1,5 @@
 """Tests for faithful effect semantics: landed=, key_from_result=, harness errors,
-NOTHING TESTED diagnostics, coarse distinct-cause grouping, nominal-path labeling,
+NOTHING TESTED diagnostics, defect and trigger grouping, nominal-path labeling,
 disk cleanup, and exactly_once(op, failure_claim_ok=True)."""
 
 from __future__ import annotations
@@ -201,16 +201,16 @@ def test_nothing_tested_explains_no_attempts_vs_refused_vs_raised(tmp_path):
 def test_after_commit_faults_split_reply_lost_from_crash_after(tmp_path):
     swept = runner.run_sweep(sc.naive_retry, range(300), tmp_path)
     report = runner.investigate_all(sc.naive_retry, swept.failing, tmp_path, "x")
-    assert len(report.causes) == 2
+    assert len(report.defects) == 1
     text = report.render()
-    assert "2 distinct causes across" in text
-    assert "needs: reply lost" in text
-    assert "needs: crash after commit (process died after the commit: crash_after)" in text
+    assert "1 defect across" in text
+    assert "reply lost:" in text
+    assert "crash after commit:" in text
     for kind_name in ("timeout_after_commit", "connection_reset_after_commit", "crash_after"):
         assert kind_name in text
 
 
-def test_before_commit_faults_group_into_one_cause_separate_from_crash_before(tmp_path):
+def test_before_commit_faults_share_a_trigger_class(tmp_path):
     @shape.effect("t.fragile", scope=lambda **_: "s")
     def fragile() -> None:
         pass
@@ -230,14 +230,13 @@ def test_before_commit_faults_group_into_one_cause_separate_from_crash_before(tm
 
     swept = runner.run_sweep(claims_after_any_failure, range(300), tmp_path)
     report = runner.investigate_all(claims_after_any_failure, swept.failing, tmp_path, "x")
-    assert len(report.causes) == 2
-    text = report.render()
-    assert "the call failed cleanly" in text
-    assert "died before the call" in text
-    assert "timeout" in text and "server_error" in text and "crash_before" in text
+    defect, = report.defects
+    assert set(defect.triggers) == {"crash_before", "before_commit"}
+    assert defect.triggers["crash_before"].faults == {"crash_before"}
+    assert {"timeout", "server_error"} <= defect.triggers["before_commit"].faults
 
 
-def test_nominal_path_cause_is_labeled_and_printed_last(tmp_path):
+def test_nominal_path_defect_is_labeled_and_printed_last(tmp_path):
     @shape.effect("t.always_bad", scope=lambda **_: "s")
     def always_bad() -> None:
         pass
@@ -266,20 +265,16 @@ def test_nominal_path_cause_is_labeled_and_printed_last(tmp_path):
 
     swept = runner.run_sweep(both_bugs, range(100), tmp_path)
     report = runner.investigate_all(both_bugs, swept.failing, tmp_path, "x")
-    assert len(report.causes) >= 2
-    # Nominal-path cause prints LAST even when it has more seeds than fault causes
-    assert not report.causes[0].is_nominal
-    assert report.causes[-1].is_nominal
-    assert len(report.causes[-1].seeds) > len(report.causes[0].seeds)
+    nominal = report.defects[-1]
+    fault = next(d for d in report.defects if d.key.op == "t.fault_bad")
+    assert nominal.key.op == "t.always_bad"
+    assert set(nominal.triggers) == {"nominal"}
+    assert len(nominal.seeds) > len(fault.seeds)
     text = report.render()
-    fault_pos = text.index("needs: reply lost")
-    nominal_pos = text.index(
-        "nominal path (0 faults, 0 model choices): a plain unit test catches this"
-    )
-    assert fault_pos < nominal_pos
+    assert text.index("reply lost:") < text.index("nominal (a plain unit test catches this)")
 
 
-def test_claims_true_groups_distinct_ops_into_distinct_causes(tmp_path):
+def test_claims_true_groups_distinct_ops_into_distinct_defects(tmp_path):
     @shape.effect("t.op_a", scope=lambda **_: "s")
     def op_a() -> None:
         pass
@@ -299,9 +294,9 @@ def test_claims_true_groups_distinct_ops_into_distinct_causes(tmp_path):
 
     swept = runner.run_sweep(lies_about_two_ops, range(200), tmp_path, jobs=4)
     report = runner.investigate_all(
-        lies_about_two_ops, swept.failing, tmp_path, "x", failing_ops=swept.failing_ops
+        lies_about_two_ops, swept.failing, tmp_path, "x", defect_keys=swept.defect_keys
     )
-    claim_ops = {c.failure.op for c in report.causes if c.failure.invariant == "claims_true"}
+    claim_ops = {d.key.op for d in report.defects if d.key.invariant == "claims_true"}
     assert claim_ops == {"t.op_a", "t.op_b"}
 
 
@@ -425,28 +420,11 @@ def test_public_check_jobs_and_replay_api(tmp_path):
     shape.replay(fixed_retry, min_file, runs_dir=tmp_path / "rep_ok")
 
 
-def test_scheduling_choices_group_as_interleaving_coarse_class():
-    from shape.boundary.failure import Cause, Failure, coarse_kind
+def test_scheduling_choices_group_as_interleaving_trigger():
+    from shape.boundary.failure import trigger_classes
 
-    assert coarse_kind("sched:actors#0.1", 1) == "interleaving"
-    assert coarse_kind("sched:tasks#0.0", 2) == "interleaving"
-    f = Failure(
-        scenario="race",
-        target="x",
-        seed=1,
-        invariant="at_most_once(t.claim)",
-        message="happened twice",
-        trace=[],
-        steps=2,
-        deviations=1,
-        original_deviations=1,
-        replays=2,
-        replay_file=None,
-        signature=("at_most_once(t.claim)", "interleaving"),
-        op="t.claim",
-        coarse_deviations=("interleaving",),
-        exact_kinds=("sched:actors#0.1=1",),
-    )
-    cause = Cause(f, seeds=[1, 2])
-    assert not cause.is_nominal
-    assert cause.trigger_label() == "needs: interleaving"
+    entries = [
+        {"kind": "schedule", "key": "sched:actors#0.1", "value": 1},
+        {"kind": "schedule", "key": "sched:tasks#0.0", "value": 2},
+    ]
+    assert trigger_classes(entries) == {"interleaving": set()}

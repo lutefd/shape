@@ -16,6 +16,7 @@ from .api import (
 )
 from .faults import ClientError, RateLimited, ServerError
 from .invariants import (
+    Finding,
     World,
     approved_before,
     at_most_once,
@@ -33,6 +34,7 @@ from .runner import check, replay
 __all__ = [
     "Actor",
     "ClientError",
+    "Finding",
     "HarnessError",
     "RateLimited",
     "Run",

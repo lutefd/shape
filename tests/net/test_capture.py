@@ -334,3 +334,35 @@ def test_mailtrap_example_reproduces_upstream_last_result_bug(tmp_path):
     assert out.stats["effects"] == {"email.send": 1}
     assert "FAILED to send to me@example.com" in (out.dir / "inc-0.out").read_text()
     assert any("caller saw HTTP 503" in line for line in runner.story(out.entries)[0])
+
+
+def test_socket_guard_identifies_address_library_and_call_site(tmp_path):
+    @shape.scenario(net=[], max_restarts=0)
+    def guarded(run):
+        socket.create_connection(("10.255.255.1", 9))
+
+    out = execute(guarded, tmp_path / "one")
+    message = out.violations[0].message
+    assert "host '10.255.255.1', port 9 via socket" in message
+    line = guarded.fn.__code__.co_firstlineno + 2
+    assert f"test_capture.py:{line}" in message
+    assert "register a fake for the host with @shape.scenario(net=[...])" in message
+    assert "omit net=" in message
+
+
+def test_aiohttp_guard_keeps_the_request_site_across_async_dns(tmp_path):
+    aiohttp = pytest.importorskip("aiohttp")
+
+    async def discover():
+        async with aiohttp.ClientSession() as client:
+            await client.get("https://discovery.invalid:8443/config")
+
+    @shape.scenario(net=[], max_restarts=0)
+    def guarded(run):
+        shape.run_async(discover())
+
+    out = execute(guarded, tmp_path / "one")
+    assert out.violated("harness_error")
+    message = out.violations[0].message
+    assert "host 'discovery.invalid', port 8443 via aiohttp" in message
+    assert f"test_capture.py:{discover.__code__.co_firstlineno + 2}" in message

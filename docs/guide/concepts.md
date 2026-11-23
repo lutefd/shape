@@ -76,6 +76,8 @@ Each seed runs your `@shape.scenario` function in a separate child process (via 
 
 **Fairness on the last incarnation:** When `max_restarts > 0`, the final incarnation (`inc == max_restarts`) runs with faults and model perturbations turned off. That tests whether your agent can recover from whatever broken state earlier faults left behind, rather than testing whether it can survive an endless stream of failures. When `max_restarts == 0`, every fault is live and the scenario must handle failures inline without restarting.
 
+Set [a recovery preset](recovery.md) to model how the deployment starts the next attempt.
+
 Each incarnation's stdout and stderr are captured to `run.dir/inc-<n>.out`.
 
 ## Fault kinds and provenance
@@ -151,7 +153,7 @@ When a seed violates an invariant, `shape` extracts its `realized` map (the keys
 2. `ddmin` removes keys until no single remaining key can be removed without the failure disappearing (1-minimal).
 3. `shape` replays the minimal map one final time, verifies it, writes `runs/<scenario>/seed-<n>.min.json`, and prints the minimized trace.
 
-If either verification replay does not fail the same invariant or does not reach every recorded key, `shape` prints `NOT MINIMIZED` with the original run and does not claim a minimal trace.
+If either verification replay does not reproduce the same defect or does not reach every recorded key, `shape` prints `NOT MINIMIZED` with the original run and does not claim a minimal trace.
 
 You can replay any saved `.min.json` file directly:
 
@@ -191,17 +193,10 @@ If a seed does not violate the same invariant on all re-runs, `shape` classifies
 - Its first failing run directory is kept under `runs/<scenario>/seed-<n>/` for inspection.
 - The sweep still exits `1`, because a test that sometimes fails is not a pass.
 
-## Distinct causes
+## Defects and triggers
 
-Many seeds in a sweep often trigger the same bug. `shape` groups failing seeds by **cause**: the violated invariant, the op that violated it, and the coarse class of each deviation in the minimized run:
+A defect groups confirmed failing seeds by the first violated invariant, its operation, and the scope pattern. For example, `order:17` and `order:18` share the pattern `order:<id>`. A scope like `tenant:acme|order:17` keeps both field names. A scope without a field name becomes `<id>`. For a custom invariant, return `shape.Finding("what failed", op="orders.confirm", scope=order_scope)` to include these details in the grouping.
 
-- **reply lost** (`commit landed, caller saw an error`): `timeout_after_commit` and `connection_reset_after_commit` group into one cause (same-process retry after losing the reply), with the exact fault kinds listed inside it.
-- **crash after commit** (`process died after the commit`): `crash_after` forms its own cause, separate from reply-lost faults, because recovering after a process death needs a different fix than in-process retry logic.
-- **before-commit fault** (`the call failed cleanly`): `timeout`, `rate_limit`, `server_error`, and `client_error` group into one cause, with exact kinds listed.
-- **crash** (`died before the call`): `crash_before`.
-- **interleaving**: scheduling choices (`sched:actors`, `sched:tasks`) from concurrent processes or `shape.run_async`.
-- **model choice** and **duplicate delivery**: grouped by choice / trigger.
+The report lists the trigger classes found in the minimized replays for each defect, including reply lost, process crashes, model choices, and interleavings. One seed can contribute to several trigger counts if the minimized replay needs several classes of deviations. A seed with zero remaining deviations is nominal.
 
-Each cause is labeled by what it took to trigger (`needs: reply lost (...)`, `needs: crash after commit (...)`, `needs: model choice`, etc.). Causes that fail on the nominal path with 0 faults and 0 model choices are printed **last** under `nominal path (0 faults, 0 model choices): a plain unit test catches this`, so findings that only fault injection or model perturbation can produce stand out first.
-
-Seeds are processed in order of fewest deviations first. Once a minimized cause is found, any remaining failing seed with the same invariant and op whose raw coarse deviations are a superset of that cause's deviations joins it without running `ddmin` again (recording its exact fault kinds on that cause). At most 200 failing seeds are minimized per sweep. The report prints `N distinct causes across M failing seeds` and one minimized trace per cause.
+Shape tries seeds with the fewest deviations first, up to the shrink limit (200 by default). The report includes all confirmed failing seeds in the defect counts. The trigger counts and replay links come from seeds that were successfully minimized. The default trace is the smallest replay for the defect. Use `--all-triggers` for a representative of each trigger class, or [`--json`](ci.md#json-sweep-reports) for all seed IDs and replay paths.

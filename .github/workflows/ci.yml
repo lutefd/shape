@@ -12,7 +12,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: >-
-          pip install -e '.[dev]' httpx -r examples/net/requirements.txt
+          pip install -e '.[dev]' httpx aiohttp -r examples/net/requirements.txt
           google-api-python-client python-telegram-bot langgraph-sdk
       - run: ruff check
       - run: pytest -q

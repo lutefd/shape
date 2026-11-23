@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import os
@@ -140,7 +141,8 @@ def cmd_test(args: argparse.Namespace) -> int:
         print(f"shape: {exc}", file=sys.stderr)
         return 2
     path, _, name = args.target.partition("::")
-    found = _load_scenarios(path)
+    with contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext():
+        found = _load_scenarios(path)
     if found is None:
         return 2
     if name and name not in found:
@@ -161,33 +163,64 @@ def cmd_test(args: argparse.Namespace) -> int:
         print(text)
         return code
     failed = False
+    reports = []
     for scen in chosen.values():
         if args.strict_scopes:
             scen = dataclasses.replace(scen, strict_scopes=True)
-        swept = runner.run_sweep(scen, range(args.start, args.start + args.seeds), runs, args.jobs,
-                                 deadline=deadline)
+        with contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext():
+            swept = runner.run_sweep(
+                scen, range(args.start, args.start + args.seeds), runs, args.jobs, deadline=deadline,
+            )
+            report = runner.Report(0, [])
+            if swept.failing:
+                limit = runner.MAX_INVESTIGATED if args.max_shrinks is None else args.max_shrinks
+                report = runner.investigate_all(
+                    scen, swept.failing, runs, f"{path}::{scen.name}", limit=limit,
+                    defect_keys=swept.defect_keys, deadline=deadline,
+                )
+        problems = swept.problems(scen)
+        notes = swept.notes(scen)
+        coverage = swept.cov.render()
+        scopes = swept.cov.render_scopes(scen.invariants)
+        scenario_failed = bool(swept.failing or swept.flaky or problems)
+        failed |= scenario_failed
+        if args.json:
+            reports.append({
+                "scenario": scen.name,
+                "target": f"{path}::{scen.name}",
+                "status": "fail" if scenario_failed else "pass",
+                "start": args.start,
+                "seeds": swept.seeds,
+                "failing_seeds": sorted(seed for seed, _, _ in swept.failing),
+                "flaky_seeds": sorted(swept.flaky),
+                "skipped_seeds": swept.skipped_seeds,
+                "unconfirmed_seeds": sorted(swept.unconfirmed),
+                "problems": problems,
+                "notes": notes,
+                "coverage": coverage,
+                "scope_assignment": scopes,
+                **report.as_dict(),
+            })
+            continue
         flaky = f"  flaky={len(swept.flaky)}" if swept.flaky else ""
         print(f"scenario={scen.name}  seeds={swept.seeds} (from {args.start})  "
               f"failing={len(swept.failing)}{flaky}  wall={swept.wall:.2f}s  "
               f"{swept.seeds / swept.wall:.0f} seeds/s")
-        print(swept.cov.render())
-        if scopes_text := swept.cov.render_scopes(scen.invariants):
-            print(scopes_text)
-        print("\n".join(swept.notes(scen)), end="\n" if swept.notes(scen) else "")
-        problems = swept.problems(scen)
+        print(coverage)
+        if scopes:
+            print(scopes)
+        for note in notes:
+            print(note)
         if swept.failing:
-            target = f"{path}::{scen.name}"
-            limit = runner.MAX_INVESTIGATED if args.max_shrinks is None else args.max_shrinks
-            print(runner.investigate_all(scen, swept.failing, runs, target,
-                                         limit=limit, failing_ops=swept.failing_ops,
-                                         deadline=deadline).render())
+            print(report.render(all_triggers=args.all_triggers))
         if swept.flaky:
             print(runner.render_flaky(swept.flaky))
-        print("\n".join(problems), end="\n" if problems else "")
-        if swept.failing or swept.flaky or problems:
-            failed = True
-        else:
+        for problem in problems:
+            print(problem)
+        if not scenario_failed:
             print("PASS")
+    if args.json:
+        print(json.dumps({"scenarios": reports}, indent=2))
     return 1 if failed else 0
 
 
@@ -202,6 +235,10 @@ def main(argv: list[str] | None = None) -> int:
     test.add_argument("--seeds", type=int, default=100)
     test.add_argument("--start", type=int, default=0)
     test.add_argument("--replay", help="replay a saved .min.json instead of running seeds")
+    test.add_argument("--all-triggers", action="store_true",
+                      help="show a minimized trace for every trigger class")
+    test.add_argument("--json", action="store_true",
+                      help="emit a JSON sweep report including replay paths")
     test.add_argument("--jobs", type=int, default=1, help="seeds to run in parallel")
     test.add_argument("--budget", type=float, metavar="SECONDS",
                       help="wall time for seeds, confirmations and shrinking")
@@ -231,8 +268,12 @@ def main(argv: list[str] | None = None) -> int:
     contract.add_argument("--report", metavar="FILE", help="write a JSON report with contract evidence")
     contract.set_defaults(fn=contract_command)
     args = parser.parse_args(argv)
+    if args.command == "test" and args.replay and (args.json or args.all_triggers):
+        test.error("--json and --all-triggers are only available for sweeps")
     try:
-        return args.fn(args)
+        code = args.fn(args)
+        sys.stdout.flush()
+        return code
     except Escape as escape:
         print(f"ESCAPE: {escape}", file=sys.stderr)
         return 2

@@ -51,6 +51,42 @@ Practical defaults:
 
 Use `--budget 30 --max-shrinks 10` to limit time and shrinking in a PR job. The budget covers seed execution, failure confirmation, and shrinking. Shape reports skipped seeds, confirmations, and shrinks. An incomplete seed sweep exits 1. `--max-shrinks 0` keeps original failing runs and skips minimization. Pass `--strict-scopes` (or `@shape.scenario(..., strict_scopes=True)` / `shape.check(..., strict_scopes=True)`) in CI so duplicate-sensitive invariants refuse default/derived scopes instead of letting unrelated jobs collide into false duplicates.
 
+## JSON sweep reports
+
+Use `shape test examples/plain_python/checks.py::checkout_buggy --seeds 200 --json > shape-report.json` to save a report for a CI annotation or artifact step. The command writes one JSON document to stdout, with a `scenarios` array, and uses the same exit codes as a text sweep. For each scenario, read `defects` for the invariant, operation, scope pattern, failing seed IDs, and representative replay path. Trigger objects include their own seed IDs, fault names, and replay paths. A seed can appear under several triggers.
+
+This projection of the checkout report shows how the replay paths relate to the seed IDs:
+
+```json
+{
+  "scope_pattern": "order:<id>",
+  "seeds": [
+    52,
+    195
+  ],
+  "replay_path": "runs/checkout_buggy/seed-52.min.json",
+  "triggers": [
+    {
+      "class": "reply_lost",
+      "seeds": [
+        52,
+        195
+      ],
+      "replay_path": "runs/checkout_buggy/seed-52.min.json"
+    },
+    {
+      "class": "before_commit",
+      "seeds": [
+        195
+      ],
+      "replay_path": "runs/checkout_buggy/seed-195.min.json"
+    }
+  ]
+}
+```
+
+When a budget or shrink limit prevents minimization, the corresponding seed IDs appear in `shrink_budget_skipped_seeds` or `shrink_limit_skipped_seeds`. A defect with no verified replay has a null `replay_path`. Upload the runs directory along with the JSON to make the replay paths available after the job.
+
 ## Exit codes
 
 ### Sweep mode (`shape test target --seeds N`)
@@ -66,8 +102,8 @@ Use `--budget 30 --max-shrinks 10` to limit time and shrinking in a PR job. The 
 
 | Exit code | Meaning |
 | --- | --- |
-| `0` | `PASS`: every recorded deviation was reached and the recorded invariant no longer fails. |
-| `1` | `FAIL`: the recorded invariant still fails on replay. |
+| `0` | `PASS`: every recorded deviation was reached and the recorded defect no longer reproduces. |
+| `1` | `FAIL`: the recorded defect reproduces on replay. |
 | `2` | `DIVERGED`: the code no longer reached every recorded deviation key in `realized` (for example after a refactor changed the call structure). |
 
 ## Running from `pytest`

@@ -1,7 +1,7 @@
 """Regression tests for the five CI-gate blockers and gaps:
 1. Explicit business scopes (`strict_scopes=True`, `--strict-scopes`, scope assignment report).
 2. Explicit adapter restart policies (`on_restart="none" | "redeliver" | callable`) and trace line.
-3. Distinct after-commit cause classes (`reply_lost` vs `crash_after`).
+3. Distinct after-commit trigger classes (`reply_lost` vs `crash_after`).
 4. `SmtpFake` default invariant covering fresh sends (`smtp.send`).
 5. Distinct default session per `shape.agents.drive` job (plus deliberate sharing via `session_id`).
 """
@@ -265,10 +265,10 @@ def test_langgraph_drive_on_restart_policies(tmp_path):
     assert any("harness redelivered the request (on_restart='redeliver')" in line for line in lines)
 
 
-# ----------------------------------------------------------- 3. Distinct after-commit causes
+# ----------------------------------------------------------- 3. Distinct after-commit triggers
 
 
-def test_reply_lost_and_crash_after_are_distinct_cause_classes(tmp_path):
+def test_reply_lost_and_crash_after_are_distinct_trigger_classes(tmp_path):
     assert fault_class("timeout_after_commit") == "reply_lost"
     assert fault_class("connection_reset_after_commit") == "reply_lost"
     assert fault_class("crash_after") == "crash_after"
@@ -277,13 +277,12 @@ def test_reply_lost_and_crash_after_are_distinct_cause_classes(tmp_path):
 
     swept = runner.run_sweep(sc.naive_retry, range(300), tmp_path)
     report = runner.investigate_all(sc.naive_retry, swept.failing, tmp_path, "x")
-    # Reply-lost faults (timeout_after_commit + connection_reset_after_commit) group into one cause;
-    # crash_after (process died after the commit) is a separate cause.
-    assert len(report.causes) == 2
-    labels = [c.trigger_label() for c in report.causes]
-    assert any("reply lost" in lbl and "timeout_after_commit" in lbl and "connection_reset_after_commit" in lbl
-               for lbl in labels)
-    assert any("process died after the commit" in lbl and "crash_after" in lbl for lbl in labels)
+    defect, = report.defects
+    assert {"reply_lost", "crash_after"} <= defect.triggers.keys()
+    assert defect.triggers["reply_lost"].faults == {
+        "timeout_after_commit", "connection_reset_after_commit",
+    }
+    assert defect.triggers["crash_after"].faults == {"crash_after"}
 
 
 # ----------------------------------------------------------- 4. SmtpFake fresh sends invariant

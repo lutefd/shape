@@ -7,7 +7,7 @@ When a scenario fails, `shape` shrinks the failure to a small set of deviations,
 Here is the real output from running `examples/plain_python/checks.py::checkout_buggy`:
 
 ```text
-scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=0.94s  212 seeds/s
+scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=6.12s  33 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      202       252
@@ -16,10 +16,11 @@ coverage over 200 seeds:
   interleaving choices taken: none
 scope assignment:
   payments.charge: explicit scope= (e.g. 'order:o1')
-2 distinct causes across 2 failing seeds
+1 defect across 2 failing seeds
 
-cause 1 of 2: 1 of 2 failing seeds (52)
-  needs: reply lost (commit landed, caller saw an error: connection_reset_after_commit, timeout_after_commit)
+defect 1 of 1: at_most_once(payments.charge)  op=payments.charge  scope=order:<id>  (2 of 2 failing seeds)
+  reply lost: 2 seeds (connection_reset_after_commit, timeout_after_commit)
+  before-commit fault: 1 seed (server_error)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 3 steps (2 of 3 deviations kept, 6 replays):
@@ -36,18 +37,18 @@ FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most
 
 Reading it top to bottom:
 
-1. **Summary line** (`scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=0.94s  212 seeds/s`): How many seeds ran, starting seed, how many failed reproducibly, wall-clock time, and throughput. If any seed failed inconsistently on re-run, `flaky=N` appears here too.
+1. **Summary line**: How many seeds ran, starting seed, how many failed reproducibly, wall-clock time, and throughput. If any seed failed inconsistently on re-run, `flaky=N` appears here too.
 2. **Coverage block** (`coverage over 200 seeds:`): Per-op counts of `landed` (real deduplicated effects) and `attempts` (all calls including failed and killed ones), every fault kind actually injected, every non-nominal `shape.choose` decision taken, and any scheduling interleaving choices taken. Check this first to confirm your sweep exercised the faults and model choices you expect.
 3. **Scope assignment block** (`scope assignment:`): For each captured op, how its scope was derived (`explicit scope=`, a fake default rule such as `` `to|subject` ``, or `effect default`) with one example value, plus a `warning:` whenever a default rule is used by a duplicate-sensitive invariant (`at_most_once`, `exactly_once`, or a provider default).
-4. **Cause count** (`2 distinct causes across 2 failing seeds`): Failing seeds grouped by `(invariant, violating op, coarse deviation classes)`.
-5. **Cause heading and trigger label** (`cause 1 of 2: 1 of 2 failing seeds (52)` + `needs: reply lost (...)`): How many failing seeds matched this cause, up to five sorted seed numbers, what class of deviation it took to trigger (with exact fault kinds listed — `reply lost` for same-process `timeout_after_commit` / `connection_reset_after_commit`, separate from `crash after commit` for `crash_after`), or `nominal path (0 faults, 0 model choices): a plain unit test catches this` printed last when zero faults and zero model choices triggered the failure.
-6. **Failure header** (`FAIL ... seed=52  invariant=at_most_once(payments.charge)`): The representative seed (fewest deviations in this cause) and the violated invariant.
+4. **Defect count** (`1 defect across 2 failing seeds`). The two seeds share the same invariant, operation, and normalized scope pattern.
+5. **Trigger counts**. Both minimized replays lose a reply. One also needs a before-commit fault. `--all-triggers` adds the smallest replay for each trigger class.
+6. **Failure header** (`FAIL ... seed=52  invariant=at_most_once(payments.charge)`). The representative replay and the invariant it violated.
 7. **Violation message** (`payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)`): Plain-language explanation from the invariant.
 8. **Shrink summary** (`minimized to 3 steps (2 of 3 deviations kept, 6 replays):`):
    - `3 steps`: total calls, approvals, claims, and model choices in the minimized trace.
    - `2 of 3 deviations kept`: delta debugging dropped 1 irrelevant deviation from seed 52 and kept 2. Why did it keep 2 instead of 1? In seed 52, `connection_reset_after_commit` was drawn on the second call (`fault:payments.charge#0.1`), which is only reached because the first call (`fault:payments.charge#0.0`) drew `timeout_after_commit` and triggered a retry. Removing `#0.0` stops `#0.1` from executing, so both keys stay in the 1-minimal set.
    - `6 replays`: how many replay runs `shape` executed to confirm and shrink this seed.
-9. **Incarnation header** (`incarnation 0`): Starts at `0`. Each process restart prints `incarnation 1 (restarted)`, `incarnation 2 (restarted)`, and so on. Under `duplicate_trigger=True`, incarnation 0 shows `(copy A of the duplicate delivery)` and `(copy B of the duplicate delivery)`. If an adapter redelivered the request on restart (`on_restart="redeliver"`), the trace prints `harness redelivered the request (on_restart='redeliver')` on its own line right under the restarted incarnation header so you can tell harness-supplied redelivery from the app's own recovery.
+9. **Incarnation header** (`incarnation 0`): Starts at `0`. Each process restart prints `incarnation 1 (restarted)`, `incarnation 2 (restarted)`, and so on. Under `duplicate_trigger=True`, incarnation 0 shows `(copy A of the duplicate delivery)` and `(copy B of the duplicate delivery)`. If an adapter redelivered the request on restart (`on_restart="redeliver"`), the trace prints `harness redelivered the request (on_restart='redeliver')` under the restarted incarnation. A [scenario recovery preset](recovery.md) puts its action and `recovery=` name in the same location.
 10. **Steps**:
    - Step 1: `PaymentClient.charge` ran with `idempotency_key='charge-o1'`. The effect landed, then `shape` injected `timeout_after_commit` so the caller saw `TimeoutError`.
    - Step 2: The retry loop caught `TimeoutError` and retried with the same key (`'charge-o1'`). That call landed (deduplicated to the same first effect because the key matched), then `shape` injected `connection_reset_after_commit` so the caller saw `ConnectionResetError`.
@@ -57,32 +58,31 @@ Reading it top to bottom:
 
 ### Crashes, restarts, exceptions, and model choices in a trace
 
-When a crash or model perturbation triggers a failure, those events appear inline in the exact order they occurred. Here is a real crash-restart trace from `examples/langgraph/durability.py::durability_async`:
+When a crash or model perturbation triggers a failure, those events appear inline in the exact order they occurred. Here is a real crash and restart from [the cron recovery scenario](recovery.md):
 
 ```text
-FAIL examples/langgraph/durability.py::durability_async  seed=100  invariant=at_most_once(payments.charge)
-  payments.charge happened 2 times for scope 'order:ord-42' (at most 1 allowed)
-  minimized to 4 steps (1 of 1 deviations kept, 3 replays):
+FAIL docs/guide/examples/async_agent.py::async_per_attempt_key  seed=13  invariant=at_most_once(payments.charge)
+  payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
+  minimized to 3 steps (2 of 2 deviations kept, 4 replays):
     incarnation 0
-      1. charge(order_id='ord-42', amount=5000, idempotency_key=None)
-           effect landed
-      2. confirm(order_id='ord-42', charge_id=1, idempotency_key=None)
-           process killed before the call ran
+      1. Payments.charge(order_id='o1', amount=500, idempotency_key='o1-0')
+           effect landed (idempotency key 'o1-0'), then process killed after the effect landed, before the caller saw it
       -> process died
     incarnation 1 (restarted)
-      3. charge(order_id='ord-42', amount=5000, idempotency_key=None)
-           effect landed
-      4. confirm(order_id='ord-42', charge_id=2, idempotency_key=None)
-           effect landed
+      harness: cron re-ticked the job (recovery='cron-retick')
+      2. Payments.charge(order_id='o1', amount=500, idempotency_key='o1-0')
+           timeout before the effect: the caller saw TimeoutError
+      3. Payments.charge(order_id='o1', amount=500, idempotency_key='o1-1')
+           effect landed (idempotency key 'o1-1')
       finished
 ```
 
 And here is a real zero-fault model-perturbation trace from `examples/langgraph/refund_agent.py::refund_wrong_order_unguarded`:
 
 ```text
-FAIL examples/langgraph/refund_agent.py::refund_wrong_order_unguarded  seed=50  invariant=approved_before(payments.refund)
+FAIL examples/langgraph/refund_agent.py::refund_wrong_order_unguarded  seed=43  invariant=approved_before(payments.refund)
   issue_refund(order_id='18', amount_cents=4200) ran with no earlier approval for scope 'order:18'
-  minimized to 3 steps (1 of 1 deviations kept, 3 replays):
+  minimized to 3 steps (1 of 3 deviations kept, 5 replays):
     incarnation 0
       1. approval recorded for 'order:17'
       2. model chose "substitute order_id='18'" at 'call 2: issue_refund' (nominal: issue_refund(order_id='17', amount_cents=4200))
@@ -108,6 +108,8 @@ A saved `.min.json` file holds the scenario metadata and the minimal `realized` 
   "scenario": "checkout_buggy",
   "file": "/path/to/examples/plain_python/checks.py",
   "invariant": "at_most_once(payments.charge)",
+  "op": "payments.charge",
+  "scope_pattern": "order:<id>",
   "seed": 195,
   "realized": {
     "fault:payments.charge#0.0": 5,

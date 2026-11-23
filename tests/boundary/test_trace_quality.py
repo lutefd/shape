@@ -1,5 +1,5 @@
 """Traces a stranger can read: hidden framework arguments, root-cause exceptions, distinct
-causes, coverage, flaky seeds, and clean CLI failures."""
+defects, coverage, flaky seeds, and clean CLI failures."""
 
 import subprocess
 import sys
@@ -94,31 +94,32 @@ def test_a_died_incarnation_logs_the_root_cause_not_the_wrapper(tmp_path):
 # ----------------------------------------------------------------------------- distinct causes
 
 
-def test_failing_seeds_are_grouped_by_root_cause_with_counts(tmp_path):
+def test_failing_seeds_are_grouped_by_defect_with_counts(tmp_path):
     swept = runner.run_sweep(sc.two_independent_model_bugs, range(300), tmp_path)
-    report = runner.investigate_all(sc.two_independent_model_bugs, swept.failing, tmp_path, "x")
-    signatures = {c.failure.signature for c in report.causes}
-    assert ("at_most_once(t.refund)", "model:after_refund=1") in signatures
-    assert ("at_most_once(t.pay)", "model:after_pay=1") in signatures
-    assert sum(len(c.seeds) for c in report.causes) == len(swept.failing)
-    assert any(len(c.seeds) > 1 for c in report.causes)
+    report = runner.investigate_all(sc.two_independent_model_bugs, swept.failing, tmp_path, "x",
+                                    defect_keys=swept.defect_keys)
+    by_op = {d.key.op: d for d in report.defects if d.key.op is not None}
+    assert set(by_op) == {"t.refund", "t.pay"}
+    assert all("model" in defect.triggers for defect in by_op.values())
+    assert sum(len(d.seeds) for d in report.defects) == len(swept.failing)
+    assert any(len(d.seeds) > 1 for d in report.defects)
     text = report.render()
-    assert f"{len(report.causes)} distinct causes across {len(swept.failing)} failing seeds" in text
-    assert text.count("\nFAIL ") == len(report.causes)  # one minimized trace per cause
+    assert f"{len(report.defects)} defects across {len(swept.failing)} failing seeds" in text
+    assert text.count("\nFAIL ") == len(report.defects)
 
 
-def test_one_invariant_with_two_different_minimal_runs_is_two_causes(tmp_path):
+def test_reply_loss_and_crash_after_commit_reproduce_the_same_defect(tmp_path):
     swept = runner.run_sweep(sc.naive_retry, range(300), tmp_path)
-    report = runner.investigate_all(sc.naive_retry, swept.failing, tmp_path, "x")
-    invariants = {c.failure.invariant for c in report.causes}
-    assert invariants == {"at_most_once(t.pay)"}
-    # Reply-lost faults (timeout_after_commit, connection_reset_after_commit) group separately
-    # from process death after commit (crash_after) because they need different fixes.
-    assert len(report.causes) == 2
-    rendered = report.render()
-    assert "reply lost" in rendered
-    assert "process died after the commit" in rendered
-    assert "timeout_after_commit" in rendered and "crash_after" in rendered
+    report = runner.investigate_all(sc.naive_retry, swept.failing, tmp_path, "x",
+                                    defect_keys=swept.defect_keys)
+    defect, = report.defects
+    assert defect.key.invariant == "at_most_once(t.pay)"
+    assert {"reply_lost", "crash_after"} <= defect.triggers.keys()
+    assert defect.failure == min((t.failure for t in defect.triggers.values()), key=lambda f: f.size)
+    assert report.render().count("\nFAIL ") == 1
+    all_triggers = report.render(all_triggers=True)
+    assert "reply lost replay:" in all_triggers and "crash after commit replay:" in all_triggers
+    assert all_triggers.count("\nFAIL ") > 1
 
 
 def test_the_shrink_summary_says_deviations_not_faults(tmp_path):
@@ -127,7 +128,7 @@ def test_the_shrink_summary_says_deviations_not_faults(tmp_path):
     text = str(info.value)
     assert "deviations kept" in text
     assert "faults kept" not in text
-    assert "distinct cause" in text
+    assert "1 defect across" in text
 
 
 # -------------------------------------------------------------------- coverage and vacuous passes
@@ -207,7 +208,7 @@ def test_a_seed_whose_replay_differs_is_reported_not_minimized(tmp_path):
     with pytest.raises(AssertionError) as info:
         shape.check(sc.replays_differ_from_seeds, seeds=1, runs_dir=tmp_path)
     text = str(info.value)
-    assert "NOT MINIMIZED" in text and "did not fail again" in text
+    assert "NOT MINIMIZED" in text and "did not reproduce the defect" in text
     assert "minimized to" not in text
 
 

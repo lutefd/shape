@@ -3,6 +3,7 @@
 from .boundary import (
     Actor,
     ClientError,
+    Finding,
     HarnessError,
     RateLimited,
     Run,
@@ -33,6 +34,7 @@ from .boundary import (
 __all__ = [
     "Actor",
     "ClientError",
+    "Finding",
     "HarnessError",
     "RateLimited",
     "Run",

@@ -64,7 +64,7 @@ def checkout_buggy(run: shape.Run) -> None:
 
 ```console
 $ .venv/bin/shape test examples/plain_python/checks.py::checkout_buggy --seeds 200
-scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=0.94s  212 seeds/s
+scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=6.12s  33 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      202       252
@@ -73,10 +73,11 @@ coverage over 200 seeds:
   interleaving choices taken: none
 scope assignment:
   payments.charge: explicit scope= (e.g. 'order:o1')
-2 distinct causes across 2 failing seeds
+1 defect across 2 failing seeds
 
-cause 1 of 2: 1 of 2 failing seeds (52)
-  needs: reply lost (commit landed, caller saw an error: connection_reset_after_commit, timeout_after_commit)
+defect 1 of 1: at_most_once(payments.charge)  op=payments.charge  scope=order:<id>  (2 of 2 failing seeds)
+  reply lost: 2 seeds (connection_reset_after_commit, timeout_after_commit)
+  before-commit fault: 1 seed (server_error)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 3 steps (2 of 3 deviations kept, 6 replays):
@@ -100,6 +101,7 @@ The `except ConnectionResetError:` branch retried without `idempotency_key='char
 
 ## Framework guides
 
+- **Deployment recovery:** Set `recovery=` for a standalone job, queue, checkpointed thread, or scheduler. See [Recovery presets](docs/guide/recovery.md).
 - **Network clients:** Pass `net=[fake, ...]` to `@shape.scenario` to capture HTTP, SMTP, and IMAP. The [Mailtrap example](examples/net/mailtrap.py) uses the real SDK and reproduces a false failure report after an accepted send. See [Network capture](docs/boundary.md#network-capture).
 - **Plain Python (sync and async):** Decorate client methods directly with `@shape.effect`, persist state in `run.dir`, and explore model choices with `shape.choose`. See [Testing plain Python agents](docs/guide/plain-python.md).
 - **LangGraph (`shape.langgraph`):** Wrap tools with `effects()`, drive `StateGraph` and `interrupt()` flows with `drive()` / `adrive()`, and perturb plans with `ScriptedChatModel`. Catches missing idempotency keys, wrong-target tool calls, default `durability="async"` checkpoint loss, and `RetryPolicy()` double charges. See [Testing LangGraph agents](docs/guide/langgraph.md).
@@ -112,6 +114,8 @@ The `except ConnectionResetError:` branch retried without `idempotency_key='char
 ```sh
 shape test examples/plain_python/checks.py::checkout_fixed --seeds 200 --jobs 4 --strict-scopes --runs-dir /tmp/shape-runs
 ```
+
+Use `--all-triggers` for extra reproductions or `--json` for CI annotations.
 
 Or invoke directly from pytest (raising `AssertionError` carrying the minimized trace on failure):
 
@@ -139,7 +143,7 @@ Replay a checked-in `.min.json` regression trace in milliseconds with `shape.rep
 
 ### User guide
 
-1. [Core concepts](docs/guide/concepts.md): effects, scopes, keys, faults, incarnations, `shape.choose`, shrinking, coverage, `FLAKY`, `NOTHING TESTED`, and distinct causes.
+1. [Core concepts](docs/guide/concepts.md): effects, scopes, keys, faults, incarnations, `shape.choose`, shrinking, coverage, `FLAKY`, `NOTHING TESTED`, and defect reports.
 2. [Invariants](docs/guide/invariants.md): every built-in invariant with runnable examples, `claims_true` vs. `exactly_once`, and custom `@shape.invariant` checks over `shape.World`.
 3. [Reading a trace](docs/guide/reading-a-trace.md): line-by-line trace walkthrough, `.min.json` replay files, and a checklist to tell a real bug from a harness artifact.
 4. Framework guides: [Plain Python](docs/guide/plain-python.md), [LangGraph](docs/guide/langgraph.md), [OpenAI Agents SDK](docs/guide/openai-agents.md).

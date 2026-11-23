@@ -307,23 +307,31 @@ async def _drive_async(
     human: Callable[[Any], Any] | None = None,
     context_serializer: Callable[[Any], dict[str, Any]] | None = None,
     max_turns: int = 10,
-    on_restart: str | Callable[[Run], Any] = "none",
+    on_restart: str | Callable[[Run], Any] | None = None,
 ) -> RunResult | None:
-    _validate_on_restart(on_restart)
+    if run.recovery == "langgraph-resume":
+        raise ValueError("recovery='langgraph-resume' requires the LangGraph driver")
+    if on_restart is not None and run.recovery is not None:
+        raise ValueError("pass recovery= on the scenario or on_restart= to drive, not both")
+    policy = on_restart
+    if policy is None:
+        policy = "none" if run.recovery in (None, "none") else "redeliver"
+    _validate_on_restart(policy)
     if session_id is not None and session_factory is not None:
         raise ValueError("pass either session_id or session_factory, not both")
 
     job_idx = _next_job_index(run)
 
     if run.restarts > 0:
-        if on_restart == "none":
+        if policy == "none":
             return None
-        if callable(on_restart):
-            res = on_restart(run)
+        if callable(policy):
+            res = policy(run)
             if inspect.isawaitable(res):
                 res = await res
             return res
-        api._note("harness redelivered the request (on_restart='redeliver')")
+        if run.recovery is None:
+            api._note("harness redelivered the request (on_restart='redeliver')")
 
     effective_session_id = session_id if session_id is not None else f"shape-job-{job_idx}"
     session = (
@@ -334,6 +342,8 @@ async def _drive_async(
     run_config = RunConfig(tracing_disabled=True)
     paused = _paused_state_path(run.dir, session_id=session_id, job_idx=job_idx)
 
+    if run.restarts and run.recovery in ("cron-retick", "apscheduler-reload"):
+        paused.unlink(missing_ok=True)
     if paused.exists():
         state = await RunState.from_json(
             agent,
@@ -394,7 +404,7 @@ def drive(
     human: Callable[[Any], Any] | None = None,
     context_serializer: Callable[[Any], dict[str, Any]] | None = None,
     max_turns: int = 10,
-    on_restart: str | Callable[[Run], Any] = "none",
+    on_restart: str | Callable[[Run], Any] | None = None,
 ) -> RunResult | None:
     """Drive an OpenAI Agents SDK `Agent` inside a `shape` scenario.
 
@@ -403,7 +413,7 @@ def drive(
     do not share conversation history. To share a session across turns deliberately, pass the
     same `session_id="..."` (or `session_factory=...`).
 
-    `on_restart` controls what happens on a restarted incarnation (`run.restarts > 0`):
+    Without scenario-level `recovery=`, `on_restart` controls what happens on restart:
     - `"none"` (default): do nothing and return `None` (models an app without a supervisor).
     - `"redeliver"`: reload any saved approval `RunState` or resend `input` into the same
       session (models an at-least-once queue/supervisor) and log the harness redelivery in the

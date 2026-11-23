@@ -84,7 +84,7 @@ shape test examples/plain_python/checks.py::checkout_buggy --seeds 200
 Real output:
 
 ```text
-scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=0.94s  212 seeds/s
+scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=6.12s  33 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      202       252
@@ -93,10 +93,11 @@ coverage over 200 seeds:
   interleaving choices taken: none
 scope assignment:
   payments.charge: explicit scope= (e.g. 'order:o1')
-2 distinct causes across 2 failing seeds
+1 defect across 2 failing seeds
 
-cause 1 of 2: 1 of 2 failing seeds (52)
-  needs: reply lost (commit landed, caller saw an error: connection_reset_after_commit, timeout_after_commit)
+defect 1 of 1: at_most_once(payments.charge)  op=payments.charge  scope=order:<id>  (2 of 2 failing seeds)
+  reply lost: 2 seeds (connection_reset_after_commit, timeout_after_commit)
+  before-commit fault: 1 seed (server_error)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 3 steps (2 of 3 deviations kept, 6 replays):
@@ -109,21 +110,6 @@ FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most
            effect landed
       finished
   replay: runs/checkout_buggy/seed-52.min.json
-
-cause 2 of 2: 1 of 2 failing seeds (195)
-  needs: before-commit fault (the call failed cleanly: server_error) + reply lost (commit landed, caller saw an error: connection_reset_after_commit)
-FAIL examples/plain_python/checks.py::checkout_buggy  seed=195  invariant=at_most_once(payments.charge)
-  payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
-  minimized to 3 steps (2 of 2 deviations kept, 4 replays):
-    incarnation 0
-      1. PaymentClient.charge(order_id='o1', amount=500, idempotency_key='charge-o1')
-           server error before the effect: the caller saw ServerError
-      2. PaymentClient.charge(order_id='o1', amount=500, idempotency_key='charge-o1')
-           effect landed (idempotency key 'charge-o1'), then connection reset after commit: the caller saw ConnectionResetError
-      3. PaymentClient.charge(order_id='o1', amount=500, idempotency_key=None)
-           effect landed
-      finished
-  replay: runs/checkout_buggy/seed-195.min.json
 ```
 
 ### The fix
@@ -182,22 +168,16 @@ Running both scenarios in `docs/guide/examples/async_agent.py`:
 shape test docs/guide/examples/async_agent.py --seeds 200
 ```
 
-Real output (`async_per_attempt_key`, which splits reply-lost failures from process-crash recovery failures into two distinct causes, followed by `async_stable_key`):
+The async example uses [the cron preset](recovery.md). The buggy key produces a single defect across the failing seeds. The stable key passes.
 
 ```text
-scenario=async_per_attempt_key  seeds=200 (from 0)  failing=12  wall=2.17s  92 seeds/s
-coverage over 200 seeds:
-  op                landed  attempts
-  payments.charge      215       252
-                   faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
-  model choices taken: none
-  interleaving choices taken: none
-scope assignment:
-  payments.charge: explicit scope= (e.g. 'order:o1')
-2 distinct causes across 12 failing seeds
+1 defect across 12 failing seeds
 
-cause 1 of 2: 11 of 12 failing seeds (7, 32, 33, 35, 52, ...)
-  needs: reply lost (commit landed, caller saw an error: connection_reset_after_commit, timeout_after_commit)
+defect 1 of 1: at_most_once(payments.charge)  op=payments.charge  scope=order:<id>  (12 of 12 failing seeds)
+  reply lost: 11 seeds (connection_reset_after_commit, timeout_after_commit)
+  before-commit fault: 4 seeds (rate_limit, server_error, timeout)
+  crash after commit: 1 seed (crash_after)
+  crash before: 1 seed (crash_before)
 FAIL docs/guide/examples/async_agent.py::async_per_attempt_key  seed=7  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 2 steps (1 of 1 deviations kept, 2 replays):
@@ -208,27 +188,10 @@ FAIL docs/guide/examples/async_agent.py::async_per_attempt_key  seed=7  invarian
            effect landed (idempotency key 'o1-1')
       finished
   replay: runs/async_per_attempt_key/seed-7.min.json
-
-cause 2 of 2: 1 of 12 failing seeds (13)
-  needs: crash after commit (process died after the commit: crash_after) + before-commit fault (the call failed cleanly: timeout)
-FAIL docs/guide/examples/async_agent.py::async_per_attempt_key  seed=13  invariant=at_most_once(payments.charge)
-  payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
-  minimized to 3 steps (2 of 2 deviations kept, 4 replays):
-    incarnation 0
-      1. Payments.charge(order_id='o1', amount=500, idempotency_key='o1-0')
-           effect landed (idempotency key 'o1-0'), then process killed after the effect landed, before the caller saw it
-      -> process died
-    incarnation 1 (restarted)
-      2. Payments.charge(order_id='o1', amount=500, idempotency_key='o1-0')
-           timeout before the effect: the caller saw TimeoutError
-      3. Payments.charge(order_id='o1', amount=500, idempotency_key='o1-1')
-           effect landed (idempotency key 'o1-1')
-      finished
-  replay: runs/async_per_attempt_key/seed-13.min.json
 ```
 
 ```text
-scenario=async_stable_key  seeds=200 (from 0)  failing=0  wall=1.72s  116 seeds/s
+scenario=async_stable_key  seeds=200 (from 0)  failing=0  wall=3.48s  57 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      200       252

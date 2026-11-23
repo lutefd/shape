@@ -1,122 +1,93 @@
-"""A minimized failure, the distinct root causes a sweep's failing seeds fall into, and how they
-are printed."""
+"""A sweep's defects, the triggers that reproduced each one, and their replay artifacts."""
 
 from __future__ import annotations
 
-from collections import Counter
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .faults import AFTER_COMMIT, FAULTS
-from .log import event_order
+from .faults import AFTER_COMMIT, DUPLICATE_TRIGGER
+from .invariants import Violation
 
-_COARSE_TEXT = {
-    "reply_lost": ("reply lost", "commit landed, caller saw an error"),
-    "crash_after": ("crash after commit", "process died after the commit"),
-    "before_commit": ("before-commit fault", "the call failed cleanly"),
-    "crash_before": ("crash", "died before the call"),
+_TRIGGER_LABELS = {
+    "reply_lost": "reply lost",
+    "crash_after": "crash after commit",
+    "crash_before": "crash before",
+    "before_commit": "before-commit fault",
+    "model": "model choice",
+    "interleaving": "interleaving",
+    "duplicate_trigger": "duplicate trigger",
+    "nominal": "nominal (a plain unit test catches this)",
 }
+
+# Keep field names in scopes such as tenant:acme|order:123 or tenant:acme/order:123.
+_SCOPE_FIELD = re.compile(r"(?:^|[|/])[A-Za-z_][\w.-]*:")
+
+
+def scope_pattern(scope: str | None) -> str | None:
+    if not scope:
+        return scope
+    fields = list(_SCOPE_FIELD.finditer(scope))
+    if not fields:
+        return "<id>"
+    prefix = "<id>" if fields[0].start() else ""
+    return prefix + "".join(f"{m[0]}<id>" for m in fields)
+
+
+@dataclass(frozen=True)
+class DefectKey:
+    invariant: str
+    op: str | None
+    scope_pattern: str | None
+
+    @classmethod
+    def from_violation(cls, violation: Violation) -> DefectKey:
+        return cls(violation.invariant, violation.op, scope_pattern(violation.scope))
 
 
 def fault_class(fault_name: str) -> str:
-    """Coarse class of a boundary fault: reply_lost (timeout/reset after commit, same process
-    retries), crash_after (process died after the commit, recovery after restart), before_commit
-    (call failed cleanly), or crash_before (died before the call)."""
-    if fault_name == "crash_after":
-        return "crash_after"
-    if fault_name in AFTER_COMMIT:
-        return "reply_lost"
-    if fault_name == "crash_before":
-        return "crash_before"
-    return "before_commit"
+    if fault_name in ("crash_before", "crash_after"):
+        return fault_name
+    return "reply_lost" if fault_name in AFTER_COMMIT else "before_commit"
 
 
-def kind(key: str, value: int) -> str:
-    """What exact deviation a draw is, without where it happened: `payments.charge:timeout`,
-    `model:after_refund=1` (option 1), or `duplicate_trigger`."""
-    family, _, rest = key.partition(":")
-    subject = rest.split("#")[0]
-    if family == "fault":
-        return f"{subject}:{FAULTS[value - 1]}"
-    if family == "sched":
-        return f"{key}={value}"
-    return f"model:{subject}={value}" if family == "model" else subject
-
-
-def coarse_kind(key: str, value: int) -> str:
-    """Coarse class of a deviation for root-cause grouping: `<op>:reply_lost`, `<op>:crash_after`,
-    `<op>:before_commit`, `<op>:crash_before`, `interleaving`, `model:<label>=<value>`, or
-    `duplicate_trigger`."""
-    family, _, rest = key.partition(":")
-    subject = rest.split("#")[0]
-    if family == "fault":
-        return f"{subject}:{fault_class(FAULTS[value - 1])}"
-    if family == "sched":
-        return "interleaving"
-    return f"model:{subject}={value}" if family == "model" else subject
-
-
-def kinds(entries: list[dict]) -> tuple[str, ...]:
-    """The exact deviations of a run, in the order they happened."""
-    draws = [e for e in entries if e["kind"] in ("fault", "choice", "schedule")]
-    draws.sort(key=event_order)
-    return tuple(kind(d["key"], d["value"]) for d in draws)
-
-
-def coarse_kinds(entries: list[dict]) -> tuple[str, ...]:
-    """The coarse deviation classes of a run, in the order they happened."""
-    draws = [e for e in entries if e["kind"] in ("fault", "choice", "schedule")]
-    draws.sort(key=event_order)
-    return tuple(coarse_kind(d["key"], d["value"]) for d in draws)
-
-
-def raw_kinds(realized: dict[str, int]) -> Counter[str]:
-    return Counter(kind(k, v) for k, v in realized.items())
-
-
-def raw_coarse_kinds(realized: dict[str, int]) -> Counter[str]:
-    return Counter(coarse_kind(k, v) for k, v in realized.items())
-
-
-def _deviation_category(coarse_dev: str) -> str:
-    if coarse_dev == "interleaving":
-        return "interleaving"
-    if coarse_dev.startswith("model:"):
-        return "model"
-    if coarse_dev == "duplicate_trigger":
-        return "duplicate_trigger"
-    _, _, cls = coarse_dev.rpartition(":")
-    return cls if cls in _COARSE_TEXT else coarse_dev
-
-
-def _exact_fault_name(exact_dev: str) -> tuple[str, str] | None:
-    if exact_dev.startswith("model:") or ":" not in exact_dev:
-        return None
-    op, _, fault_name = exact_dev.rpartition(":")
-    return (op, fault_name) if fault_name in FAULTS else None
+def trigger_classes(entries: list[dict]) -> dict[str, set[str]]:
+    classes: dict[str, set[str]] = {}
+    for event in entries:
+        if event["kind"] == "choice":
+            classes.setdefault("model", set())
+        elif event["kind"] == "schedule":
+            classes.setdefault("interleaving", set())
+        elif event["kind"] == "fault":
+            fault = event["fault"]
+            if fault == DUPLICATE_TRIGGER:
+                classes.setdefault("duplicate_trigger", set())
+            else:
+                classes.setdefault(fault_class(fault), set()).add(fault)
+    return classes or {"nominal": set()}
 
 
 @dataclass
 class Failure:
-    scenario: str
     target: str
     seed: int
-    invariant: str
+    key: DefectKey
     message: str
     trace: list[str]
     steps: int
     deviations: int
     original_deviations: int
     replays: int
-    replay_file: Path | None
-    problem: str | None = None  # set when the run does not reproduce: no minimality claim then
-    signature: tuple = ()  # invariant (+ op if distinct) + ordered coarse deviations
-    op: str | None = None
-    coarse_deviations: tuple[str, ...] = ()
-    exact_kinds: tuple[str, ...] = ()
+    replay_file: Path
+    problem: str | None = None
+    triggers: dict[str, set[str]] = field(default_factory=dict)
+
+    @property
+    def size(self) -> tuple[bool, int, int, int]:
+        return self.problem is not None, self.deviations, self.steps, self.seed
 
     def render(self) -> str:
-        head = f"FAIL {self.target}  seed={self.seed}  invariant={self.invariant}"
+        head = f"FAIL {self.target}  seed={self.seed}  invariant={self.key.invariant}"
         out = [head, f"  {self.message}"]
         if self.problem:
             out += [f"  NOT MINIMIZED: {self.problem}",
@@ -125,89 +96,127 @@ class Failure:
             out.append(f"  minimized to {self.steps} steps ({self.deviations} of "
                        f"{self.original_deviations} deviations kept, {self.replays} replays):")
         out += [f"    {line}" for line in self.trace]
-        if self.replay_file:
+        if self.problem is None:
             out.append(f"  replay: {self.replay_file}")
         return "\n".join(out)
 
 
 @dataclass
-class Cause:
-    """Failing seeds whose minimized runs share the same invariant, violating op, and coarse
-    deviation classes, with the exact fault kinds observed listed inside the cause."""
-
-    failure: Failure  # the seed with the fewest deviations among them
+class Trigger:
+    name: str
+    failure: Failure
     seeds: list[int] = field(default_factory=list)
-    exact_kinds: set[str] = field(default_factory=set)
+    faults: set[str] = field(default_factory=set)
 
-    def __post_init__(self) -> None:
-        self.exact_kinds.update(self.failure.exact_kinds)
-
-    @property
-    def deviations(self) -> Counter[str]:
-        return Counter(self.failure.coarse_deviations)
+    def record(self, failure: Failure) -> None:
+        self.seeds.append(failure.seed)
+        self.faults.update(failure.triggers[self.name])
+        self.failure = min(self.failure, failure, key=lambda f: f.size)
 
     @property
-    def is_nominal(self) -> bool:
-        return not self.failure.coarse_deviations
+    def label(self) -> str:
+        return _TRIGGER_LABELS[self.name]
 
-    def record_exact(self, realized: dict[str, int]) -> None:
-        wanted = self.deviations
-        for k, v in realized.items():
-            if coarse_kind(k, v) in wanted:
-                self.exact_kinds.add(kind(k, v))
+    def as_dict(self) -> dict:
+        return {
+            "class": self.name,
+            "label": self.label,
+            "seeds": sorted(self.seeds),
+            "faults": sorted(self.faults),
+            "representative_seed": self.failure.seed,
+            "replay_path": str(self.failure.replay_file),
+        }
 
-    def trigger_label(self) -> str:
-        if self.failure.invariant == "harness_error":
-            return "harness error (a shape hook raised; fix the harness)"
-        if self.is_nominal:
-            return "nominal path (0 faults, 0 model choices): a plain unit test catches this"
-        by_class: dict[str, set[str]] = {}
-        for dev in self.exact_kinds:
-            parsed = _exact_fault_name(dev)
-            if parsed is not None:
-                _, fname = parsed
-                by_class.setdefault(fault_class(fname), set()).add(fname)
-        seen_cats: list[str] = []
-        for cdev in self.failure.coarse_deviations:
-            cat = _deviation_category(cdev)
-            if cat not in seen_cats:
-                seen_cats.append(cat)
-        parts: list[str] = []
-        for cat in seen_cats:
-            if cat in _COARSE_TEXT:
-                short, desc = _COARSE_TEXT[cat]
-                names = sorted(by_class.get(cat, ()))
-                detail = f"{desc}: {', '.join(names)}" if names else desc
-                parts.append(f"{short} ({detail})")
-            elif cat == "model":
-                parts.append("model choice")
-            elif cat == "duplicate_trigger":
-                parts.append("duplicate delivery")
-            else:
-                parts.append(cat)
-        return "needs: " + " + ".join(parts)
+
+@dataclass
+class Defect:
+    key: DefectKey
+    seeds: list[int] = field(default_factory=list)
+    triggers: dict[str, Trigger] = field(default_factory=dict)
+    failure: Failure | None = None
+
+    def record(self, failure: Failure) -> None:
+        if self.failure is None or failure.size < self.failure.size:
+            self.failure = failure
+        for name in failure.triggers:
+            self.triggers.setdefault(name, Trigger(name, failure)).record(failure)
+
+    def ranked_triggers(self) -> list[Trigger]:
+        return sorted(self.triggers.values(), key=lambda t: (t.name == "nominal", -len(t.seeds),
+                                                             t.name))
+
+    def as_dict(self) -> dict:
+        failure = self.failure
+        return {
+            "invariant": self.key.invariant,
+            "op": self.key.op,
+            "scope_pattern": self.key.scope_pattern,
+            "seeds": sorted(self.seeds),
+            "representative_seed": failure.seed if failure else None,
+            "replay_path": str(failure.replay_file) if failure and not failure.problem else None,
+            "message": failure.message if failure else None,
+            "triggers": [t.as_dict() for t in self.ranked_triggers()],
+        }
 
 
 @dataclass
 class Report:
     failing: int
-    causes: list[Cause]
-    skipped: int = 0  # failing seeds beyond the investigation limit
-    budget_skipped: int = 0
+    defects: list[Defect]
+    skipped_seeds: list[int] = field(default_factory=list)
+    budget_skipped_seeds: list[int] = field(default_factory=list)
+    unreproducible: list[Failure] = field(default_factory=list)
 
-    def render(self) -> str:
-        n = len(self.causes)
-        word = "cause" if n == 1 else "causes"
-        out = [f"{n} distinct {word} across {self.failing} failing seeds"]
+    @property
+    def skipped(self) -> int:
+        return len(self.skipped_seeds)
+
+    @property
+    def budget_skipped(self) -> int:
+        return len(self.budget_skipped_seeds)
+
+    def render(self, *, all_triggers: bool = False) -> str:
+        n = len(self.defects)
+        out = [f"{n} {'defect' if n == 1 else 'defects'} across {self.failing} failing seeds"]
         if self.skipped:
             out.append(f"({self.skipped} more failing seeds were not minimized due to max_shrinks)")
         if self.budget_skipped:
             out.append(f"({self.budget_skipped} more failing seeds were not minimized "
                        "because the time budget expired)")
-        for i, cause in enumerate(self.causes, 1):
-            ordered = sorted(cause.seeds)
-            seen = ", ".join(map(str, ordered[:5])) + (", ..." if len(ordered) > 5 else "")
-            heading = (f"cause {i} of {n}: {len(cause.seeds)} of {self.failing} failing seeds "
-                       f"({seen})")
-            out += ["", heading, f"  {cause.trigger_label()}", cause.failure.render()]
+        for i, defect in enumerate(self.defects, 1):
+            key = defect.key
+            count = len(defect.seeds)
+            scope = "(run)" if key.scope_pattern == "" else key.scope_pattern or "-"
+            heading = (f"defect {i} of {n}: {key.invariant}  op={key.op or '-'}  "
+                       f"scope={scope}  ({count} of {self.failing} failing seeds)")
+            out.extend(["", heading])
+            triggers = defect.ranked_triggers()
+            for trigger in triggers:
+                count = len(trigger.seeds)
+                faults = f" ({', '.join(sorted(trigger.faults))})" if trigger.faults else ""
+                out.append(f"  {trigger.label}: {count} {'seed' if count == 1 else 'seeds'}{faults}")
+            if defect.failure is not None:
+                out.append(defect.failure.render())
+                if all_triggers:
+                    shown = {defect.failure.seed}
+                    for trigger in triggers:
+                        if trigger.failure.seed in shown:
+                            out.append(f"  {trigger.label} replay: shown above")
+                        else:
+                            out.extend([f"  {trigger.label} replay:", trigger.failure.render()])
+                            shown.add(trigger.failure.seed)
+        for failed in self.unreproducible:
+            if all(defect.failure is not failed for defect in self.defects):
+                out.extend(["", failed.render()])
         return "\n".join(out)
+
+    def as_dict(self) -> dict:
+        return {
+            "defects": [defect.as_dict() for defect in self.defects],
+            "shrink_limit_skipped_seeds": sorted(self.skipped_seeds),
+            "shrink_budget_skipped_seeds": sorted(self.budget_skipped_seeds),
+            "unreproducible": [
+                {"seed": f.seed, "invariant": f.key.invariant, "reason": f.problem}
+                for f in self.unreproducible
+            ],
+        }

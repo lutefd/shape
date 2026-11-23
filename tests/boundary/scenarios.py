@@ -429,8 +429,8 @@ def scenario_that_must_do_nothing(run: shape.Run) -> None:
 
 @shape.scenario(invariants=[shape.at_most_once("t.pay")], max_restarts=0)
 def replays_differ_from_seeds(run: shape.Run) -> None:
-    """Deterministic per seed, but a replay from a realized map (no seed) takes another path."""
-    for _ in range(2 if run.seed is not None else 1):
+    """Depends on the run path, so explicit replays in a different directory diverge."""
+    for _ in range(1 if run.dir.name.endswith(".min") else 2):
         pay_unkeyed_twice()
 
 
@@ -447,7 +447,7 @@ def crashy() -> None:
 @shape.scenario(invariants=[shape.at_most_once("t.refund"), shape.at_most_once("t.pay")],
                 max_restarts=0)
 def two_independent_model_bugs(run: shape.Run) -> None:
-    """Swallows every tool error, so the only failures are the two model decisions."""
+    """Two duplicate effects triggered by model decisions, with faults still enabled."""
     def attempt(fn, *args):
         with contextlib.suppress(Exception):
             fn(*args)
