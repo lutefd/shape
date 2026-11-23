@@ -34,3 +34,5 @@ jobs:
           grep -q "invariant=at_most_once(payments.charge)" plain.out
       - name: plain-python fixed example must pass
         run: shape test examples/plain_python/checks.py::checkout_fixed --seeds 200
+      - name: README quickstart and guide docs check
+        run: python scripts/check_docs.py
