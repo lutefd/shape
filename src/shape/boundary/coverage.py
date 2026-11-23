@@ -120,22 +120,26 @@ class Coverage:
                 for op in inv.ops:
                     if inv.name not in dup_by_op[op]:
                         dup_by_op[op].append(inv.name)
-        out = ["scope assignment:"]
+        rows: list[str] = []
         for op in sorted(self.scopes):
             items = sorted(self.scopes[op].items())
+            if self.effects[op] == 0 and self.no_effects[op] > 0:
+                items = [item for item in items if item[0][0] != "effect_default"]
+            if not items:
+                continue
             uses_default = False
             for (source, rule), example in items:
                 if source in ("fake_default", "effect_default"):
                     uses_default = True
                 desc = _format_scope_derivation(source, rule)
-                out.append(f"  {op}: {desc} (e.g. {example!r})")
+                rows.append(f"  {op}: {desc} (e.g. {example!r})")
             if uses_default and dup_by_op.get(op):
                 invs = ", ".join(dup_by_op[op])
-                out.append(
+                rows.append(
                     f"  warning: {op} uses a default scope rule with {invs}; "
                     f"pass scope= to the fake or effect (or run with --strict-scopes)"
                 )
-        return "\n".join(out)
+        return "\n".join(["scope assignment:", *rows]) if rows else ""
 
 
 def never_ran(coverage: Coverage, ops: tuple[str, ...]) -> list[str]:
