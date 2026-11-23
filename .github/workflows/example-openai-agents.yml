@@ -1,0 +1,60 @@
+name: example-openai-agents
+on:
+  pull_request:
+    paths:
+      - "examples/openai_agents/**"
+      - "src/shape/boundary/**"
+      - ".github/workflows/example-openai-agents.yml"
+  push:
+    branches: [main]
+    paths:
+      - "examples/openai_agents/**"
+      - "src/shape/boundary/**"
+      - ".github/workflows/example-openai-agents.yml"
+jobs:
+  openai-agents:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/openai_agents
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: clean venv, pinned SDK, results table (exits 1 if any cell changed)
+        run: ./run.sh
+      - name: unkeyed refund must fail and shrink
+        run: |
+          set +e
+          .venv/bin/shape test checks.py::refund_unkeyed --seeds 300 | tee unkeyed.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -ne 0
+          grep -q "invariant=at_most_once(payments.refund)" unkeyed.out
+          grep -q "minimized to" unkeyed.out
+          ! grep -q "NOT MINIMIZED" unkeyed.out
+      - name: unkeyed approval flow must fail and shrink
+        run: |
+          set +e
+          .venv/bin/shape test checks.py::refund_approval_unkeyed --seeds 300 | tee approval.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -ne 0
+          grep -q "invariant=at_most_once(payments.refund)" approval.out
+          ! grep -q "NOT MINIMIZED" approval.out
+      - name: keyed refund must pass
+        run: .venv/bin/shape test checks.py::refund_keyed --seeds 300
+      - name: keyed approval flow must pass
+        run: .venv/bin/shape test checks.py::refund_approval_keyed --seeds 300
+      - name: checked-in traces must replay to the same failure
+        run: |
+          for f in traces/*.min.json; do
+            scenario=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['scenario'])" "$f")
+            set +e
+            .venv/bin/shape test "checks.py::$scenario" --replay "$f" | tee replay.out
+            code=${PIPESTATUS[0]}
+            set -e
+            test "$code" -eq 1
+            grep -q "(replayed)" replay.out
+          done
