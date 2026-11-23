@@ -365,7 +365,7 @@ def test_agents_adapter_auto_detects_framework_error_string_as_not_landed(tmp_pa
 
 
 def test_scenario_recovery_redelivers_agents_sdk_input(tmp_path):
-    @shape.scenario(recovery="celery-acks-late", max_restarts=1)
+    @shape.scenario(recovery=shape.recovery.CeleryAcksLate(reject_on_worker_lost=True), max_restarts=1)
     def scenario(run):
         ctx = _Ctx(run.dir / "payments.db")
         ctx.init_db()
