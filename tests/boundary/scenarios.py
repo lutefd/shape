@@ -106,3 +106,32 @@ def async_never_awaited(run: shape.Run) -> None:
     """Creates the coroutine and drops it: nothing ran, so nothing may be recorded or faulted."""
     coro = apay("1", str(run.dir / "apay-body"))
     coro.close()
+
+
+@shape.effect("t.refund", scope=lambda order, **_: f"order:{order}")
+def refund(order: str) -> None:
+    pass
+
+
+@shape.scenario(invariants=[shape.at_most_once("t.refund")], max_restarts=0)
+def model_may_repeat_a_refund(run: shape.Run) -> None:
+    refund("1")
+    if shape.choose("after_refund", ["reply_to_customer", "refund_again"]) == "refund_again":
+        refund("1")
+
+
+@shape.effect("t.keyed_refund", scope=lambda order, **_: f"order:{order}",
+              key=lambda order, **_: f"refund-{order}")
+def keyed_refund(order: str) -> None:
+    pass
+
+
+@shape.scenario(invariants=[shape.at_most_once("t.keyed_refund")])
+def model_never_repeats(run: shape.Run) -> None:
+    for _ in range(3):
+        try:
+            keyed_refund("1")
+            break
+        except (TimeoutError, ConnectionResetError, shape.RateLimited, shape.ServerError):
+            continue
+    shape.choose("after_refund", ["reply_to_customer", "ask_a_question", "close_ticket"])
