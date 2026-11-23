@@ -95,7 +95,7 @@ A failure caused purely by a model perturbation (zero injected faults) renders a
 
 ```text
 incarnation 0
-  1. model chose 'repeat' at 'call 2: issue_refund' (nominal: 'nominal')
+  1. model chose 'repeat' at 'call 2: issue_refund' (nominal: issue_refund(order_id='17', amount_cents=4200))
   2. issue_refund(order_id='17', amount_cents=4200)
        effect landed
   3. issue_refund(order_id='17', amount_cents=4200)

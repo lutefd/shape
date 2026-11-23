@@ -8,12 +8,11 @@ substitution, error retry count, and post-restart re-issue).
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 from ..boundary import api
 
-_EFFECT_KEYS = frozenset({"op", "scope", "key", "irreversible", "errors"})
 _RETRY_OPTIONS = ("retry_1", "retry_0", "retry_2")
 _RETRY_BUDGET = {"retry_0": 0, "retry_1": 1, "retry_2": 2}
 
@@ -27,6 +26,14 @@ class Effect:
     key: Callable[..., str | None] | None = None
     irreversible: bool = False
     errors: Mapping[str, Callable[[], Exception]] | None = None
+    idempotent: bool = False
+    result: Callable[[Any], Any] | None = None
+    hide: Sequence[str] = ()
+
+
+# Every option of `@shape.effect` is a field of `Effect`: unknown keys are rejected against the
+# fields, and the decorator is built from them, so a new option is forwarded by adding a field.
+_EFFECT_KEYS = frozenset(f.name for f in fields(Effect))
 
 
 EffectConfig = str | Mapping[str, Any] | Effect
@@ -45,26 +52,26 @@ def normalize_effect(tool_name: str, cfg: EffectConfig) -> Effect:
             )
         if "op" not in cfg:
             raise ValueError(f"effect config for tool {tool_name!r} must include 'op'")
-        return Effect(
-            op=cfg["op"],
-            scope=cfg.get("scope"),
-            key=cfg.get("key"),
-            irreversible=bool(cfg.get("irreversible", False)),
-            errors=cfg.get("errors"),
-        )
+        return Effect(**{
+            **cfg,
+            "irreversible": bool(cfg.get("irreversible", False)),
+            "idempotent": bool(cfg.get("idempotent", False)),
+            "hide": tuple(cfg.get("hide", ())),
+        })
     raise TypeError(
         f"ops[{tool_name!r}] must be an op name, dict, or Effect; got {type(cfg).__name__}"
     )
 
 
 def make_effect_decorator(spec: Effect) -> Callable:
-    return api.effect(
-        spec.op,
-        scope=spec.scope,
-        key=spec.key,
-        irreversible=spec.irreversible,
-        errors=spec.errors,
-    )
+    return api.effect(spec.op, **{f.name: getattr(spec, f.name)
+                                  for f in fields(spec) if f.name != "op"})
+
+
+def _call_text(step: _PendingStep) -> str:
+    """The planned call as the trace should name it: `issue_refund(order_id='17')`."""
+    shown = ", ".join(f"{k}={v!r}" for k, v in step.args.items())
+    return f"{step.name}({shown})"
 
 
 @dataclass(frozen=True)
@@ -267,6 +274,7 @@ class PlanRunner:
                 choice = api.choose(
                     f"after restart: call {step.num}: {step.name}",
                     ["nominal", "reissue"],
+                    nominal=f"do not repeat {_call_text(step)}",
                 )
                 if choice == "reissue":
                     reissued.append(step.clone(perturbed=True))
@@ -345,7 +353,8 @@ class PlanRunner:
                 options.append(opt)
                 sub_map[opt] = (arg_name, alt_val)
 
-            choice = api.choose(f"call {step.num}: {step.name}", options)
+            choice = api.choose(f"call {step.num}: {step.name}", options,
+                                nominal=_call_text(step))
             if choice == "nominal":
                 return self._emit(step, history)
             if choice == "repeat":

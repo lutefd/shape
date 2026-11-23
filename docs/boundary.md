@@ -95,7 +95,7 @@ def after_tool_error(messages):
     ...
 ```
 
-`options[0]` is the nominal choice, what a well-behaved model does. Each seed may pick another option instead, drawn at key `model:<label>#<incarnation>.<n>`. Choices are shrunk and replayed exactly like faults, so a failure that needs the model to repeat a call shows up in the minimized trace as `model chose 'refund_again' at 'after_refund' (nominal: 'reply_to_customer')`. Outside a run, and on the last fault-free incarnation, `choose` returns `options[0]`. `weights` defaults to the nominal option being 10 times as likely as each alternative.
+`options[0]` is the nominal choice, what a well-behaved model does. Each seed may pick another option instead, drawn at key `model:<label>#<incarnation>.<n>`. Choices are shrunk and replayed exactly like faults, so a failure that needs the model to repeat a call shows up in the minimized trace as `model chose 'refund_again' at 'after_refund' (nominal: 'reply_to_customer')`. Outside a run, and on the last fault-free incarnation, `choose` returns `options[0]`. `weights` defaults to the nominal option being 10 times as likely as each alternative. `shape.choose(label, options, weights=None, nominal=None)`: `nominal` is the text the trace uses for `options[0]` when its repr does not say what the model was supposed to do. The adapters pass the planned call, so a trace reads `model chose 'repeat' at 'call 2: issue_refund' (nominal: issue_refund(order_id='17'))`.
 
 ### World
 
