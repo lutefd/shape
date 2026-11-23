@@ -202,7 +202,7 @@ class PagerDutyFake:
 
 Key rules for custom fakes:
 
-1. **Return `None` from `effect()` (and `describe()`) for reads.** Reads do not enter the world log.
+1. **Return `None` from `effect()` (and `describe()`) for reads.** Shape captures standard read methods as scheduling points and leaves them out of effect and attempt counts.
 2. **Return `landed=False` from `effect()` for rejected writes.** Any 4xx/5xx error (or Slack-style `ok: false`) must set `landed=False` so `shape` does not log a landed effect or inject after-commit faults.
 3. **Never use `random`, `uuid4()`, or wall-clock `time.time()` inside `handle()`.** Use counters stored in `state` and an injected `clock` so replays and shrinking remain deterministic.
 4. **Implement optional `describe(req)`** when you want domain-named fault keys before fault injection; if omitted, `shape.net` falls back to `METHOD host/path` keys and still uses `effect(req, resp)` for the world log.
