@@ -1,0 +1,19 @@
+scenario=refund_wrong_order_unguarded  seeds=300 (from 0)  failing=20  wall=10.00s  30 seeds/s
+coverage over 300 seeds:
+  op                landed  attempts
+  payments.refund      278       382
+                   faults injected: client_error 7, connection_reset_after_commit 11, crash_after 16, crash_before 11, rate_limit 15, server_error 11, timeout 12, timeout_after_commit 9
+  model choices taken: after restart: call 2: issue_refund -> 'reissue' x1, call 1: lookup_order -> "substitute order_id='18'" x18, call 1: lookup_order -> 'drop' x21, call 1: lookup_order -> 'repeat' x24, call 1: lookup_order -> 'swap' x23, call 2: issue_refund -> "substitute order_id='18'" x21, call 2: issue_refund -> 'drop' x20, call 2: issue_refund -> 'repeat' x22, error at call 2: issue_refund -> 'retry_0' x3, error at call 2: issue_refund -> 'retry_2' x4
+1 distinct cause across 20 failing seeds
+
+cause 1 of 1: 20 of 20 failing seeds (43, 50, 58, 113, 130, ...)
+FAIL checks.py::refund_wrong_order_unguarded  seed=50  invariant=approved_before(payments.refund)
+  issue_refund(order_id='18', amount_cents=4200) ran with no earlier approval for scope 'order:18'
+  minimized to 3 steps (1 of 1 deviations kept, 3 replays):
+    incarnation 0
+      1. approval recorded for 'order:17'
+      2. model chose "substitute order_id='18'" at 'call 2: issue_refund' (nominal: issue_refund(order_id='17', amount_cents=4200))
+      3. issue_refund(order_id='18', amount_cents=4200)
+           effect landed (idempotency key 'ticket-17:refund:18')
+      finished
+  replay: runs/refund_wrong_order_unguarded/seed-50.min.json

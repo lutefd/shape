@@ -1,0 +1,58 @@
+scenario=refund_unkeyed  seeds=300 (from 0)  failing=52  wall=13.49s  22 seeds/s
+coverage over 300 seeds:
+  op                landed  attempts
+  payments.refund      362       427
+                   faults injected: client_error 10, connection_reset_after_commit 13, crash_after 18, crash_before 11, rate_limit 16, server_error 11, timeout 17, timeout_after_commit 13
+  model choices taken: after restart: call 1: lookup_order -> 'reissue' x5, call 1: lookup_order -> 'drop' x26, call 1: lookup_order -> 'repeat' x22, call 1: lookup_order -> 'swap' x20, call 2: issue_refund -> 'drop' x24, call 2: issue_refund -> 'repeat' x35, error at call 2: issue_refund -> 'retry_0' x5, error at call 2: issue_refund -> 'retry_2' x3
+4 distinct causes across 52 failing seeds
+
+cause 1 of 4: 33 of 52 failing seeds (4, 13, 20, 42, 43, ...)
+FAIL checks.py::refund_unkeyed  seed=4  invariant=at_most_once(payments.refund)
+  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
+  minimized to 3 steps (1 of 1 deviations kept, 3 replays):
+    incarnation 0
+      1. model chose 'repeat' at 'call 2: issue_refund' (nominal: issue_refund(order_id='17', amount_cents=4200))
+      2. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      3. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      finished
+  replay: runs/refund_unkeyed/seed-4.min.json
+
+cause 2 of 4: 7 of 52 failing seeds (7, 15, 67, 69, 78, ...)
+FAIL checks.py::refund_unkeyed  seed=7  invariant=at_most_once(payments.refund)
+  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
+  minimized to 2 steps (1 of 1 deviations kept, 3 replays):
+    incarnation 0
+      1. issue_refund(order_id='17', amount_cents=4200)
+           effect landed, then connection reset after commit: the caller saw ConnectionResetError
+      2. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      finished
+  replay: runs/refund_unkeyed/seed-7.min.json
+
+cause 3 of 4: 7 of 52 failing seeds (23, 63, 109, 112, 158, ...)
+FAIL checks.py::refund_unkeyed  seed=63  invariant=at_most_once(payments.refund)
+  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
+  minimized to 2 steps (1 of 1 deviations kept, 3 replays):
+    incarnation 0
+      1. issue_refund(order_id='17', amount_cents=4200)
+           effect landed, then timeout after commit: the caller saw TimeoutError
+      2. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      finished
+  replay: runs/refund_unkeyed/seed-63.min.json
+
+cause 4 of 4: 5 of 52 failing seeds (41, 65, 186, 271, 287)
+FAIL checks.py::refund_unkeyed  seed=41  invariant=at_most_once(payments.refund)
+  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
+  minimized to 2 steps (1 of 2 deviations kept, 5 replays):
+    incarnation 0
+      1. issue_refund(order_id='17', amount_cents=4200)
+           effect landed, then process killed after the effect landed, before the caller saw it
+      -> process died
+    incarnation 1 (restarted)
+      2. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      finished
+  replay: runs/refund_unkeyed/seed-41.min.json

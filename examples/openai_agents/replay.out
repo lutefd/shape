@@ -1,0 +1,10 @@
+FAIL refund_unkeyed  invariant=at_most_once(payments.refund) (replayed)
+  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
+  incarnation 0
+    1. issue_refund(order_id='17', amount_cents=4200)
+         effect landed, then process killed after the effect landed, before the caller saw it
+    -> process died
+  incarnation 1 (restarted)
+    2. issue_refund(order_id='17', amount_cents=4200)
+         effect landed
+    finished

@@ -1,0 +1,86 @@
+scenario=refund_approval_unkeyed  seeds=300 (from 0)  failing=54  wall=16.35s  18 seeds/s
+coverage over 300 seeds:
+  op                landed  attempts
+  payments.refund      365       431
+                   faults injected: client_error 10, connection_reset_after_commit 13, crash_after 17, crash_before 12, rate_limit 16, server_error 11, timeout 17, timeout_after_commit 13
+  model choices taken: after restart: call 1: lookup_order -> 'reissue' x5, after restart: call 2: issue_refund -> 'reissue' x4, call 1: lookup_order -> 'drop' x26, call 1: lookup_order -> 'repeat' x22, call 1: lookup_order -> 'swap' x20, call 2: issue_refund -> 'drop' x22, call 2: issue_refund -> 'repeat' x30, error at call 2: issue_refund -> 'retry_0' x5, error at call 2: issue_refund -> 'retry_2' x3
+5 distinct causes across 54 failing seeds
+
+cause 1 of 5: 28 of 54 failing seeds (4, 13, 20, 42, 43, ...)
+FAIL checks.py::refund_approval_unkeyed  seed=4  invariant=at_most_once(payments.refund)
+  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
+  minimized to 5 steps (1 of 1 deviations kept, 3 replays):
+    incarnation 0
+      1. model chose 'repeat' at 'call 2: issue_refund' (nominal: issue_refund(order_id='17', amount_cents=4200))
+      2. approval recorded for 'order:17'
+      3. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      4. approval recorded for 'order:17'
+      5. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      finished
+  replay: runs/refund_approval_unkeyed/seed-4.min.json
+
+cause 2 of 5: 8 of 54 failing seeds (23, 63, 109, 112, 158, ...)
+FAIL checks.py::refund_approval_unkeyed  seed=63  invariant=at_most_once(payments.refund)
+  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
+  minimized to 4 steps (1 of 1 deviations kept, 3 replays):
+    incarnation 0
+      1. approval recorded for 'order:17'
+      2. issue_refund(order_id='17', amount_cents=4200)
+           effect landed, then timeout after commit: the caller saw TimeoutError
+      3. approval recorded for 'order:17'
+      4. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      finished
+  replay: runs/refund_approval_unkeyed/seed-63.min.json
+
+cause 3 of 5: 8 of 54 failing seeds (41, 65, 133, 186, 200, ...)
+FAIL checks.py::refund_approval_unkeyed  seed=200  invariant=at_most_once(payments.refund)
+  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
+  minimized to 4 steps (1 of 1 deviations kept, 3 replays):
+    incarnation 0
+      1. approval recorded for 'order:17'
+      2. issue_refund(order_id='17', amount_cents=4200)
+           effect landed, then process killed after the effect landed, before the caller saw it
+      -> process died
+    incarnation 1 (restarted)
+      3. approval recorded for 'order:17'
+      4. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      finished
+  replay: runs/refund_approval_unkeyed/seed-200.min.json
+
+cause 4 of 5: 7 of 54 failing seeds (7, 15, 67, 69, 78, ...)
+FAIL checks.py::refund_approval_unkeyed  seed=7  invariant=at_most_once(payments.refund)
+  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
+  minimized to 4 steps (1 of 1 deviations kept, 3 replays):
+    incarnation 0
+      1. approval recorded for 'order:17'
+      2. issue_refund(order_id='17', amount_cents=4200)
+           effect landed, then connection reset after commit: the caller saw ConnectionResetError
+      3. approval recorded for 'order:17'
+      4. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      finished
+  replay: runs/refund_approval_unkeyed/seed-7.min.json
+
+cause 5 of 5: 3 of 54 failing seeds (82, 255, 294)
+FAIL checks.py::refund_approval_unkeyed  seed=82  invariant=at_most_once(payments.refund)
+  payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
+  minimized to 7 steps (2 of 2 deviations kept, 5 replays):
+    incarnation 0
+      1. approval recorded for 'order:17'
+      2. issue_refund(order_id='17', amount_cents=4200)
+           process killed before the call ran
+      -> process died
+    incarnation 1 (restarted)
+      3. approval recorded for 'order:17'
+      4. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      5. model chose 'reissue' at 'after restart: call 2: issue_refund' (nominal: do not repeat issue_refund(order_id='17', amount_cents=4200))
+      6. approval recorded for 'order:17'
+      7. issue_refund(order_id='17', amount_cents=4200)
+           effect landed
+      finished
+  replay: runs/refund_approval_unkeyed/seed-82.min.json
