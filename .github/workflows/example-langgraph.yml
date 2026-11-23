@@ -78,7 +78,7 @@ jobs:
       - name: refund_agent perturbation scenarios fail unguarded and pass guarded
         run: |
           set +e
-          shape test examples/langgraph/refund_agent.py::refund_repeat_unguarded --seeds 200 --jobs 4 | tee repeat.out
+          shape test examples/langgraph/refund_agent.py::refund_repeat_unguarded --seeds 200 --jobs 4 --all-triggers | tee repeat.out
           code=${PIPESTATUS[0]}
           set -e
           test "$code" -eq 1
