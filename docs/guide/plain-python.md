@@ -84,15 +84,17 @@ shape test examples/plain_python/checks.py::checkout_buggy --seeds 200
 Real output:
 
 ```text
-scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=1.10s  181 seeds/s
+scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=3.65s  55 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      202       252
                    faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
   model choices taken: none
+  interleaving choices taken: none
 2 distinct causes across 2 failing seeds
 
 cause 1 of 2: 1 of 2 failing seeds (52)
+  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, timeout_after_commit)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 3 steps (2 of 3 deviations kept, 6 replays):
@@ -107,6 +109,7 @@ FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most
   replay: runs/checkout_buggy/seed-52.min.json
 
 cause 2 of 2: 1 of 2 failing seeds (195)
+  needs: before-commit fault (the call failed cleanly: server_error) + after-commit fault (the caller did not see the commit: connection_reset_after_commit)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=195  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 3 steps (2 of 2 deviations kept, 5 replays):
@@ -145,12 +148,13 @@ shape test examples/plain_python/checks.py::checkout_fixed --seeds 200
 Real output:
 
 ```text
-scenario=checkout_fixed  seeds=200 (from 0)  failing=0  wall=0.99s  202 seeds/s
+scenario=checkout_fixed  seeds=200 (from 0)  failing=0  wall=3.90s  51 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      200       252
                    faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
   model choices taken: none
+  interleaving choices taken: none
 PASS
 ```
 
@@ -174,18 +178,20 @@ Running both scenarios in `docs/guide/examples/async_agent.py`:
 shape test docs/guide/examples/async_agent.py --seeds 200
 ```
 
-Real output (first cause of `async_per_attempt_key`, followed by `async_stable_key`):
+Real output (`async_per_attempt_key`, where all three after-commit faults group into one cause, followed by `async_stable_key`):
 
 ```text
-scenario=async_per_attempt_key  seeds=200 (from 0)  failing=12  wall=2.80s  71 seeds/s
+scenario=async_per_attempt_key  seeds=200 (from 0)  failing=12  wall=4.00s  50 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      215       252
                    faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
   model choices taken: none
-3 distinct causes across 12 failing seeds
+  interleaving choices taken: none
+1 distinct cause across 12 failing seeds
 
-cause 1 of 3: 10 of 12 failing seeds (7, 32, 33, 35, 52, ...)
+cause 1 of 1: 12 of 12 failing seeds (7, 13, 32, 33, 35, ...)
+  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, crash_after, timeout_after_commit)
 FAIL docs/guide/examples/async_agent.py::async_per_attempt_key  seed=7  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 2 steps (1 of 1 deviations kept, 3 replays):
@@ -199,21 +205,22 @@ FAIL docs/guide/examples/async_agent.py::async_per_attempt_key  seed=7  invarian
 ```
 
 ```text
-scenario=async_stable_key  seeds=200 (from 0)  failing=0  wall=2.08s  96 seeds/s
+scenario=async_stable_key  seeds=200 (from 0)  failing=0  wall=2.95s  68 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      200       252
                    faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
   model choices taken: none
+  interleaving choices taken: none
 PASS
 ```
 
 ## 5. Adding model decisions, custom errors, webhooks, and world actors
 
 - **Real exception types**: If your retry loop catches `httpx.ReadTimeout` or `stripe.APIConnectionError` rather than `TimeoutError`, pass `errors={"timeout": lambda: httpx.ReadTimeout("timeout"), ...}` to `@shape.effect`.
-- **Tools that return error dicts**: `@shape.effect` logs an effect whenever the function returns without raising. Put `@shape.effect` on the inner client function that raises, or inspect `result=` in a custom `@shape.invariant`. A `landed=` predicate on `@shape.effect` is planned.
+- **Tools that return error dicts or refusals**: Pass `landed=lambda res: bool(res.get("ok"))` on `@shape.effect` so calls that return failure payloads log as `returned without effect` instead of landed effects. For tools that dedupe via local state and return an existing resource ID on repeat calls, pass `key_from_result=lambda res: res.get("id")`. Whenever possible, still prefer putting `@shape.effect` on the inner API client method that touches the outside world.
 - **Model perturbations**: Wherever your agent reads a decision from a model, replace the LLM with a scripted function that calls `shape.choose(label, [nominal, bad_choice_1, ...])`. See [Concepts](concepts.md#model-choices-shapechoose).
-- **Duplicate webhook or queue delivery**: Pass `duplicate_trigger=True` on `@shape.scenario` to run two concurrent copies of incarnation 0 against the same `run.dir`.
+- **Duplicate delivery and concurrent races**: Pass `duplicate_trigger=True` or `concurrent=[other_actor]` on `@shape.scenario` (marking shared-state boundaries with `shape.point(label)`), or use `shape.run_async(coro)` for deterministic `asyncio` task interleavings. See [Concurrency in docs/boundary.md](../boundary.md#concurrency) and [`examples/races/`](../../examples/races/).
 - **External state edits while crashed**: Decorate a function with `@shape.actor` and pass `actors=[my_actor]` on `@shape.scenario`. `shape` runs it in the parent process between incarnations so you can mutate files or database rows while the agent is down.
 
 Next steps: read [Reading a trace](reading-a-trace.md) to dissect failures and replay files, or [CI and pytest](ci.md) to wire scenarios into your test suite.

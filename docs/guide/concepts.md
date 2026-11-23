@@ -114,7 +114,7 @@ A `timeout` factory also serves `timeout_after_commit` unless you override `time
 
 Two additional fault mechanisms operate at the scenario level:
 
-- **Duplicate delivery (`duplicate_trigger=True`)**: On roughly 1 in 4 seeds when enabled on `@shape.scenario`, incarnation `0` starts as two forked copies at the same moment on the same `run.dir`. This models an at-least-once webhook or job queue delivering the same trigger twice. Copy A draws under `#0.<n>` and copy B draws under `#0t1.<n>`. The real OS interleaving between the two processes is not controlled, so race-dependent failures can surface as `FLAKY`. Deterministic concurrency control (`shape.point` and `run_async`) is planned.
+- **Duplicate delivery (`duplicate_trigger=True`) and concurrent actors (`concurrent=[...]`)**: On roughly 1 in 4 seeds when `duplicate_trigger=True` is enabled on `@shape.scenario`, incarnation `0` starts as two forked copies at the same moment on the same `run.dir`, modeling an at-least-once webhook or job queue delivering the same trigger twice. Both duplicate copies and explicit `concurrent=[...]` actors run under `shape`'s process scheduler, yielding at `@shape.effect` calls and `shape.point(label)` markers (`sched:actors#<inc>.<n>`) so interleavings replay and shrink deterministically. For in-process `asyncio` task races, use `shape.run_async(coro)` (`sched:tasks`). See [Concurrency in docs/boundary.md](../boundary.md#concurrency) and [`examples/races/`](../../examples/races/).
 - **World actors (`@shape.actor`)**: Functions passed in `@shape.scenario(actors=[...])` run in the parent process between incarnations (after one incarnation dies and before the next starts), with faults off. Use `shape.choose` inside an actor to model external state changes while the agent is down, such as a user editing an order amount or revoking an approval.
 
 ## Model choices (`shape.choose`)
@@ -194,6 +194,7 @@ Many seeds in a sweep often trigger the same bug. `shape` groups failing seeds b
 - **after-commit fault** (`the caller did not see the commit`): `timeout_after_commit`, `connection_reset_after_commit`, and `crash_after` group into one cause, with the exact fault kinds seen across those seeds listed inside it.
 - **before-commit fault** (`the call failed cleanly`): `timeout`, `rate_limit`, `server_error`, and `client_error` group into one cause, with exact kinds listed.
 - **crash** (`died before the call`): `crash_before`.
+- **interleaving**: scheduling choices (`sched:actors`, `sched:tasks`) from concurrent processes or `shape.run_async`.
 - **model choice** and **duplicate delivery**: grouped by choice / trigger.
 
 Each cause is labeled by what it took to trigger (`needs: after-commit fault (...)`, `needs: model choice`, etc.). Causes that fail on the nominal path with 0 faults and 0 model choices are printed **last** under `nominal path (0 faults, 0 model choices): a plain unit test catches this`, so findings that only fault injection or model perturbation can produce stand out first.

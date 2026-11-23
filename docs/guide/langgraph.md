@@ -36,16 +36,16 @@ tools = shape.langgraph.effects(
 )
 ```
 
-Each entry in `ops` accepts an op string (`"payments.refund"`), a dict supporting every `@shape.effect` option (`op`, `scope`, `key`, `irreversible`, `errors`, `idempotent`, `result`, `hide`), or a `shape.langgraph.Effect(...)` instance. Unknown tool names raise `ValueError`.
+Each entry in `ops` accepts an op string (`"payments.refund"`), a dict supporting every `@shape.effect` option (`op`, `scope`, `key`, `key_from_result`, `landed`, `irreversible`, `errors`, `idempotent`, `result`, `hide`), or a `shape.langgraph.Effect(...)` instance. Unknown tool names raise `ValueError`.
 
-### What `shape.langgraph.effects` passes to `scope` and `key`
+### What `shape.langgraph.effects` passes to hooks
 
-- For `@tool` / `StructuredTool`: `effects()` wraps `tool.func` and `tool.coroutine` with `@shape.effect`. Your `scope` and `key` lambdas receive the named parameters declared by that tool function (LLM arguments, plus `config`, `runtime`, or `InjectedState` parameters if your tool signature accepts them).
-- For custom `BaseTool` subclasses: `effects()` wraps `tool._run` and `tool._arun`, so `scope` and `key` receive the arguments of `_run` / `_arun`.
+- `scope`, `key`, `result`, `landed`, and `key_from_result` receive the tool's named arguments **plus** LangGraph framework context: `config` (`RunnableConfig`, even when your `@tool` does not declare a `config` parameter) and any `InjectedState`, `InjectedStore`, or `ToolRuntime` parameters declared by your tool.
+- All injected parameters (`config`, `runtime`, `InjectedState`, `InjectedStore`) are hidden from rendered calls, world log `args`, and `approved_before` argument hashes automatically.
+- For custom `BaseTool` subclasses: `effects()` wraps `tool._run` and `tool._arun`, forwarding `config` and `run_manager` and passing `config` to all hooks.
+- If any hook raises, `shape` raises `shape.HarnessError` (`BaseException`) so `ToolNode(handle_tool_errors=True)` never swallows it into a tool error message — the run fails immediately pointing at your lambda.
 
-Passing framework context into `scope` and `key` even when the tool function does not declare it is planned.
-
-If a tool checks local state and returns early without calling the external provider, or runs its own internal retry loop, put `@shape.effect` directly on the underlying API client method instead of wrapping the outer tool (see [`examples/langgraph/durability.py`](../../examples/langgraph/durability.py)).
+If a tool checks local state and returns early without calling the external provider, or runs its own internal retry loop, put `@shape.effect` directly on the underlying API client method instead of wrapping the outer tool (see [`examples/langgraph/durability.py`](../../examples/langgraph/durability.py)), or pass `landed=` / `key_from_result=` when you only control the tool layer.
 
 ## 2. Perturb the model with `ScriptedChatModel`
 
@@ -72,7 +72,7 @@ On nominal runs (all choices `0`), `ScriptedChatModel` emits each planned tool c
 - `error at call N`: after a tool error, chooses between `retry_1` (nominal), `retry_0` (give up), and `retry_2` (retry twice).
 - `after restart`: on a restarted incarnation where step `N` already succeeded in message history, may `reissue` it.
 
-**Tool error detection:** `ScriptedChatModel` treats a `ToolMessage` as an error when `status == "error"` or its content starts with `"Error:"` or `"Error invoking tool"` (and treats `"not approved"` as a rejection). `ToolNode(tools, handle_tool_errors=True)` produces error `ToolMessage`s automatically when a tool raises. If your tool catches exceptions and returns a plain dict such as `{"ok": False}`, `ScriptedChatModel` treats it as success and `shape` records it as a landed effect (a `landed=` predicate on `@shape.effect` is planned).
+**Tool error detection:** `ScriptedChatModel` treats a `ToolMessage` as an error when `status == "error"` or its content starts with `"Error:"` or `"Error invoking tool"` (and treats `"not approved"` as a rejection). `shape.langgraph.effects` also auto-detects returned `ToolMessage(status="error")` results (and `Command` updates carrying one) as not landed without needing `landed=`. If your tool returns a plain refusal string or error dict such as `{"ok": False}`, pass `landed=lambda res: ...` in `ops` so `shape` logs it as `returned without effect`.
 
 ## 3. Drive and resume the graph with `drive` and `adrive`
 
@@ -109,17 +109,22 @@ shape.langgraph.drive(
 )
 ```
 
-**Static `interrupt_before` / `interrupt_after`:** LangGraph static breakpoints compiled with `builder.compile(checkpointer=cp, interrupt_before=["send"])` do not populate `result["__interrupt__"]`. Instead, `invoke()` returns early while `graph.get_state(config).next` is non-empty, and resuming uses `graph.invoke(None, config)` rather than `Command(resume=...)`. If your graph uses static breakpoints, write a short resume loop instead of calling `drive()`:
+**Static `interrupt_before` / `interrupt_after`:** `shape.langgraph.drive` and `adrive` handle static breakpoints compiled with `builder.compile(checkpointer=cp, interrupt_before=["sensitive_tools"])` (the LangGraph customer-support tutorial pattern) automatically. After each invoke on a checkpointed graph, `drive` inspects `graph.get_state(config).next`:
 
 ```python
-result = graph.invoke(INIT_STATE if run.restarts == 0 else None, CONFIG, durability="sync")
-while graph.get_state(CONFIG).next:
-    state = graph.get_state(CONFIG).values
-    shape.approval(f"order:{state['order_id']}", {"order_id": state["order_id"], "amount": state["amount"]})
-    result = graph.invoke(None, CONFIG, durability="sync")
+def human(snapshot) -> bool:
+    if "sensitive_tools" in snapshot.next:
+        tc = snapshot.values["messages"][-1].tool_calls[0]
+        shape.approval(f"order:{tc['args']['order_id']}", tc["args"])
+    return shape.choose("human_review", [True, False])
+
+shape.langgraph.drive(graph, INIT_STATE, CONFIG, run, human=human, durability="sync")
 ```
 
-Support for static `interrupt_before` / `interrupt_after` breakpoints in `shape.langgraph.drive` is planned.
+- Returning `True` or `None` approves and resumes with `graph.invoke(None, config)`.
+- Returning `False` denies pending tool calls (injecting a denial `ToolMessage` when the last message has `tool_calls`, or stopping cleanly otherwise).
+- Returning a `dict` or `Command` passes it directly to `graph.invoke(reply, config)`.
+- Omitting `human=` fails loudly (`graph paused before node 'sensitive_tools'; pass human=... to approve`) instead of silently returning as finished.
 
 ## 4. Real findings in `examples/langgraph/` and their fixes
 
@@ -131,10 +136,13 @@ Run:
 examples/langgraph/.venv/bin/shape test examples/langgraph/refund_agent.py --seeds 200 --jobs 4
 ```
 
-Without an idempotency key, `refund_repeat_unguarded` fails 37 of 200 seeds. Cause 1 needs zero injected faults (the model repeats `issue_refund`):
+Without an idempotency key, `refund_repeat_unguarded` fails 37 of 200 seeds across 3 distinct causes. Cause 1 needs zero injected faults (the model repeats `issue_refund`), and cause 2 groups all three after-commit faults (`connection_reset_after_commit`, `crash_after`, `timeout_after_commit`) into one cause:
 
 ```text
-cause 1 of 5: 19 of 37 failing seeds (4, 13, 20, 42, 49, ...)
+3 distinct causes across 37 failing seeds
+
+cause 1 of 3: 19 of 37 failing seeds (4, 13, 20, 42, 49, ...)
+  needs: model choice
 FAIL examples/langgraph/refund_agent.py::refund_repeat_unguarded  seed=4  invariant=at_most_once(payments.refund)
   payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
   minimized to 3 steps (1 of 1 deviations kept, 3 replays):
@@ -153,6 +161,7 @@ With `alternatives={"order_id": ["18"]}`, `refund_wrong_order_unguarded` fails 1
 
 ```text
 cause 1 of 1: 11 of 11 failing seeds (43, 50, 58, 113, 130, ...)
+  needs: model choice
 FAIL examples/langgraph/refund_agent.py::refund_wrong_order_unguarded  seed=50  invariant=approved_before(payments.refund)
   issue_refund(order_id='18', amount_cents=4200) ran with no earlier approval for scope 'order:18'
   minimized to 3 steps (1 of 1 deviations kept, 3 replays):
@@ -174,10 +183,11 @@ Run:
 examples/langgraph/.venv/bin/shape test examples/langgraph/retry_policy.py --seeds 200 --jobs 4
 ```
 
-LangGraph's default `RetryPolicy()` (`default_retry_on`) retries `ConnectionResetError`, `httpx.ReadTimeout`, and `requests.HTTPError` with status `402`. Without an idempotency key, an after-commit `httpx.ReadTimeout` double-charges inside a single incarnation (`retry_httpx_timeout`, cause 2):
+LangGraph's default `RetryPolicy()` (`default_retry_on`) retries `ConnectionResetError`, `httpx.ReadTimeout`, and `requests.HTTPError` with status `402`. Without an idempotency key, an after-commit `httpx.ReadTimeout` double-charges inside a single incarnation (`retry_httpx_timeout`, cause 2 of 4):
 
 ```text
-cause 2 of 7: 7 of 27 failing seeds (7, 32, 79, 86, 87, ...)
+cause 2 of 4: 8 of 27 failing seeds (7, 32, 79, 86, 87, ...)
+  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, timeout_after_commit)
 FAIL examples/langgraph/retry_policy.py::retry_httpx_timeout  seed=7  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:ord-17' (at most 1 allowed)
   minimized to 2 steps (1 of 1 deviations kept, 3 replays):
@@ -232,18 +242,21 @@ Run:
 examples/langgraph/.venv/bin/shape test examples/langgraph/approval.py --seeds 200 --jobs 4
 ```
 
-`approved_before(transfers.send)` holds across every scenario (`approval_gate_only`, `approval_default`, `approval_sync_fixed`, and `approval_rejected` with `expect_effects=False`). However, `approval_default` fails `at_most_once(transfers.send)` on 21 of 200 seeds when an after-commit fault hits `send` without an idempotency key:
+`approved_before(transfers.send)` holds across every scenario (`approval_gate_only`, `approval_default`, `approval_sync_fixed`, and `approval_rejected` with `expect_effects=False`). However, `approval_default` fails `at_most_once(transfers.send)` on 21 of 200 seeds (all grouped into 1 cause covering `connection_reset_after_commit`, `crash_after`, and `timeout_after_commit`):
 
 ```text
-cause 1 of 3: 8 of 21 failing seeds (38, 40, 45, 49, 103, ...)
-FAIL examples/langgraph/approval.py::approval_default  seed=38  invariant=at_most_once(transfers.send)
+1 distinct cause across 21 failing seeds
+
+cause 1 of 1: 21 of 21 failing seeds (37, 38, 40, 45, 49, ...)
+  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, crash_after, timeout_after_commit)
+FAIL examples/langgraph/approval.py::approval_default  seed=37  invariant=at_most_once(transfers.send)
   transfers.send happened 2 times for scope 'order:ord-7' (at most 1 allowed)
   minimized to 3 steps (1 of 1 deviations kept, 3 replays):
     incarnation 0
       1. approval recorded for 'order:ord-7'
       2. send(order_id='ord-7', to='acct-42', amount=50000, idempotency_key=None)
-           effect landed, then timeout after commit: the caller saw TimeoutError
-      process raised: TimeoutError: shape: injected timeout_after_commit
+           effect landed, then connection reset after commit: the caller saw ConnectionResetError
+      process raised: ConnectionResetError: shape: injected connection_reset_after_commit
     incarnation 1 (restarted)
       3. send(order_id='ord-7', to='acct-42', amount=50000, idempotency_key=None)
            effect landed

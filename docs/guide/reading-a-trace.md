@@ -7,15 +7,17 @@ When a scenario fails, `shape` shrinks the failure to a small set of deviations,
 Here is the real output from running `examples/plain_python/checks.py::checkout_buggy`:
 
 ```text
-scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=1.10s  181 seeds/s
+scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=3.65s  55 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      202       252
                    faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
   model choices taken: none
+  interleaving choices taken: none
 2 distinct causes across 2 failing seeds
 
 cause 1 of 2: 1 of 2 failing seeds (52)
+  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, timeout_after_commit)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 3 steps (2 of 3 deviations kept, 6 replays):
@@ -32,10 +34,10 @@ FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most
 
 Reading it top to bottom:
 
-1. **Summary line** (`scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=1.10s  181 seeds/s`): How many seeds ran, starting seed, how many failed reproducibly, wall-clock time, and throughput. If any seed failed inconsistently on re-run, `flaky=N` appears here too.
-2. **Coverage block** (`coverage over 200 seeds:`): Per-op counts of `landed` (real deduplicated effects) and `attempts` (all calls including failed and killed ones), every fault kind actually injected, and every non-nominal `shape.choose` decision taken. Check this first to confirm your sweep exercised the faults and model choices you expect.
-3. **Cause count** (`2 distinct causes across 2 failing seeds`): Failing seeds grouped by `(invariant, ordered deviation kinds)`.
-4. **Cause heading** (`cause 1 of 2: 1 of 2 failing seeds (52)`): How many failing seeds matched this cause and up to five example seed numbers, sorted ascending.
+1. **Summary line** (`scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=3.65s  55 seeds/s`): How many seeds ran, starting seed, how many failed reproducibly, wall-clock time, and throughput. If any seed failed inconsistently on re-run, `flaky=N` appears here too.
+2. **Coverage block** (`coverage over 200 seeds:`): Per-op counts of `landed` (real deduplicated effects) and `attempts` (all calls including failed and killed ones), every fault kind actually injected, every non-nominal `shape.choose` decision taken, and any scheduling interleaving choices taken. Check this first to confirm your sweep exercised the faults and model choices you expect.
+3. **Cause count** (`2 distinct causes across 2 failing seeds`): Failing seeds grouped by `(invariant, violating op, coarse deviation classes)`.
+4. **Cause heading and trigger label** (`cause 1 of 2: 1 of 2 failing seeds (52)` + `needs: after-commit fault (...)`): How many failing seeds matched this cause, up to five sorted seed numbers, what class of deviation it took to trigger (with exact fault kinds listed), or `nominal path (0 faults, 0 model choices): a plain unit test catches this` printed last when zero faults and zero model choices triggered the failure.
 5. **Failure header** (`FAIL ... seed=52  invariant=at_most_once(payments.charge)`): The representative seed (fewest deviations in this cause) and the violated invariant.
 6. **Violation message** (`payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)`): Plain-language explanation from the invariant.
 7. **Shrink summary** (`minimized to 3 steps (2 of 3 deviations kept, 6 replays):`):

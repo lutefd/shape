@@ -153,6 +153,7 @@ Failing seeds are grouped by root cause. The signature is the violated invariant
 - **after-commit fault** (`the caller did not see the commit`): `timeout_after_commit`, `connection_reset_after_commit`, and `crash_after` group together, with the exact fault kinds observed listed inside the cause.
 - **before-commit fault** (`the call failed cleanly`): `timeout`, `rate_limit`, `server_error`, and `client_error` group together, with exact kinds listed.
 - **crash** (`died before the call`): `crash_before`.
+- **interleaving**: scheduling choices (`sched:actors`, `sched:tasks`) from concurrent processes or `shape.run_async`.
 - **model choice** and **duplicate delivery**: grouped by choice / trigger.
 
 Each cause is labeled by what it took to trigger (`needs: after-commit fault (...)`, `needs: model choice`, etc.). Causes that fail on the nominal path with 0 faults and 0 model choices are printed **last**, labeled `nominal path (0 faults, 0 model choices): a plain unit test catches this`, so findings that only fault injection or model perturbation can produce stand out first. Seeds go fewest deviations first; a seed that still contains every coarse deviation of a cause already found joins it without being shrunk again and adds its exact fault kinds to that cause; any other seed is minimized. At most 200 seeds are minimized per sweep, and the report says how many were not.

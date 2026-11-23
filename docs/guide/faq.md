@@ -11,10 +11,9 @@ Do not add `shape` when any of the following is true:
 
 ## Honest limits of boundary mode
 
-- **No virtual clock, scheduler, or thread control.** Your code, threads, and timers run for real inside the child process. If a bug depends on thread timing or wall-clock races, a seed may show up as `FLAKY` or `NOT MINIMIZED`.
+- **Point-granularity concurrency, not arbitrary OS thread scheduling.** Concurrent actors (`@shape.scenario(concurrent=[...])` and `duplicate_trigger=True`) are deterministically scheduled across processes at `@shape.effect` boundaries and `shape.point(label)` markers, and `shape.run_async(coro)` deterministically schedules `asyncio` callbacks with a virtual timer clock (see [Concurrency in docs/boundary.md](../boundary.md#concurrency) and [`examples/races/`](../../examples/races/)). User-created OS threads and wall-clock timers still run on the host; if a failure depends on host thread timing, a seed shows up as `FLAKY` or `NOT MINIMIZED`.
 - **Crashes only happen at `@shape.effect` boundaries.** `shape` injects `crash_before` and `crash_after` around marked effect calls. It does not kill the process at arbitrary Python bytecode instructions between effects.
 - **Your test double must honor idempotency keys truthfully.** `shape` counts two calls with the same `(op, scope, key)` as one effect because real providers deduplicate by key. If your real provider rejects that key format, expires keys early, or ignores keys on that endpoint, `shape` will not catch the mismatch. Verify your double's semantics against the real provider sandbox.
-- **Duplicate delivery interleaving is OS-scheduled.** `@shape.scenario(duplicate_trigger=True)` forks two real processes on the same `run.dir` at the same time, without controlling their interleaving. Deterministic concurrency control (`shape.point` and `run_async`) is planned.
 - **Fork vs. spawn performance.** On Unix, `shape` imports the scenario once and forks per incarnation. On Windows, or when `SHAPE_START_METHOD=spawn` is set, each incarnation spawns a fresh Python interpreter and re-imports the scenario file, which is slower and requires the scenario file to be safely importable at top level.
 
 ## How much disk space does `runs/` use?

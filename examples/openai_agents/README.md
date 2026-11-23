@@ -1,8 +1,8 @@
 # shape on an OpenAI Agents SDK agent
 
-A support agent written the way the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) docs write one (`@function_tool`, `Agent`, `Runner.run`, a `SQLiteSession`), tested with shape's [boundary mode](../../docs/boundary.md) with no change to the agent. The only shape code in the agent's path is one `@shape.effect` decorator on the payments client's `refund` call (`payments.py`).
+A support agent written the way the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) docs write one (`@function_tool`, `Agent`, `Runner.run`, a `SQLiteSession`), tested with shape's [boundary mode](../../docs/boundary.md) and [`shape.agents`](../../docs/adapters.md) with zero shape imports in `agent.py` or `payments.py`. `checks.py` wraps `issue_refund` from outside with `shape.agents.effects(...)`.
 
-No network and no API key: `scripted_model.py` implements the SDK's own `Model` interface and emits the tool calls a model would.
+No network and no API key: `checks.py` plugs in `shape.agents.ScriptedModel` (implementing the SDK's `Model` interface with shrinkable `shape.choose` perturbations) and runs the agent with `shape.agents.drive(...)`.
 
 ## Run it
 
@@ -26,12 +26,12 @@ CI: `.github/workflows/example-openai-agents.yml` runs `run.sh`, the sweeps and 
 
 ## The agent
 
-- Tools: `lookup_order` (read-only, sync, so the SDK runs it in a thread) and `issue_refund` (async), which calls `PaymentsClient.refund`. That method is the effect: `@shape.effect("payments.refund", scope=order, key=idempotency_key)`. The provider fake is a sqlite file that, like a real provider, returns the original refund for a repeated key.
-- Persistence: `SQLiteSession("ticket-17", run.dir/"session.db")` as in the [Sessions docs](https://openai.github.io/openai-agents-python/sessions/). A restarted process (`run.restarts > 0`) runs the same handler again with the same session: the customer's message is redelivered because the worker never acked it. The SDK documents no resume for a run that was killed mid-turn, other than the `RunState` flow below and the Temporal / Dapr / Restate integrations, so this is the app-level pattern.
-- Approval variant: `function_tool(..., needs_approval=True)`, the [Human-in-the-loop](https://openai.github.io/openai-agents-python/human_in_the_loop/) flow: `result.interruptions`, `result.to_state()` saved to `paused-run.json`, `state.approve(...)`, `Runner.run(agent, state, session=session)`. A scripted approver always says yes after calling `shape.approval(...)`. A restarted process reloads the saved paused state.
-- The scripted model behaves like a reasonable model: lookup, then refund the amount the lookup gave; if the tool result is an error, retry once, then apologise; if the history already holds a successful refund, say so instead of refunding. It counts errors since the customer's latest message, so a redelivered message gets a fresh attempt. The worker (`checks.py`) fails the job, so the queue redelivers it, when the agent apologised instead of refunding.
-- Variants: `refund_unkeyed` calls the client without an idempotency key. `refund_keyed` sends `ticket-17:refund:<order>` (derived from the ticket and order, not from anything the model or the run generates). `refund_approval_unkeyed` and `refund_approval_keyed` are the same with approval.
-- Invariants: `at_most_once` and `exactly_once` on `payments.refund`, plus `approved_before` on the approval variants.
+- Tools: `lookup_order` (read-only, sync, so the SDK runs it in a thread) and `issue_refund` (async), which calls `PaymentsClient.refund`. `checks.py` wraps `issue_refund` via `shape.agents.effects(..., ops={"issue_refund": {"op": "payments.refund", ...}})` without editing `agent.py` or `payments.py`. The provider fake is a sqlite file that, like a real provider, returns the original refund for a repeated key.
+- Persistence: `SQLiteSession("ticket-17", run.dir/"session.db")` as in the [Sessions docs](https://openai.github.io/openai-agents-python/sessions/), wired via `shape.agents.drive(...)`. A restarted process (`run.restarts > 0`) runs the same handler again with the same session: the customer's message is redelivered because the worker never acked it. The SDK documents no resume for a run that was killed mid-turn, other than the `RunState` flow below and the Temporal / Dapr / Restate integrations, so this is the app-level pattern.
+- Approval variant: `function_tool(..., needs_approval=True)`, the [Human-in-the-loop](https://openai.github.io/openai-agents-python/human_in_the_loop/) flow: `result.interruptions`, `result.to_state()` saved to `paused-run.json`, `state.approve(...)`, `Runner.run(agent, state, session=session)`, handled by `shape.agents.drive(..., human=_approve)`. A restarted process reloads the saved paused state.
+- The scripted model (`shape.agents.ScriptedModel`) runs the nominal plan (lookup, then refund) and perturbs it via `shape.choose` (repeat, drop, swap, wrong order substitution, retry count after tool errors, and post-restart re-issue). The worker (`checks.py`) raises `TicketUnresolved`, so the queue redelivers it, when the agent finished without refunding order 17.
+- Variants: `refund_unkeyed` calls the client without an idempotency key; `refund_keyed` sends `ticket-17:refund:<order>` (derived from the ticket and order, not from anything the model or the run generates); `refund_approval_unkeyed` and `refund_approval_keyed` add `needs_approval=True`; `refund_wrong_order_unguarded` and `refund_wrong_order_guarded` add `alternatives={"order_id": ["18"]}` to test allowlist enforcement.
+- Invariants: `at_most_once` and `exactly_once` on `payments.refund`, plus `approved_before` on the approval and wrong-order variants.
 
 ## Results
 
@@ -44,14 +44,16 @@ Single fault on the first refund call (everything else nominal). Cell: first vio
 | `refund_approval_unkeyed` | ok 1/1 | **at_most_once 2/2** |
 | `refund_approval_keyed` | ok 1/1 | ok 1/2 |
 
-`run.sh` prints the full 7-column table. Seed sweeps (random fault kinds, up to 3 restarts), 300 seeds each:
+`run.sh` prints the full 8-column table. Seed sweeps (random fault kinds + model perturbations, up to 3 restarts), 300 seeds each:
 
-| variant | failing | 95% Wilson | first invariant |
-| --- | --- | --- | --- |
-| `refund_unkeyed` | 30 / 300 | 7.1% - 13.9% | `at_most_once(payments.refund)` |
-| `refund_keyed` | 0 / 300 | 0 - 1.3% | |
-| `refund_approval_unkeyed` | 30 / 300 | 7.1% - 13.9% | `at_most_once(payments.refund)` |
-| `refund_approval_keyed` | 0 / 300 | 0 - 1.3% | |
+| variant | failing | first invariant |
+| --- | --- | --- |
+| `refund_unkeyed` | 52 / 300 | `at_most_once(payments.refund)` |
+| `refund_keyed` | 0 / 300 | |
+| `refund_approval_unkeyed` | 54 / 300 | `at_most_once(payments.refund)` |
+| `refund_approval_keyed` | 0 / 300 | |
+| `refund_wrong_order_unguarded` | 20 / 300 | `approved_before(payments.refund)` |
+| `refund_wrong_order_guarded` | 0 / 300 | |
 
 `exactly_once` (the refund did happen) and `approved_before` hold in every run of every variant. Each shrunk trace replays 10 of 10 times (`traces/`, checked in CI). A zero means 300 seeds without a failure, not a proof.
 
@@ -65,7 +67,7 @@ Both findings are in the unkeyed variants only, and both are the hazard the SDK'
 - OA-C02, [Tools](https://openai.github.io/openai-agents-python/tools/): "This is a function that provides an error response to the LLM in case the tool call crashes." and "By default (i.e. if you don't pass anything), it runs a default_tool_error_function which tells the LLM an error occurred."
 - OA-C03, [Human-in-the-loop](https://openai.github.io/openai-agents-python/human_in_the_loop/): "Approval permits a tool call to execute; it does not guarantee exactly-once execution. If a tool performs an external action and the process stops before the application stores the updated run state, resuming from the older approved snapshot can execute the tool again. For example, a payment can complete even though the saved snapshot has no record of the payment result."
 - OA-C04, same page: "the application should assign a stable idempotency key to each logical action and pass that key to a destination that atomically prevents duplicate effects."
-- OA-C05, [Models](https://openai.github.io/openai-agents-python/models/): "Directly providing a Model implementation." (how the scripted model is plugged in; `Agent(model=ScriptedSupportModel())`).
+- OA-C05, [Models](https://openai.github.io/openai-agents-python/models/): "Directly providing a Model implementation." (how `shape.agents.ScriptedModel` is plugged into `Agent(model=...)`).
 
 **F1: a tool that raised after its effect landed is retried by the model (OA-C02).** Faults `timeout_after_commit`, `connection_reset_after_commit` (the call raises after the refund landed). The SDK turns the exception into the string `An error occurred while running the tool.`, which says nothing about whether the effect happened. The scripted model retries once. Observed in `inc-0.out`: model #2 issues `issue_refund`, model #3 sees the error and issues it again, 2 refunds.
 
