@@ -85,7 +85,7 @@ This projection of the checkout report shows how the replay paths relate to the 
 }
 ```
 
-When a budget or shrink limit prevents minimization, the corresponding seed IDs appear in `shrink_budget_skipped_seeds` or `shrink_limit_skipped_seeds`. A defect with no verified replay has a null `replay_path`. Upload the runs directory along with the JSON to make the replay paths available after the job.
+When a budget or shrink limit prevents minimization, the corresponding seed IDs appear in `shrink_budget_skipped_seeds` or `shrink_limit_skipped_seeds`. A defect with no verified replay has a null `replay_path`. Each defect and trigger object also includes `trigger_label` (all kept deviations in order), and `flaky_details` lists each flaky seed's saved `runs/<scenario>/flaky/seed-<n>` directory and first divergence. Upload the runs directory along with the JSON to make the replay paths available after the job.
 
 ## Exit codes
 
@@ -159,4 +159,4 @@ def test_refund_crash_regression(tmp_path):
 
 ## Disk usage of `runs/`
 
-Passing seed directories are deleted immediately after each seed passes (along with any stale `seed-<n>` directory from an earlier failing run, and empty scenario directories). Failing seeds, `.min` directories, flaky seeds, and `replay/` stay under `--runs-dir` (default `runs/`). Add `runs/` to `.gitignore`, clean with `rm -rf runs/`, and use `--runs-dir /tmp/shape-runs` in CI or `runs_dir=tmp_path` in pytest.
+Passing seed directories are deleted immediately after each seed passes (along with any stale `seed-<n>` or `flaky/seed-<n>` directory from an earlier failing run, and empty scenario directories). Failing seeds, representative `.min` directories and `.min.json` files (one per `(defect, trigger class)`), flaky rerun directories (`flaky/seed-<n>/run-<k>/`), and `replay/` stay under `--runs-dir` (default `runs/`). Add `runs/` to `.gitignore`, clean with `rm -rf runs/`, and use `--runs-dir /tmp/shape-runs` in CI or `runs_dir=tmp_path` in pytest.

@@ -22,8 +22,8 @@ By default, `shape test` stores artifacts under `runs/<scenario>/`:
 
 - **Passing seeds** are deleted immediately after they pass (along with any stale `seed-<n>` directory from an earlier failing run, and an empty `runs/<scenario>/` directory when all seeds pass).
 - **Failing seeds** keep `runs/<scenario>/seed-<n>/` (world log, realized log, `inc-*.out`, and any SQLite or state files your scenario wrote to `run.dir`).
-- **Minimized seeds** also keep `seed-<n>.min/` and `seed-<n>.min.json`.
-- **Flaky seeds** keep their first failing run directory (`seed-<n>/`); rerun directories are cleaned up.
+- **Minimized representatives** keep `seed-<n>.min/` and `seed-<n>.min.json` (one per `(defect, trigger class)` rather than one per failing seed).
+- **Flaky seeds** keep their initial run and every confirmation rerun (`inc-*.out`, `world.jsonl`, `realized.jsonl`) under `flaky/seed-<n>/run-<k>/`.
 - **Replays** write to `runs/<scenario>/replay/`.
 
 Add `runs/` to `.gitignore`, and clean all saved run directories with `rm -rf runs/`. In CI, pass `--runs-dir /tmp/shape-runs` (or upload only `*.min.json` on failure). In pytest, pass `runs_dir=tmp_path` to `shape.check(...)` so pytest cleans up automatically.

@@ -178,9 +178,9 @@ scope assignment:
   payments.charge: explicit scope= (e.g. 'order:o1')
 ```
 
-- **`scope assignment:` and `--strict-scopes`**: Lists each captured op, how its scope was derived (`explicit scope=`, a fake default rule such as `` `to|subject` ``, or `effect default`), and one example value. If a default rule is used by a duplicate-sensitive invariant (`at_most_once`, `exactly_once`, or a provider default), `shape` prints a `warning:`. Use `@shape.scenario(..., strict_scopes=True)` or `shape test --strict-scopes` to fail loudly whenever a duplicate-sensitive invariant sees a default/derived scope instead of an explicit business scope.
+- **`scope assignment:` and `--strict-scopes`**: Lists each captured op, how its scope was derived (`explicit scope=`, a fake default rule such as `` `to|subject` ``, or `effect default`), and one example value. Calls to user-registered fakes that only return without effect are omitted from `effect default`. If a default rule is used by a duplicate-sensitive invariant (`at_most_once`, `exactly_once`, or a provider default), `shape` prints a `warning:`. Use `@shape.scenario(..., strict_scopes=True)` or `shape test --strict-scopes` to fail loudly whenever a duplicate-sensitive invariant sees a default/derived scope instead of an explicit business scope.
 - **`NOTHING TESTED`**: If no seed called any `@shape.effect` function, or if attempts ran but zero effects ever landed, and nothing failed, the sweep fails with `NOTHING TESTED` and exits `1`. The message explains why when known: zero attempts (the agent never reached its tools), attempts that returned without effect (check `landed=` or tool refusals), attempts that all raised before completing, or harness hook errors. If a scenario legitimately expects zero effects, such as a rejected approval flow, set `@shape.scenario(..., expect_effects=False)`.
-- **`note:` lines**: If an invariant watches an `op` that no seed ever called, `shape` prints `note: an invariant watches <op>, which no seed ever called`. This is informational and does not fail the sweep.
+- **`note:` lines (`--verbose`)**: Pass `--verbose` (or `-v`) to print `note: an invariant watches <op>, which no seed ever called` for watched ops that no seed exercised. These lines are hidden by default to avoid noise from unused provider-fake invariants.
 
 ## `FLAKY` seeds
 
@@ -190,13 +190,13 @@ If a seed does not violate the same invariant on all re-runs, `shape` classifies
 
 - It is counted separately (`flaky=N`) and listed in the report.
 - It is never minimized.
-- Its first failing run directory is kept under `runs/<scenario>/seed-<n>/` for inspection.
+- Its initial run and every confirmation rerun (`inc-*.out`, `world.jsonl`, `realized.jsonl`) are kept under `runs/<scenario>/flaky/seed-<n>/run-<k>/`, and the report points to that directory and shows the first divergence between reruns.
 - The sweep still exits `1`, because a test that sometimes fails is not a pass.
 
 ## Defects and triggers
 
 A defect groups confirmed failing seeds by the first violated invariant, its operation, and the scope pattern. For example, `order:17` and `order:18` share the pattern `order:<id>`. A scope like `tenant:acme|order:17` keeps both field names. A scope without a field name becomes `<id>`. For a custom invariant, return `shape.Finding("what failed", op="orders.confirm", scope=order_scope)` to include these details in the grouping.
 
-The report lists the trigger classes found in the minimized replays for each defect, including reply lost, process crashes, model choices, and interleavings. One seed can contribute to several trigger counts if the minimized replay needs several classes of deviations. A seed with zero remaining deviations is nominal.
+The report lists the trigger classes found in the minimized replays for each defect, including reply lost, process crashes, model choices, and interleavings. One seed can contribute to several trigger counts if the minimized replay needs several classes of deviations, and each minimized trace's `trigger:` line lists every kept deviation in execution order (for example `crash after commit + before-commit fault (429)`). A seed with zero remaining deviations is nominal.
 
-Shape tries seeds with the fewest deviations first, up to the shrink limit (200 by default). The report includes all confirmed failing seeds in the defect counts. The trigger counts and replay links come from seeds that were successfully minimized. The default trace is the smallest replay for the defect. Use `--all-triggers` for a representative of each trigger class, or [`--json`](ci.md#json-sweep-reports) for all seed IDs and replay paths.
+Shape minimizes one representative per `(defect, trigger class)` (up to the shrink limit, 200 by default), confirms remaining failing seeds by replay, and writes `.min.json` only for representatives. The report includes all confirmed failing seeds in the defect and trigger counts. The default trace is the smallest replay for the defect; when a defect's nominal path fails and fault-driven seeds also fail with distinct minimized traces, `shape` automatically shows per-trigger representatives so fault-driven defects are not hidden. Use `--all-triggers` for a representative of every trigger class, or [`--json`](ci.md#json-sweep-reports) for all seed IDs, trigger labels, flaky details, and replay paths.
