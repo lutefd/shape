@@ -104,11 +104,13 @@ class _Context:
             self.seq += 1
             writer.write({**entry, "inc": self.incarnation, "seq": self.seq})
 
-    def call(self, spec: EffectSpec, fn: Callable, sig: inspect.Signature,
-             args: tuple, kwargs: dict) -> Any:
+    def before(self, spec: EffectSpec, fn: Callable, sig: inspect.Signature,
+               args: tuple, kwargs: dict) -> tuple | None:
+        """Draw this call's fault and apply the ones that fire before the function runs. Returns
+        what `after` needs, or None when the call is malformed (the function raises its own error)."""
         named = _named_args(sig, args, kwargs)
         if named is None:
-            return fn(*args, **kwargs)
+            return None
         shown = {k: v for k, v in named.items() if k not in ("self", "cls")}
         label = fn.__qualname__.rsplit("<locals>.", 1)[-1]
         call = f"{label}({', '.join(f'{k}={_short(v)}' for k, v in shown.items())})"
@@ -131,7 +133,11 @@ class _Context:
             os._exit(CRASH_EXIT)
         if error is not None and fault not in AFTER_COMMIT:
             raise error
-        result = fn(*args, **kwargs)
+        return spec, shown, call, scope, key, fault, error
+
+    def after(self, pending: tuple) -> None:
+        """Record the effect that just landed, then apply the faults that fire after it."""
+        spec, shown, call, scope, key, fault, error = pending
         self.append(self.world, {
             "kind": "effect", "op": spec.op, "scope": scope, "key": key, "call": call,
             "irreversible": spec.irreversible, "args_hash": args_hash(shown),
@@ -140,6 +146,25 @@ class _Context:
             os._exit(CRASH_EXIT)
         if error is not None:
             raise error
+
+    def call(self, spec: EffectSpec, fn: Callable, sig: inspect.Signature,
+             args: tuple, kwargs: dict) -> Any:
+        pending = self.before(spec, fn, sig, args, kwargs)
+        if pending is None:
+            return fn(*args, **kwargs)
+        result = fn(*args, **kwargs)
+        self.after(pending)
+        return result
+
+    async def acall(self, spec: EffectSpec, fn: Callable, sig: inspect.Signature,
+                    args: tuple, kwargs: dict) -> Any:
+        """`call` for `async def` functions: the effect is recorded when the awaited call returns,
+        not when the coroutine is created."""
+        pending = self.before(spec, fn, sig, args, kwargs)
+        if pending is None:
+            return await fn(*args, **kwargs)
+        result = await fn(*args, **kwargs)
+        self.after(pending)
         return result
 
 
@@ -154,7 +179,8 @@ def activate(ctx: _Context | None) -> None:
 def effect(op: str, *, scope: Callable[..., str] | None = None,
            key: Callable[..., str | None] | None = None, irreversible: bool = False,
            errors: Mapping[str, Callable[[], Exception]] | None = None) -> Callable:
-    """Mark a side-effecting function. Outside a shape run it is the plain function.
+    """Mark a side-effecting function (sync or `async def`). Outside a shape run it is the plain
+    function.
 
     `scope` names the business thing the effect applies to. `key` returns the idempotency key
     the call carries: effects with the same op, scope and key are one effect, because the
@@ -164,6 +190,15 @@ def effect(op: str, *, scope: Callable[..., str] | None = None,
 
     def wrap(fn: Callable) -> Callable:
         sig = inspect.signature(fn)
+
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                ctx = _active
+                if ctx is None:
+                    return await fn(*args, **kwargs)
+                return await ctx.acall(spec, fn, sig, args, kwargs)
+            return async_wrapper
 
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
