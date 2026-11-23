@@ -187,7 +187,7 @@ def _run_actors(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> None
 def execute(scen: api.Scenario, spec: dict, workdir: Path) -> Outcome:
     """Run one seed (or one explicit replay) in `workdir`, restarting after every death."""
     shutil.rmtree(workdir, ignore_errors=True)
-    workdir.mkdir(parents=True)
+    workdir.mkdir(parents=True, exist_ok=True)
     parent = JsonlWriter(workdir / WORLD, fsync=False)
     copies = 2 if _delivered_twice(scen, spec, workdir) else 1
     completed, incarnations = False, 0
@@ -237,8 +237,6 @@ def run_seed(scen: api.Scenario, seed: int, runs_dir: Path) -> Outcome:
         shutil.rmtree(base / f"seed-{seed}", ignore_errors=True)
         shutil.rmtree(base / f"seed-{seed}.min", ignore_errors=True)
         (base / f"seed-{seed}.min.json").unlink(missing_ok=True)
-        with contextlib.suppress(OSError):
-            base.rmdir()
     else:
         kept = base / f"seed-{seed}"
         shutil.rmtree(kept, ignore_errors=True)
