@@ -19,9 +19,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from world import WorldLog
 
@@ -77,6 +77,7 @@ def _run_subprocess(
         env=env,
         capture_output=True,
         text=True,
+        check=False,
     )
     parsed: dict[str, object] | None = None
     if proc.returncode == 0 and proc.stdout.strip():
