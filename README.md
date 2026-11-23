@@ -80,6 +80,7 @@ defect 1 of 1: at_most_once(payments.charge)  op=payments.charge  scope=order:<i
   before-commit fault: 1 seed (server_error)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
+  trigger: reply lost (timeout_after_commit) + reply lost (connection_reset_after_commit)
   minimized to 3 steps (2 of 3 deviations kept, 6 replays):
     incarnation 0
       1. PaymentClient.charge(order_id='o1', amount=500, idempotency_key='charge-o1')

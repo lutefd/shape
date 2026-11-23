@@ -23,6 +23,7 @@ defect 1 of 1: at_most_once(payments.charge)  op=payments.charge  scope=order:<i
   before-commit fault: 1 seed (server_error)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
+  trigger: reply lost (timeout_after_commit) + reply lost (connection_reset_after_commit)
   minimized to 3 steps (2 of 3 deviations kept, 6 replays):
     incarnation 0
       1. PaymentClient.charge(order_id='o1', amount=500, idempotency_key='charge-o1')
@@ -39,11 +40,11 @@ Reading it top to bottom:
 
 1. **Summary line**: How many seeds ran, starting seed, how many failed reproducibly, wall-clock time, and throughput. If any seed failed inconsistently on re-run, `flaky=N` appears here too.
 2. **Coverage block** (`coverage over 200 seeds:`): Per-op counts of `landed` (real deduplicated effects) and `attempts` (all calls including failed and killed ones), every fault kind actually injected, every non-nominal `shape.choose` decision taken, and any scheduling interleaving choices taken. Check this first to confirm your sweep exercised the faults and model choices you expect.
-3. **Scope assignment block** (`scope assignment:`): For each captured op, how its scope was derived (`explicit scope=`, a fake default rule such as `` `to|subject` ``, or `effect default`) with one example value, plus a `warning:` whenever a default rule is used by a duplicate-sensitive invariant (`at_most_once`, `exactly_once`, or a provider default).
+3. **Scope assignment block** (`scope assignment:`): For each captured op, how its scope was derived (`explicit scope=`, a fake default rule such as `` `to|subject` ``, or `effect default`) with one example value, plus a `warning:` whenever a default rule is used by a duplicate-sensitive invariant (`at_most_once`, `exactly_once`, or a provider default). Calls to user-registered fakes that only return without effect are omitted from `effect default`.
 4. **Defect count** (`1 defect across 2 failing seeds`). The two seeds share the same invariant, operation, and normalized scope pattern.
-5. **Trigger counts**. Both minimized replays lose a reply. One also needs a before-commit fault. `--all-triggers` adds the smallest replay for each trigger class.
+5. **Trigger counts**. Both minimized replays lose a reply. One also needs a before-commit fault. `shape` minimizes one representative per `(defect, trigger class)` and confirms other failing seeds by replay without writing extra `.min.json` files. `--all-triggers` adds the smallest replay for each trigger class; when a defect's nominal path fails and fault-driven seeds also fail with distinct traces, `shape` shows per-trigger representatives automatically so fault-driven bugs are never hidden.
 6. **Failure header** (`FAIL ... seed=52  invariant=at_most_once(payments.charge)`). The representative replay and the invariant it violated.
-7. **Violation message** (`payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)`): Plain-language explanation from the invariant.
+7. **Violation message** (`payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)`): Plain-language explanation from the invariant, followed by the **trigger label** (`trigger: ...`) listing every kept deviation in execution order (for example `crash after commit + before-commit fault (429)`).
 8. **Shrink summary** (`minimized to 3 steps (2 of 3 deviations kept, 6 replays):`):
    - `3 steps`: total calls, approvals, claims, and model choices in the minimized trace.
    - `2 of 3 deviations kept`: delta debugging dropped 1 irrelevant deviation from seed 52 and kept 2. Why did it keep 2 instead of 1? In seed 52, `connection_reset_after_commit` was drawn on the second call (`fault:payments.charge#0.1`), which is only reached because the first call (`fault:payments.charge#0.0`) drew `timeout_after_commit` and triggered a retry. Removing `#0.0` stops `#0.1` from executing, so both keys stay in the 1-minimal set.
@@ -63,6 +64,7 @@ When a crash or model perturbation triggers a failure, those events appear inlin
 ```text
 FAIL docs/guide/examples/async_agent.py::async_per_attempt_key  seed=13  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
+  trigger: crash after commit + before-commit fault (timeout)
   minimized to 3 steps (2 of 2 deviations kept, 4 replays):
     incarnation 0
       1. Payments.charge(order_id='o1', amount=500, idempotency_key='o1-0')
@@ -153,8 +155,8 @@ Once your fix is in place, the same `--replay` command prints `PASS ...: the rec
 Before filing a bug or changing production code, run through this checklist:
 
 1. **Does the output say `FLAKY` or `NOT MINIMIZED`?**
-   Your scenario depends on something `shape` does not control: thread scheduling, wall-clock timers, random numbers, a live LLM, or state stored outside `run.dir`. Move all persistence into `run.dir` and replace live models with `shape.choose` or a scripted model.
-2. **Does the output say `NOTHING TESTED` or `note: an invariant watches ...`?**
+   Your scenario depends on something `shape` does not control: thread scheduling, wall-clock timers, random numbers, a live LLM, or state stored outside `run.dir`. Move all persistence into `run.dir` and replace live models with `shape.choose` or a scripted model. For `FLAKY` seeds, `shape` keeps the initial run and every confirmation rerun (`inc-*.out`, `world.jsonl`, `realized.jsonl`) under `runs/<scenario>/flaky/seed-<n>/run-<k>/` and prints the first divergence between reruns.
+2. **Does the output say `NOTHING TESTED` or (under `--verbose`) `note: an invariant watches ...`?**
    Either no seed attempted an `@shape.effect` function, or attempts ran but zero effects ever landed. The `NOTHING TESTED` line tells you which happened (0 attempts, returned without effect via `landed=`, or every attempt raised before completing). Inspect `inc-0.out`, verify your `op` string matches between `@shape.effect` and the invariant, or set `expect_effects=False` if zero effects is expected (such as a rejected approval).
 3. **Is `@shape.effect` on the right function?**
    If you decorated an outer tool that checks local state and returns early without calling the provider, `shape` logs a fake effect on every no-op return. Move `@shape.effect` to the client method that actually talks to the provider, or pass `key_from_result=` if the tool returns an existing resource ID on deduped repeats.
