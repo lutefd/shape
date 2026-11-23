@@ -225,10 +225,10 @@ extra actor's token in incarnation 0 is `0p1`.
 
 A crash kills the actor that took the fault. The remaining actors can finish their turns, and
 an incomplete incarnation restarts with fresh processes and the same `run.dir`.
-On the last recovery incarnation, faults stop and the scheduler uses nominal order. If an
-actor blocks until another actor can run, it needs to reach a point before that wait. The
-incarnation timeout kills and reaps stalled actors and reports the actor and the point where
-it was granted the turn, alongside the actors still waiting.
+On the last recovery incarnation, faults stop and the scheduler uses nominal order. A blocking
+wait within a step can stall when the actor that would resolve it is parked. The incarnation
+timeout kills and reaps stalled actors and reports the actor and the point where it was granted
+the turn, alongside the actors still waiting.
 
 ### Asyncio
 
@@ -236,8 +236,9 @@ Use `shape.run_async(coro)` in place of `asyncio.run(coro)` to explore races bet
 tasks inside a scenario or actor. Shape uses a virtual clock for asyncio timers and draws
 `sched:tasks#<actor-token>.<n>` whenever two or more callbacks are ready. Index 0 is FIFO.
 The trace and coverage include the reordered callbacks, and replay and shrinking use their
-choice keys. A coroutine with no runnable callbacks, timers or pending executor work can
-raise `shape.loop.Deadlock`. Outside a shape run, `shape.run_async` delegates to `asyncio.run`.
+choice keys. A coroutine with no runnable callbacks, timers, pending executor work or live user
+threads can raise `shape.loop.Deadlock`. Outside a shape run, `shape.run_async` delegates to
+`asyncio.run`.
 
 ### Scheduling limits
 

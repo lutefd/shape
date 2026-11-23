@@ -71,9 +71,9 @@ def child_main(scen: api.Scenario, spec: dict, workdir: Path, inc: int, twin: in
                        actor_slot=actor_slot)
     api.activate(ctx)
     if gate is None:
-        watchdog = threading.Timer(INCARNATION_TIMEOUT, lambda: os._exit(TIMEOUT_EXIT))
-        watchdog.daemon = True
-        watchdog.start()
+        ctx.watchdog = threading.Timer(INCARNATION_TIMEOUT, lambda: os._exit(TIMEOUT_EXIT))
+        ctx.watchdog.daemon = True
+        ctx.watchdog.start()
     try:
         if gate is not None:
             gate.point("entry")
