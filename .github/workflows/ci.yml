@@ -6,6 +6,17 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: shape
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 10
+    env:
+      SHAPE_PG_DSN: postgresql://postgres:shape@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -14,6 +25,7 @@ jobs:
       - run: >-
           pip install -e '.[dev]' httpx aiohttp -r examples/net/requirements.txt
           google-api-python-client python-telegram-bot langgraph-sdk
+          'apscheduler<4' sqlalchemy celery 'psycopg[binary]'
       - run: ruff check
       - run: pytest -q
       - name: toy saga must fail and shrink

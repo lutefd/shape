@@ -143,6 +143,17 @@ Each fake intentionally models only the semantics safety invariants depend on: r
 - Create and read threads and launch background, streaming, or wait-for-output runs. Creating a thread with a stable ID and `if_exists="do_nothing"` returns the saved thread on retry. Run creation can duplicate. Stream replies use server-sent events. Runs resolve on stream, join, or wait and return their input by default. Pass `run_result=` for a scripted output.
 - Create thread-bound or standalone cron definitions, search, patch, and delete them. The fake stores definitions for inspection. Graph execution, crontab scheduling, and webhooks are outside this fake. [Agent Server API reference](https://docs.langchain.com/langsmith/server-api-ref), [OpenAPI schema](https://github.com/langchain-ai/docs/blob/main/src/langsmith/agent-server-openapi.json).
 
+## Seeding a fake
+
+Every fake takes `initial_state=`: a JSON dict merged into the fake's provider state before the first call of each seed, so a scenario can start with customers, channels or threads that already exist. Its keys are the fake's own state keys, the JSON it keeps between calls. The agent's changes persist across incarnations; the seed is applied once. For setup that should go through the fake's API instead, use [`@shape.scenario(setup=...)`](world-fixtures.md#fault-free-setup), which makes the calls with no faults and logs them as setup.
+
+```python
+slack = shape.fakes.SlackFake(initial_state={"channels": {"C1": []}})
+threads = shape.fakes.LangGraphFake(threads=[{"metadata": {"user": "u1"}, "values": {"messages": []}}])
+```
+
+`LangGraphFake(threads=[...])` takes dicts with an optional `thread_id` (a UUID; one is derived from the position otherwise), `metadata`, `values` and `status`.
+
 ## Contract tests
 
 ```sh

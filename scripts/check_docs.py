@@ -6,6 +6,7 @@ Run from the repository root:
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -124,6 +125,61 @@ def main() -> int:
             must_contain=["harness: cron re-ticked the job (recovery='cron-retick')"],
         )
         run([*pytest_cmd, "docs/guide/examples/test_async_agent.py"], expect=0)
+
+        # 3. World fixtures guide: setup, per-seed SQLite, virtual clock, presets, by-design loss
+        world = "docs/guide/examples/world_fixtures.py"
+        run(
+            [*shape_cmd, "test", f"{world}::lease_unkeyed", "--start", "39", "--seeds", "1",
+             "--runs-dir", str(runs)],
+            expect=1,
+            must_contain=[
+                "setup (no faults)",
+                "enqueue_job(job_id='j1')",
+                "time passed: 31s (clock 2025-01-01T00:00:31Z)",
+                ("harness: another worker reclaimed the job after its lease expired "
+                 "(recovery='lease-takeover')"),
+                "agent.run happened 2 times for scope 'job:j1'",
+            ],
+        )
+        run([*shape_cmd, "test", f"{world}::lease_keyed", "--seeds", "40", "--runs-dir", str(runs)],
+            expect=0, must_contain=["PASS"])
+        run(
+            [*shape_cmd, "test", f"{world}::digest_current_hour", "--start", "2", "--seeds", "1",
+             "--runs-dir", str(runs)],
+            expect=1,
+            must_contain=[
+                "no digest was sent for hour 0",
+                "time passed: 3600s (clock 2025-01-01T01:00:00Z)",
+                ("harness: APScheduler reloaded the job store; the crashed tick was not rerun "
+                 "(recovery='apscheduler-reload')"),
+                "harness: tick scheduled for 2025-01-01T01:00:00Z",
+            ],
+        )
+        run([*shape_cmd, "test", f"{world}::digest_catches_up", "--seeds", "100",
+             "--runs-dir", str(runs)], expect=0, must_contain=["PASS"])
+        run(
+            [*shape_cmd, "test", f"{world}::sms_unkeyed", "--seeds", "100", "--runs-dir", str(runs)],
+            expect=1,
+            must_contain=[
+                ("by design (declared at-most-once, a lost effect is not a defect; "
+                 "a duplicate still fails):"),
+                "sms.send: lost in 14 of 100 seeds",
+                "sms.send happened 2 times for scope 'user:u1'",
+            ],
+        )
+        run(
+            [*shape_cmd, "test", f"{world}::sms_keyed", "--seeds", "100", "--runs-dir", str(runs)],
+            expect=0,
+            must_contain=["sms.send: lost in 14 of 100 seeds", "PASS"],
+        )
+        if os.environ.get("SHAPE_PG_DSN"):
+            pg = "docs/guide/examples/postgres_queue.py"
+            run([sys.executable, pg], expect=0, must_contain=["template database"])
+            run([*shape_cmd, "test", f"{pg}::pg_lease_unkeyed", "--start", "39", "--seeds", "1",
+                 "--runs-dir", str(runs)], expect=1,
+                must_contain=["time passed: 31s", "agent.run happened 2 times for scope 'job:j1'"])
+            run([*shape_cmd, "test", f"{pg}::pg_lease_keyed", "--seeds", "100", "--jobs", "4",
+                 "--runs-dir", str(runs)], expect=0, must_contain=["PASS"])
 
     # 3. Local relative links across README and user guide
     check_links()
