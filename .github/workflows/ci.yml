@@ -36,3 +36,23 @@ jobs:
         run: shape test examples/plain_python/checks.py::checkout_fixed --seeds 200
       - name: README quickstart and guide docs check
         run: python scripts/check_docs.py
+      - name: race examples must fail, shrink, replay and pass with the fix
+        run: |
+          for case in lead_summary:summary:every_stored_lead_appears_in_a_summary job_claim:queue:job_processed_once; do
+            IFS=: read -r example scenario invariant <<< "$case"
+            path="examples/races/$example.py"
+            code=0
+            shape test "$path::${scenario}_buggy" --seeds 100 > race.out || code=$?
+            cat race.out
+            test "$code" -eq 1
+            grep -q "invariant=$invariant" race.out
+            grep -q '1 of [0-9]* deviations kept' race.out
+            grep -q 'scheduler ran' race.out
+            replay=$(sed -n 's/^  replay: //p' race.out | head -n 1)
+            code=0
+            shape test "$path::${scenario}_buggy" --replay "$replay" > replay.out || code=$?
+            cat replay.out
+            test "$code" -eq 1
+            grep -q "invariant=$invariant (replayed)" replay.out
+            shape test "$path::${scenario}_fixed" --seeds 100
+          done

@@ -14,6 +14,12 @@ REALIZED = "realized.jsonl"
 PARENT_SEQ = 10**9  # the runner's own entries sort after everything an incarnation wrote
 
 
+def event_order(entry: dict) -> tuple[int, int, int]:
+    seq = entry["seq"]
+    turn = PARENT_SEQ if seq > PARENT_SEQ else entry.get("turn", entry.get("twin", 0))
+    return entry["inc"], turn, seq
+
+
 def args_hash(args: Any) -> str:
     text = json.dumps(args, sort_keys=True, default=repr)
     return hashlib.blake2b(text.encode(), digest_size=8).hexdigest()

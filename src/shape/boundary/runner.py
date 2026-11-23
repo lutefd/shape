@@ -17,11 +17,11 @@ from pathlib import Path
 
 from ..choices import ChoiceSource, ExplicitChoices, SeededChoices
 from ..shrink import shrink
-from . import api, coverage
+from . import api, coverage, schedule
 from .failure import Cause, Failure, Report, kinds, raw_kinds
 from .faults import CRASH_EXIT, DUPLICATE_KEY, DUPLICATE_TRIGGER, FAULT_TEXT
 from .invariants import Violation, World, scenario_terminates
-from .log import PARENT_SEQ, REALIZED, WORLD, JsonlWriter, read_jsonl
+from .log import PARENT_SEQ, REALIZED, WORLD, JsonlWriter, event_order, read_jsonl
 from .rootcause import describe
 
 INCARNATION_TIMEOUT = 30.0  # seconds; a hung incarnation counts as one that never finished
@@ -54,23 +54,30 @@ def make_choices(spec: dict) -> ChoiceSource:
 # ---------------------------------------------------------------------------------- incarnations
 
 
-def child_main(scen: api.Scenario, spec: dict, workdir: Path, inc: int, twin: int = 0) -> int:
-    """Run one incarnation inside the current (already isolated) process. Returns its exit code.
-    `twin` is 1 for the second copy of a duplicated incarnation 0."""
-    out = os.open(workdir / f"inc-{inc}{f'-t{twin}' if twin else ''}.out", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+def child_main(scen: api.Scenario, spec: dict, workdir: Path, inc: int, twin: int = 0, *,
+               fn=None, gate: schedule.Gate | None = None, actor_slot: int = 0) -> int:
+    """Run a scenario or its concurrent actor in an isolated process and return its exit code."""
+    suffix = f"-p{actor_slot}" if actor_slot else f"-t{twin}" if twin else ""
+    out = os.open(workdir / f"inc-{inc}{suffix}.out", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     os.dup2(out, 1)
     os.dup2(out, 2)
+    if out > 2:
+        os.close(out)
     sys.stdout = sys.stderr = os.fdopen(1, "w", buffering=1, closefd=False)
     # Fairness: faults eventually stop. With restarts allowed, the last incarnation runs fault-free,
     # so scenario_terminates asks whether the agent recovers, not whether the harness can outlast it.
     quiet = scen.max_restarts > 0 and inc == scen.max_restarts
-    ctx = api._Context(workdir, inc, make_choices(spec), quiet, twin)
+    ctx = api._Context(workdir, inc, make_choices(spec), quiet, twin, gate=gate,
+                       actor_slot=actor_slot)
     api.activate(ctx)
-    watchdog = threading.Timer(INCARNATION_TIMEOUT, lambda: os._exit(TIMEOUT_EXIT))
-    watchdog.daemon = True
-    watchdog.start()
+    if gate is None:
+        watchdog = threading.Timer(INCARNATION_TIMEOUT, lambda: os._exit(TIMEOUT_EXIT))
+        watchdog.daemon = True
+        watchdog.start()
     try:
-        scen.fn(api.Run(workdir, inc, spec.get("seed")))
+        if gate is not None:
+            gate.point("entry")
+        (fn if fn is not None else scen.fn)(api.Run(workdir, inc, spec.get("seed")))
         return 0
     except BaseException as exc:  # noqa: BLE001 - anything that kills the agent is a death to log
         ctx.append(ctx.world, {"kind": "error", "text": describe(exc)})
@@ -82,45 +89,47 @@ def _classify(code: int) -> str:
     return {0: "done", CRASH_EXIT: "crash", TIMEOUT_EXIT: "timeout"}.get(code, "error")
 
 
-def _fork_incarnations(scen: api.Scenario, spec: dict, workdir: Path, inc: int,
-                       copies: int) -> list[int]:
+def _fork_incarnation(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> int:
     sys.stdout.flush()
     sys.stderr.flush()
-    pids = []
-    for twin in range(copies):
-        pid = os.fork()
-        if pid == 0:
-            code = 70
-            try:
-                code = child_main(scen, spec, workdir, inc, twin)
-            finally:
-                os._exit(code)
-        pids.append(pid)
-    codes = []
-    for pid in pids:
-        _, status = os.waitpid(pid, 0)
-        codes.append(os.waitstatus_to_exitcode(status) if not os.WIFSIGNALED(status) else 1)
-    return codes
+    pid = os.fork()
+    if pid == 0:
+        code = 70
+        try:
+            code = child_main(scen, spec, workdir, inc)
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status)
 
 
-def _spawn_incarnations(scen: api.Scenario, spec: dict, workdir: Path, inc: int,
-                        copies: int) -> list[int]:
+def _spawn_incarnation(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> int:
     root = str(Path(__file__).resolve().parents[2])
     paths = [root, *filter(None, [os.environ.get("PYTHONPATH")])]
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(paths)}
-    procs = []
-    for twin in range(copies):
-        payload = json.dumps({"file": scen.file, "name": scen.name, "spec": spec,
-                              "workdir": str(workdir), "inc": inc, "twin": twin})
-        procs.append(subprocess.Popen([sys.executable, "-m", "shape.boundary.child", payload],
-                                      env=env))
-    return [code if code >= 0 else 1 for code in (proc.wait() for proc in procs)]
+    payload = json.dumps({"file": scen.file, "name": scen.name, "spec": spec,
+                          "workdir": str(workdir), "inc": inc})
+    return subprocess.run([sys.executable, "-m", "shape.boundary.child", payload],
+                          env=env, check=False).returncode
 
 
-def _incarnate(scen: api.Scenario, spec: dict, workdir: Path, inc: int, copies: int) -> list[int]:
+def _incarnate(scen: api.Scenario, spec: dict, workdir: Path, inc: int, copies: int,
+              world: JsonlWriter) -> bool:
     use_fork = hasattr(os, "fork") and os.environ.get("SHAPE_START_METHOD") != "spawn"
-    return (_fork_incarnations if use_fork else _spawn_incarnations)(scen, spec, workdir, inc,
-                                                                      copies)
+    if copies == 1 and not scen.concurrent:
+        code = (_fork_incarnation if use_fork else _spawn_incarnation)(scen, spec, workdir, inc)
+        world.write({"kind": "incarnation", "inc": inc, "twin": 0, "seq": PARENT_SEQ,
+                     "how": _classify(code)})
+        return code == 0
+    actors = schedule.run_processes(
+        scen, spec, workdir, inc, copies, use_fork=use_fork, choices=make_choices(spec),
+        quiet=scen.max_restarts > 0 and inc == scen.max_restarts,
+        timeout=INCARNATION_TIMEOUT, timeout_exit=TIMEOUT_EXIT, world=world)
+    for a in actors:
+        world.write(a.event(inc, PARENT_SEQ, kind="incarnation", how=_classify(a.code)))
+    codes = [a.code for a in actors]
+    return (0 in codes[:copies] and all(code == 0 for code in codes[copies:])
+            and TIMEOUT_EXIT not in codes)
 
 
 def _delivered_twice(scen: api.Scenario, spec: dict, workdir: Path) -> bool:
@@ -170,20 +179,14 @@ def execute(scen: api.Scenario, spec: dict, workdir: Path) -> Outcome:
     completed, incarnations = False, 0
     for inc in range(scen.max_restarts + 1):
         incarnations += 1
-        hows = [_classify(code) for code in _incarnate(scen, spec, workdir, inc,
-                                                       copies if inc == 0 else 1)]
-        for twin, how in enumerate(hows):
-            parent.write({"kind": "incarnation", "inc": inc, "twin": twin, "seq": PARENT_SEQ,
-                          "how": how})
-        if "done" in hows:  # a delivery somebody finished counts as handled
+        if _incarnate(scen, spec, workdir, inc, copies if inc == 0 else 1, parent):
             completed = True
             break
         if inc < scen.max_restarts:
             _run_actors(scen, spec, workdir, inc)
     parent.close()
     entries = read_jsonl(workdir / WORLD)
-    draws = [d | {"kind": "choice" if "choice" in d else "fault"}
-             for d in read_jsonl(workdir / REALIZED)]
+    draws = _read_draws(workdir)
     world = World(entries, completed, incarnations, scen.max_restarts,
                   api.Run(workdir, incarnations - 1, spec.get("seed")))
     violations = []
@@ -321,19 +324,23 @@ def _parallel(seeds: list[int], jobs: int, one) -> list:
 def story(entries: list[dict]) -> tuple[list[str], int]:
     """The trace in the code's words, and its step count (calls, approvals and deaths)."""
     events = [e for e in entries
-              if e["kind"] in ("effect", "approval", "claim", "choice", "error", "incarnation")
+              if e["kind"] in ("effect", "approval", "claim", "choice", "error", "incarnation",
+                               "point", "schedule")
               or (e["kind"] == "fault" and e["fault"] not in api.AFTER_COMMIT)]
-    events.sort(key=lambda e: (e["inc"], e.get("twin", 0), e["seq"]))
+    events.sort(key=event_order)
     copies = any(e.get("twin") for e in events)  # the trigger was delivered twice
     lines: list[str] = []
     steps, current = 0, None
     for e in events:
-        group = (e["inc"], e.get("twin", 0))
+        group = (e["inc"], e.get("twin", 0), e.get("actor_id"))
         if group != current:
             current = group
             label = f"incarnation {group[0]}" + (" (restarted)" if group[0] else "")
-            lines.append(label + (f" (copy {'AB'[group[1]]} of the duplicate delivery)"
-                                  if copies and group[0] == 0 else ""))
+            if copies and group[0] == 0 and group[2] in (None, 0, 1):
+                label += f" (copy {'AB'[group[1]]} of the duplicate delivery)"
+            if group[2] is not None:
+                label += f", actor {group[2]} {e['actor_name']}"
+            lines.append(label)
         kind = e["kind"]
         if kind in ("effect", "fault"):
             steps += 1
@@ -348,6 +355,13 @@ def story(entries: list[dict]) -> tuple[list[str], int]:
             by = f" [world actor {e['actor']}]" if e.get("actor") else ""
             lines.append(f"  {steps}. model chose {e['chosen']} at {e['choice']!r}"
                          f" (nominal: {e['nominal']}){by}")
+        elif kind == "schedule":
+            steps += 1
+            who = "scheduler" if e["schedule"] == "actors" else "asyncio"
+            lines.append(f"  {steps}. {who} ran {e['chosen']} before {e['nominal']}")
+        elif kind == "point":
+            steps += 1
+            lines.append(f"  {steps}. at {e['label']!r}")
         elif kind == "approval":
             steps += 1
             lines.append(f"  {steps}. approval recorded for {e['scope']!r}")
@@ -439,9 +453,14 @@ def investigate_all(scen: api.Scenario, failing: list[tuple[int, str, dict]], ru
     return Report(len(failing), ranked, skipped)
 
 
+def _read_draws(workdir: Path) -> list[dict]:
+    return [d | {"kind": ("choice" if "choice" in d else
+                         "schedule" if "schedule" in d else "fault")}
+            for d in read_jsonl(workdir / REALIZED)]
+
+
 def read_story(workdir: Path) -> list[dict]:
-    return read_jsonl(workdir / WORLD) + [d | {"kind": "choice" if "choice" in d else "fault"}
-                                          for d in read_jsonl(workdir / REALIZED)]
+    return read_jsonl(workdir / WORLD) + _read_draws(workdir)
 
 
 def replay_file(scen: api.Scenario, path: Path, runs_dir: Path) -> tuple[int, str]:

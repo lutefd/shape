@@ -13,15 +13,18 @@ def of_run(world: Any, draws: list[dict]) -> dict:
     model choices taken. Plain dicts, so a parallel worker can send them back as JSON."""
     faults: dict[str, dict[str, int]] = defaultdict(dict)
     choices: Counter[str] = Counter()
+    schedules: Counter[str] = Counter()
     for d in draws:
-        if "choice" in d:
+        if "schedule" in d:
+            schedules[f"{d['schedule']}: {d['chosen']} before {d['nominal']}"] += 1
+        elif "choice" in d:
             choices[f"{d['choice']} -> {d['chosen']}"] += 1
         else:
             by_kind = faults[d["op"]]
             by_kind[d["fault"]] = by_kind.get(d["fault"], 0) + 1
     return {"effects": dict(Counter(e["op"] for e in world.effects())),
             "attempts": dict(Counter(e["op"] for e in world.attempts())),
-            "faults": dict(faults), "choices": dict(choices)}
+            "faults": dict(faults), "choices": dict(choices), "schedules": dict(schedules)}
 
 
 class Coverage:
@@ -31,12 +34,14 @@ class Coverage:
         self.attempts: Counter[str] = Counter()
         self.faults: dict[str, Counter[str]] = defaultdict(Counter)
         self.choices: Counter[str] = Counter()
+        self.schedules: Counter[str] = Counter()
 
     def add(self, stats: dict) -> None:
         self.seeds += 1
         self.effects.update(stats["effects"])
         self.attempts.update(stats["attempts"])
         self.choices.update(stats["choices"])
+        self.schedules.update(stats["schedules"])
         for op, by_kind in stats["faults"].items():
             self.faults[op].update(by_kind)
 
@@ -57,6 +62,8 @@ class Coverage:
             out.append("  no effect was called")
         taken = ", ".join(f"{k} x{n}" for k, n in sorted(self.choices.items()))
         out.append(f"  model choices taken: {taken or 'none'}")
+        taken = ", ".join(f"{k} x{n}" for k, n in sorted(self.schedules.items()))
+        out.append(f"  interleaving choices taken: {taken or 'none'}")
         return "\n".join(out)
 
 

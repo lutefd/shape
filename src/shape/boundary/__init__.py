@@ -1,6 +1,18 @@
 """Boundary mode: test agent code you already have by faulting and killing its side effects."""
 
-from .api import Actor, Run, Scenario, actor, approval, choose, claim, effect, scenario
+from .api import (
+    Actor,
+    Run,
+    Scenario,
+    actor,
+    approval,
+    choose,
+    claim,
+    effect,
+    point,
+    run_async,
+    scenario,
+)
 from .faults import ClientError, RateLimited, ServerError
 from .invariants import (
     World,
@@ -37,7 +49,9 @@ __all__ = [
     "exactly_once",
     "invariant",
     "max_calls",
+    "point",
     "requires",
+    "run_async",
     "scenario",
     "scenario_terminates",
     "sum_le",

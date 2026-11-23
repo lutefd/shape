@@ -3,17 +3,19 @@ that every wrapped call goes through."""
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import os
 import threading
-from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections import Counter, deque
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..choices import ChoiceSource
+from .asyncio import BoundaryLoop
 from .faults import (
     AFTER_COMMIT,
     CRASH_EXIT,
@@ -23,6 +25,7 @@ from .faults import (
 )
 from .log import PARENT_SEQ, REALIZED, WORLD, JsonlWriter, args_hash
 from .rootcause import mark_injected
+from .schedule import Gate
 
 # Arguments a framework injects into a tool call. They are not business arguments, so they never
 # appear in a rendered call, the world log or an argument hash. `@shape.effect(hide=...)` adds more.
@@ -73,6 +76,7 @@ class Scenario:
     actors: Sequence[Actor] = ()
     duplicate_trigger: bool = False
     expect_effects: bool = True
+    concurrent: Sequence[Callable[[Run], None]] = ()
 
     def __call__(self, run: Run) -> None:
         self.fn(run)
@@ -80,11 +84,12 @@ class Scenario:
 
 def scenario(fn: Callable[[Run], None] | None = None, *, invariants: Sequence[Any] = (),
              max_restarts: int = 3, actors: Sequence[Actor] = (),
-             duplicate_trigger: bool = False, expect_effects: bool = True) -> Any:
+             duplicate_trigger: bool = False, expect_effects: bool = True,
+             concurrent: Sequence[Callable[[Run], None]] = ()) -> Any:
     def wrap(f: Callable[[Run], None]) -> Scenario:
         return Scenario(f, f.__name__, tuple(invariants), max_restarts,
                         inspect.getsourcefile(f) or "", f.__module__, tuple(actors),
-                        duplicate_trigger, expect_effects)
+                        duplicate_trigger, expect_effects, tuple(concurrent))
     return wrap(fn) if fn is not None else wrap
 
 
@@ -117,6 +122,18 @@ def _short(value: Any) -> str:
     return text if len(text) <= 60 else text[:57] + "..."
 
 
+def _callback_name(handle: asyncio.Handle) -> str:
+    callback = handle._callback
+    task = getattr(callback, "__self__", None)
+    if isinstance(task, asyncio.Task):
+        name = task.get_name()
+        if not (name.startswith("Task-") and name[5:].isdigit()):
+            return name
+        coro = task.get_coro()
+        return getattr(coro, "__qualname__", type(coro).__name__).rsplit("<locals>.", 1)[-1]
+    return getattr(callback, "__qualname__", type(callback).__name__)
+
+
 def _result(spec: EffectSpec, value: Any) -> Any:
     """What the effect returned to the world, as `result=` describes it. A `result=` that raises
     must not lose an effect that already landed, so its error is logged in its place."""
@@ -133,13 +150,17 @@ class _Context:
     framework that runs sync tools in a thread pool still gets stable per-op keys."""
 
     def __init__(self, workdir: Path, incarnation: int, choices: ChoiceSource,
-                 quiet: bool = False, twin: int = 0, actors: bool = False) -> None:
+                 quiet: bool = False, twin: int = 0, actors: bool = False, *,
+                 gate: Gate | None = None, actor_slot: int = 0) -> None:
         self.incarnation = incarnation
         self.twin = twin  # 1 for the duplicate delivery of incarnation 0
         self.actors = actors  # the parent's context for world actors: choices, no faults
         self.actor: str | None = None
         # Draw keys carry the incarnation, namespaced per twin and for actors, so each replays alone.
         self.token = f"{incarnation}{f't{twin}' if twin else ''}{'a' if actors else ''}"
+        if actor_slot:
+            self.token += f"p{actor_slot}"
+        self.gate = gate
         self.quiet = quiet  # faults have stopped: the recovery incarnation draws nothing
         self.choices = choices
         self.lock = threading.Lock()
@@ -151,8 +172,13 @@ class _Context:
 
     def append(self, writer: JsonlWriter, entry: dict) -> None:
         with self.lock:
-            self.seq += 1
-            writer.write({**entry, "inc": self.incarnation, "twin": self.twin, "seq": self.seq})
+            self._append(writer, entry)
+
+    def _append(self, writer: JsonlWriter, entry: dict) -> None:
+        self.seq += 1
+        position = self.gate.position() if self.gate else {}
+        writer.write({**entry, **position, "inc": self.incarnation, "twin": self.twin,
+                      "seq": self.seq})
 
     def close(self) -> None:
         self.world.close()
@@ -171,13 +197,28 @@ class _Context:
             draw_key = f"model:{label}#{self.token}.{n}"
             value = 0 if self.quiet else self.choices.draw(draw_key, w)
             if value:
-                self.seq += 1
-                self.realized.write({
+                self._append(self.realized, {
                     "key": draw_key, "value": value, "choice": label,
                     "chosen": _short(options[value]), "nominal": nominal or _short(options[0]),
-                    "actor": self.actor, "inc": self.incarnation, "twin": self.twin,
-                    "seq": self.seq})
+                    "actor": self.actor})
         return value
+
+    def pick_task(self, ready: deque[asyncio.Handle]) -> int:
+        if self.quiet:
+            return 0
+        n = len(ready)
+        with self.lock:
+            counter = self.counts["sched:tasks"]
+            self.counts["sched:tasks"] += 1
+            key = f"sched:tasks#{self.token}.{counter}"
+            weight = 1.0 if self.choices.enabled("sched") else 0.0
+            index = self.choices.draw(key, [3.0] + [weight / (n - 1)] * (n - 1))
+            if index:
+                self._append(self.realized, {
+                    "key": key, "value": index, "schedule": "tasks",
+                    "chosen": f"callback {index} ({_callback_name(ready[index])})",
+                    "nominal": f"callback 0 ({_callback_name(ready[0])})"})
+        return index
 
     def before(self, spec: EffectSpec, fn: Callable, sig: inspect.Signature,
                args: tuple, kwargs: dict) -> tuple | None:
@@ -185,11 +226,15 @@ class _Context:
         what `after` needs, or None when the call is malformed (the function raises its own error)."""
         named = _named_args(sig, args, kwargs)
         if named is None:
-            return None
+            if self.gate:
+                self.gate.point(fn.__qualname__)
+            return None  # let the real function raise its own error
         hidden = HIDDEN_ARGS | spec.hide
         shown = {k: v for k, v in named.items() if k not in hidden}
         label = fn.__qualname__.rsplit("<locals>.", 1)[-1]
         call = f"{label}({', '.join(f'{k}={_short(v)}' for k, v in shown.items())})"
+        if self.gate:
+            self.gate.point(call)
         scope = spec.scope(**named) if spec.scope else ""
         key = spec.key(**named) if spec.key else None
         with self.lock:
@@ -202,11 +247,9 @@ class _Context:
             if error is not None:
                 mark_injected(error)
             if fault:
-                self.seq += 1
-                self.realized.write({
+                self._append(self.realized, {
                     "key": draw_key, "value": value, "fault": fault, "op": spec.op, "call": call,
-                    "raised": type(error).__name__ if error else None,
-                    "inc": self.incarnation, "twin": self.twin, "seq": self.seq})
+                    "raised": type(error).__name__ if error else None})
         self.append(self.world, {"kind": "attempt", "op": spec.op, "scope": scope, "call": call,
                                  "fault": fault})
         if fault == "crash_before":
@@ -255,6 +298,28 @@ _active: _Context | None = None
 def activate(ctx: _Context | None) -> None:
     global _active
     _active = ctx
+
+
+def point(label: str) -> None:
+    """Yield the process turn before a shared-state operation."""
+    ctx = _active
+    if ctx is not None and ctx.gate is not None:
+        ctx.gate.point(label, show=True)
+
+
+def run_async[T](coro: Coroutine[Any, Any, T]) -> T:
+    """Run an asyncio coroutine with seeded scheduling inside a shape boundary run."""
+    ctx = _active
+    if ctx is None:
+        return asyncio.run(coro)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("shape.run_async() cannot be called from a running event loop")
+    with asyncio.Runner(loop_factory=lambda: BoundaryLoop(ctx)) as runner:
+        return runner.run(coro)
 
 
 def effect(op: str, *, scope: Callable[..., str] | None = None,

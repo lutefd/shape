@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .faults import FAULTS
+from .log import event_order
 
 
 def kind(key: str, value: int) -> str:
@@ -17,13 +18,15 @@ def kind(key: str, value: int) -> str:
     subject = rest.split("#")[0]
     if family == "fault":
         return f"{subject}:{FAULTS[value - 1]}"
+    if family == "sched":
+        return f"{key}={value}"
     return f"model:{subject}={value}" if family == "model" else subject
 
 
 def kinds(entries: list[dict]) -> tuple[str, ...]:
     """The deviations of a run, in the order they happened."""
-    draws = [e for e in entries if e["kind"] in ("fault", "choice")]
-    draws.sort(key=lambda e: (e["inc"], e.get("twin", 0), e["seq"]))
+    draws = [e for e in entries if e["kind"] in ("fault", "choice", "schedule")]
+    draws.sort(key=event_order)
     return tuple(kind(d["key"], d["value"]) for d in draws)
 
 
