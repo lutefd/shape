@@ -124,18 +124,25 @@ incarnation 0
 
 ## Resume policies and assumptions
 
-### `shape.langgraph.drive(graph, input, config, run, *, human=None, durability=None)`
+### `shape.langgraph.drive(graph, input, config, run, *, human=None, durability=None, on_restart="resume")`
 
 - On incarnation 0 (`run.restarts == 0`), calls `graph.invoke(input, config)`.
-- On restarts (`run.restarts > 0`), calls `graph.invoke(None, config)`, assuming the graph was compiled with a durable checkpointer (such as `SqliteSaver` under `run.dir`) and the same `thread_id` in `config`.
+- On restarts (`run.restarts > 0`), `on_restart` controls what happens:
+  - `"resume"` (**default**): calls `graph.invoke(None, config)` to resume from the checkpointer (LangGraph's own checkpoint recovery behavior, assuming a durable checkpointer such as `SqliteSaver` under `run.dir` and the same `thread_id` in `config`).
+  - `"none"`: does nothing and returns `None` (models an app without a supervisor or checkpointer recovery).
+  - `"redeliver"`: resends `input` to `graph.invoke(input, config)` (models an at-least-once queue/supervisor) and logs `harness redelivered the request (on_restart='redeliver')` as its own line in the trace.
+  - callable `fn(run)`: calls your custom recovery function with `run` and returns its result.
 - **Dynamic `interrupt()`:** whenever `graph.invoke` returns an `__interrupt__`, calls `human(payload)` and resumes with `Command(resume=reply)` in a loop. `human` may call `shape.choose(...)` to explore approve/reject/edit paths.
 - **Static `interrupt_before=` / `interrupt_after=`:** after each invoke on a checkpointed graph, `drive` checks `graph.get_state(config).next`. When the graph is paused before a node, `drive` calls `human(snapshot)` and resumes: `True` or `None` approves (`graph.invoke(None, config)`), `False` denies pending tool calls (injecting a denial `ToolMessage` when the last message has `tool_calls`, or stopping cleanly otherwise), and a `dict` or `Command` is passed directly to `graph.invoke(reply, config)`.
 - **Loud pause failures:** if the graph pauses with no `human=` callback, `drive` raises `RuntimeError("graph paused before node '<name>'; pass human=... to approve")` (or the dynamic `interrupt()` equivalent) instead of returning as finished. It also raises if resuming leaves the graph stuck at the same checkpoint.
-- `durability` is forwarded only when explicitly passed, so `durability=None` tests LangGraph's own default (`"async"`). `adrive` is the `async` counterpart.
+- `durability` is forwarded only when explicitly passed, so `durability=None` tests LangGraph's own default (`"async"`). `adrive` is the `async` counterpart (supporting the same `on_restart` values, including async callables).
 
-### `shape.agents.drive(agent, input, run, *, context=None, session_factory=None, human=None, context_serializer=None, max_turns=10)`
+### `shape.agents.drive(agent, input, run, *, context=None, session_id=None, session_factory=None, human=None, context_serializer=None, max_turns=10, on_restart="none")`
 
-- Persists conversation memory in `SQLiteSession("shape", str(run.dir / "session.db"))` by default, or in the session returned by `session_factory(run.dir)`.
-- **No mid-turn resume:** the OpenAI Agents SDK does not checkpoint an in-flight tool call inside `Runner.run`. On restart (`run.restarts > 0`), `drive` redelivers `input` to `Runner.run` with the same session, modeling an at-least-once job queue or client retry.
-- **Human-in-the-loop (`needs_approval=True`):** when a run pauses on `result.interruptions`, `drive` persists `result.to_state()` to `run.dir / "paused-run.json"` (defaulting `context_serializer` to `{}` when a `context` is supplied, and reloading with `context_override=context`). On restart, if `paused-run.json` exists, `drive` reloads that `RunState` instead of starting a new turn, asks `human(item)` for each interruption (`True` -> `approve`, `False` -> `reject`), and deletes `paused-run.json` once the run finishes without further interruptions.
+- **Distinct session per job by default:** Each `drive()` call in a scenario gets its own `SQLiteSession("shape-job-<n>", str(run.dir / "session.db"))` (`shape-job-0`, `shape-job-1`, ...), so two independent jobs in the same scenario do not share conversation history or skip each other's tool calls. To share a session deliberately across turns, pass the same `session_id="..."` (or `session_factory=...`).
+- **Explicit restart policy (`on_restart`):** The OpenAI Agents SDK does not checkpoint an in-flight tool call inside `Runner.run`, so `drive` never invents supervisor recovery you did not opt into:
+  - `"none"` (**default**): on `run.restarts > 0`, does nothing and returns `None` (models an app without a supervisor).
+  - `"redeliver"`: on `run.restarts > 0`, logs `harness redelivered the request (on_restart='redeliver')` as its own trace line, then reloads any saved approval `RunState` or resends `input` into the same session (models an at-least-once job queue or supervisor).
+  - callable `fn(run)`: calls your custom recovery function (sync or async) with `run` and returns its result.
+- **Human-in-the-loop (`needs_approval=True`):** when a run pauses on `result.interruptions`, `drive` persists `result.to_state()` under `run.dir` (defaulting `context_serializer` to `{}` when a `context` is supplied, and reloading with `context_override=context`), asks `human(item)` for each interruption (`True` -> `approve`, `False` -> `reject`), and deletes the saved state file once the run finishes without further interruptions. With `on_restart="redeliver"`, a restarted incarnation reloads that saved `RunState` instead of starting a new turn.
 - Disables Agents SDK trace export (`RunConfig(tracing_disabled=True)`) so local runs require no API key or network access.

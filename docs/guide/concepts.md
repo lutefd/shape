@@ -161,9 +161,9 @@ shape test checks.py::my_scenario --replay runs/my_scenario/seed-52.min.json
 
 Exit codes for `--replay`: `0` if the bug is fixed (and every recorded deviation was still reached), `1` if the invariant still fails, and `2` if the code diverged and no longer reached the recorded deviation keys.
 
-## Coverage and `NOTHING TESTED`
+## Coverage, scope assignment, and `NOTHING TESTED`
 
-After every sweep, `shape` prints a coverage summary over all seeds:
+After every sweep, `shape` prints a coverage summary and a `scope assignment:` block over all seeds:
 
 ```text
 coverage over 200 seeds:
@@ -171,8 +171,12 @@ coverage over 200 seeds:
   payments.charge      202       252
                    faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
   model choices taken: none
+  interleaving choices taken: none
+scope assignment:
+  payments.charge: explicit scope= (e.g. 'order:o1')
 ```
 
+- **`scope assignment:` and `--strict-scopes`**: Lists each captured op, how its scope was derived (`explicit scope=`, a fake default rule such as `` `to|subject` ``, or `effect default`), and one example value. If a default rule is used by a duplicate-sensitive invariant (`at_most_once`, `exactly_once`, or a provider default), `shape` prints a `warning:`. Use `@shape.scenario(..., strict_scopes=True)` or `shape test --strict-scopes` to fail loudly whenever a duplicate-sensitive invariant sees a default/derived scope instead of an explicit business scope.
 - **`NOTHING TESTED`**: If no seed called any `@shape.effect` function, or if attempts ran but zero effects ever landed, and nothing failed, the sweep fails with `NOTHING TESTED` and exits `1`. The message explains why when known: zero attempts (the agent never reached its tools), attempts that returned without effect (check `landed=` or tool refusals), attempts that all raised before completing, or harness hook errors. If a scenario legitimately expects zero effects, such as a rejected approval flow, set `@shape.scenario(..., expect_effects=False)`.
 - **`note:` lines**: If an invariant watches an `op` that no seed ever called, `shape` prints `note: an invariant watches <op>, which no seed ever called`. This is informational and does not fail the sweep.
 
@@ -191,12 +195,13 @@ If a seed does not violate the same invariant on all re-runs, `shape` classifies
 
 Many seeds in a sweep often trigger the same bug. `shape` groups failing seeds by **cause**: the violated invariant, the op that violated it, and the coarse class of each deviation in the minimized run:
 
-- **after-commit fault** (`the caller did not see the commit`): `timeout_after_commit`, `connection_reset_after_commit`, and `crash_after` group into one cause, with the exact fault kinds seen across those seeds listed inside it.
+- **reply lost** (`commit landed, caller saw an error`): `timeout_after_commit` and `connection_reset_after_commit` group into one cause (same-process retry after losing the reply), with the exact fault kinds listed inside it.
+- **crash after commit** (`process died after the commit`): `crash_after` forms its own cause, separate from reply-lost faults, because recovering after a process death needs a different fix than in-process retry logic.
 - **before-commit fault** (`the call failed cleanly`): `timeout`, `rate_limit`, `server_error`, and `client_error` group into one cause, with exact kinds listed.
 - **crash** (`died before the call`): `crash_before`.
 - **interleaving**: scheduling choices (`sched:actors`, `sched:tasks`) from concurrent processes or `shape.run_async`.
 - **model choice** and **duplicate delivery**: grouped by choice / trigger.
 
-Each cause is labeled by what it took to trigger (`needs: after-commit fault (...)`, `needs: model choice`, etc.). Causes that fail on the nominal path with 0 faults and 0 model choices are printed **last** under `nominal path (0 faults, 0 model choices): a plain unit test catches this`, so findings that only fault injection or model perturbation can produce stand out first.
+Each cause is labeled by what it took to trigger (`needs: reply lost (...)`, `needs: crash after commit (...)`, `needs: model choice`, etc.). Causes that fail on the nominal path with 0 faults and 0 model choices are printed **last** under `nominal path (0 faults, 0 model choices): a plain unit test catches this`, so findings that only fault injection or model perturbation can produce stand out first.
 
 Seeds are processed in order of fewest deviations first. Once a minimized cause is found, any remaining failing seed with the same invariant and op whose raw coarse deviations are a superset of that cause's deviations joins it without running `ddmin` again (recording its exact fault kinds on that cause). At most 200 failing seeds are minimized per sweep. The report prints `N distinct causes across M failing seeds` and one minimized trace per cause.

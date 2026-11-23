@@ -64,17 +64,19 @@ def checkout_buggy(run: shape.Run) -> None:
 
 ```console
 $ .venv/bin/shape test examples/plain_python/checks.py::checkout_buggy --seeds 200
-scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=3.65s  55 seeds/s
+scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=0.94s  212 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      202       252
                    faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
   model choices taken: none
   interleaving choices taken: none
+scope assignment:
+  payments.charge: explicit scope= (e.g. 'order:o1')
 2 distinct causes across 2 failing seeds
 
 cause 1 of 2: 1 of 2 failing seeds (52)
-  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, timeout_after_commit)
+  needs: reply lost (commit landed, caller saw an error: connection_reset_after_commit, timeout_after_commit)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 3 steps (2 of 3 deviations kept, 6 replays):
@@ -108,7 +110,7 @@ The `except ConnectionResetError:` branch retried without `idempotency_key='char
 `shape test` exits `0` on pass, `1` on failure (`FAIL`, `FLAKY`, or `NOTHING TESTED`), and `2` on import errors or diverged replays. Run in parallel with `--jobs 4`:
 
 ```sh
-shape test examples/plain_python/checks.py::checkout_fixed --seeds 200 --jobs 4 --runs-dir /tmp/shape-runs
+shape test examples/plain_python/checks.py::checkout_fixed --seeds 200 --jobs 4 --strict-scopes --runs-dir /tmp/shape-runs
 ```
 
 Or invoke directly from pytest (raising `AssertionError` carrying the minimized trace on failure):

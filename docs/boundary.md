@@ -51,9 +51,9 @@ def test_place_order_is_crash_safe():
     shape.check(place_order, seeds=200)    # raises AssertionError carrying the minimized trace
 ```
 
-`check(scenario, seeds=100, start=0, runs_dir="runs", jobs=1, *, budget=None, max_shrinks=200)` runs seeds (optionally in `jobs` forked workers) and raises `AssertionError` on failure. `replay(scenario, path, runs_dir="runs")` replays a saved `.min.json` regression trace and raises `AssertionError` if the failure still reproduces or diverges.
+`check(scenario, seeds=100, start=0, runs_dir="runs", jobs=1, *, budget=None, max_shrinks=200, strict_scopes=None)` runs seeds (optionally in `jobs` forked workers) and raises `AssertionError` on failure. `replay(scenario, path, runs_dir="runs")` replays a saved `.min.json` regression trace and raises `AssertionError` if the failure still reproduces or diverges.
 
-`@shape.scenario(invariants=, max_restarts=3, actors=(), duplicate_trigger=False, expect_effects=True, concurrent=(), net=None)`. `actors` and `duplicate_trigger` are described under Faults, and `concurrent` under Concurrency. `expect_effects=False` says the scenario may legitimately call no effect (a rejected request must do nothing). See Coverage.
+`@shape.scenario(invariants=, max_restarts=3, actors=(), duplicate_trigger=False, expect_effects=True, concurrent=(), net=None, strict_scopes=False)`. `actors` and `duplicate_trigger` are described under Faults, and `concurrent` under Concurrency. `expect_effects=False` says the scenario may legitimately call no effect (a rejected request must do nothing). `strict_scopes=True` (or `shape test --strict-scopes`) makes duplicate-sensitive invariants (`at_most_once`, `exactly_once`, and provider fake default invariants) refuse default/derived scopes and fail with a message telling you to pass `scope=` to the fake or `@shape.effect`. See Coverage.
 
 ### Network capture
 
@@ -161,17 +161,22 @@ def refunds_match_the_order(world):
             return f"refunded {e['result']['amount']} but asked for {e['args']['amount_cents']}"
 ```
 
-### Coverage and vacuous passes
+### Coverage, scope assignment, and vacuous passes
 
-After every sweep shape prints what it exercised, per op: effects that landed, attempts, and the faults injected by kind, then the model choices taken:
+After every sweep shape prints what it exercised, per op: effects that landed, attempts, and the faults injected by kind, the model choices taken, and a `scope assignment:` section showing how each captured op's scope was derived (explicit `scope=`, a fake default rule such as `` `to|subject` ``, or the effect default) with one example value:
 
 ```
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      202       252
-                   faults injected: client_error 9, crash_after 6, timeout 9, ...
-  model choices taken: after_refund -> 'refund_again' x5
+                   faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
+  model choices taken: none
+  interleaving choices taken: none
+scope assignment:
+  payments.charge: explicit scope= (e.g. 'order:o1')
 ```
+
+When a captured op used a default scope rule (a fake heuristic such as `to|subject` or an `@shape.effect` without `scope=`) and a duplicate-sensitive invariant (`at_most_once`, `exactly_once`, or a provider default) watches that op, the report prints a `warning:` line advising you to pass an explicit `scope=`. Set `@shape.scenario(..., strict_scopes=True)` or pass `--strict-scopes` to `shape test` (or `strict_scopes=True` to `shape.check`) to make duplicate-sensitive invariants refuse default scopes outright so unrelated jobs cannot collide into false duplicates.
 
 A pass that tested nothing is not a pass. When no seed made an effect attempt, or attempts ran but zero effects landed, and nothing failed, the sweep fails with `NOTHING TESTED` and exits 1. The message explains which case occurred: zero attempts (the agent never reached its tools), attempts that returned without effect (check `landed=` or whether the tool refused every call), attempts that all raised before completing, or harness hook errors. A scenario that must legitimately do nothing sets `expect_effects=False`. When an invariant watches an op that no seed ever called, the report adds a `note:` line (it does not fail: "this must never run" is a valid thing to assert). Coverage counts after-commit faults only when an effect landed and the fault fired.
 
@@ -183,13 +188,14 @@ Boundary mode does not control threads, timers or an unscripted model, so a fail
 
 Failing seeds are grouped by root cause. The signature is the violated invariant, the op that violated it, and the coarse class of each deviation of the minimized run:
 
-- **after-commit fault** (`the caller did not see the commit`): `timeout_after_commit`, `connection_reset_after_commit`, and `crash_after` group together, with the exact fault kinds observed listed inside the cause.
+- **reply lost** (`commit landed, caller saw an error`): `timeout_after_commit` and `connection_reset_after_commit` group together (the same process retries after losing the reply), with the exact fault kinds observed listed inside the cause.
+- **crash after commit** (`process died after the commit`): `crash_after` stays separate from reply-lost faults because process death and post-restart recovery require different fixes than in-process retry handling.
 - **before-commit fault** (`the call failed cleanly`): `timeout`, `rate_limit`, `server_error`, and `client_error` group together, with exact kinds listed.
 - **crash** (`died before the call`): `crash_before`.
 - **interleaving**: scheduling choices (`sched:actors`, `sched:tasks`) from concurrent processes or `shape.run_async`.
 - **model choice** and **duplicate delivery**: grouped by choice / trigger.
 
-Each cause is labeled by what it took to trigger (`needs: after-commit fault (...)`, `needs: model choice`, etc.). Causes that fail on the nominal path with 0 faults and 0 model choices are printed **last**, labeled `nominal path (0 faults, 0 model choices): a plain unit test catches this`, so findings that only fault injection or model perturbation can produce stand out first. Seeds go fewest deviations first; a seed that still contains every coarse deviation of a cause already found joins it without being shrunk again and adds its exact fault kinds to that cause; any other seed is minimized. At most 200 seeds are minimized per sweep, and the report says how many were not.
+Each cause is labeled by what it took to trigger (`needs: reply lost (...)`, `needs: crash after commit (...)`, `needs: model choice`, etc.). Causes that fail on the nominal path with 0 faults and 0 model choices are printed **last**, labeled `nominal path (0 faults, 0 model choices): a plain unit test catches this`, so findings that only fault injection or model perturbation can produce stand out first. Seeds go fewest deviations first; a seed that still contains every coarse deviation of a cause already found joins it without being shrunk again and adds its exact fault kinds to that cause; any other seed is minimized. At most 200 seeds are minimized per sweep, and the report says how many were not.
 
 Use `--max-shrinks N` or `shape.check(max_shrinks=N)` to change that limit. A value of zero preserves original failures and skips all shrinking. `--budget SECONDS` or `shape.check(budget=seconds)` limits wall time across seed execution, confirmation, and shrinking. Shape reports skipped work at each phase. A sweep with untested seeds or unconfirmed failures reports `INCOMPLETE` and exits 1. Parent-process invariants and world actors finish their current call before shape checks the deadline again.
 

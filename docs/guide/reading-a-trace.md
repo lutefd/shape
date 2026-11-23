@@ -7,17 +7,19 @@ When a scenario fails, `shape` shrinks the failure to a small set of deviations,
 Here is the real output from running `examples/plain_python/checks.py::checkout_buggy`:
 
 ```text
-scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=3.65s  55 seeds/s
+scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=0.94s  212 seeds/s
 coverage over 200 seeds:
   op                landed  attempts
   payments.charge      202       252
                    faults injected: client_error 2, connection_reset_after_commit 2, crash_after 11, crash_before 7, rate_limit 4, server_error 5, timeout 9, timeout_after_commit 12
   model choices taken: none
   interleaving choices taken: none
+scope assignment:
+  payments.charge: explicit scope= (e.g. 'order:o1')
 2 distinct causes across 2 failing seeds
 
 cause 1 of 2: 1 of 2 failing seeds (52)
-  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, timeout_after_commit)
+  needs: reply lost (commit landed, caller saw an error: connection_reset_after_commit, timeout_after_commit)
 FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)
   minimized to 3 steps (2 of 3 deviations kept, 6 replays):
@@ -34,23 +36,24 @@ FAIL examples/plain_python/checks.py::checkout_buggy  seed=52  invariant=at_most
 
 Reading it top to bottom:
 
-1. **Summary line** (`scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=3.65s  55 seeds/s`): How many seeds ran, starting seed, how many failed reproducibly, wall-clock time, and throughput. If any seed failed inconsistently on re-run, `flaky=N` appears here too.
+1. **Summary line** (`scenario=checkout_buggy  seeds=200 (from 0)  failing=2  wall=0.94s  212 seeds/s`): How many seeds ran, starting seed, how many failed reproducibly, wall-clock time, and throughput. If any seed failed inconsistently on re-run, `flaky=N` appears here too.
 2. **Coverage block** (`coverage over 200 seeds:`): Per-op counts of `landed` (real deduplicated effects) and `attempts` (all calls including failed and killed ones), every fault kind actually injected, every non-nominal `shape.choose` decision taken, and any scheduling interleaving choices taken. Check this first to confirm your sweep exercised the faults and model choices you expect.
-3. **Cause count** (`2 distinct causes across 2 failing seeds`): Failing seeds grouped by `(invariant, violating op, coarse deviation classes)`.
-4. **Cause heading and trigger label** (`cause 1 of 2: 1 of 2 failing seeds (52)` + `needs: after-commit fault (...)`): How many failing seeds matched this cause, up to five sorted seed numbers, what class of deviation it took to trigger (with exact fault kinds listed), or `nominal path (0 faults, 0 model choices): a plain unit test catches this` printed last when zero faults and zero model choices triggered the failure.
-5. **Failure header** (`FAIL ... seed=52  invariant=at_most_once(payments.charge)`): The representative seed (fewest deviations in this cause) and the violated invariant.
-6. **Violation message** (`payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)`): Plain-language explanation from the invariant.
-7. **Shrink summary** (`minimized to 3 steps (2 of 3 deviations kept, 6 replays):`):
+3. **Scope assignment block** (`scope assignment:`): For each captured op, how its scope was derived (`explicit scope=`, a fake default rule such as `` `to|subject` ``, or `effect default`) with one example value, plus a `warning:` whenever a default rule is used by a duplicate-sensitive invariant (`at_most_once`, `exactly_once`, or a provider default).
+4. **Cause count** (`2 distinct causes across 2 failing seeds`): Failing seeds grouped by `(invariant, violating op, coarse deviation classes)`.
+5. **Cause heading and trigger label** (`cause 1 of 2: 1 of 2 failing seeds (52)` + `needs: reply lost (...)`): How many failing seeds matched this cause, up to five sorted seed numbers, what class of deviation it took to trigger (with exact fault kinds listed — `reply lost` for same-process `timeout_after_commit` / `connection_reset_after_commit`, separate from `crash after commit` for `crash_after`), or `nominal path (0 faults, 0 model choices): a plain unit test catches this` printed last when zero faults and zero model choices triggered the failure.
+6. **Failure header** (`FAIL ... seed=52  invariant=at_most_once(payments.charge)`): The representative seed (fewest deviations in this cause) and the violated invariant.
+7. **Violation message** (`payments.charge happened 2 times for scope 'order:o1' (at most 1 allowed)`): Plain-language explanation from the invariant.
+8. **Shrink summary** (`minimized to 3 steps (2 of 3 deviations kept, 6 replays):`):
    - `3 steps`: total calls, approvals, claims, and model choices in the minimized trace.
    - `2 of 3 deviations kept`: delta debugging dropped 1 irrelevant deviation from seed 52 and kept 2. Why did it keep 2 instead of 1? In seed 52, `connection_reset_after_commit` was drawn on the second call (`fault:payments.charge#0.1`), which is only reached because the first call (`fault:payments.charge#0.0`) drew `timeout_after_commit` and triggered a retry. Removing `#0.0` stops `#0.1` from executing, so both keys stay in the 1-minimal set.
    - `6 replays`: how many replay runs `shape` executed to confirm and shrink this seed.
-8. **Incarnation header** (`incarnation 0`): Starts at `0`. Each process restart prints `incarnation 1 (restarted)`, `incarnation 2 (restarted)`, and so on. Under `duplicate_trigger=True`, incarnation 0 shows `(copy A of the duplicate delivery)` and `(copy B of the duplicate delivery)`.
-9. **Steps**:
+9. **Incarnation header** (`incarnation 0`): Starts at `0`. Each process restart prints `incarnation 1 (restarted)`, `incarnation 2 (restarted)`, and so on. Under `duplicate_trigger=True`, incarnation 0 shows `(copy A of the duplicate delivery)` and `(copy B of the duplicate delivery)`. If an adapter redelivered the request on restart (`on_restart="redeliver"`), the trace prints `harness redelivered the request (on_restart='redeliver')` on its own line right under the restarted incarnation header so you can tell harness-supplied redelivery from the app's own recovery.
+10. **Steps**:
    - Step 1: `PaymentClient.charge` ran with `idempotency_key='charge-o1'`. The effect landed, then `shape` injected `timeout_after_commit` so the caller saw `TimeoutError`.
    - Step 2: The retry loop caught `TimeoutError` and retried with the same key (`'charge-o1'`). That call landed (deduplicated to the same first effect because the key matched), then `shape` injected `connection_reset_after_commit` so the caller saw `ConnectionResetError`.
    - Step 3: The buggy `except ConnectionResetError:` branch retried with `idempotency_key=None`. Without a key, the provider created a second real charge.
-10. **Outcome line** (`finished`): The incarnation returned cleanly. Other endings are `-> process died` (killed by `crash_before` or `crash_after`), `process raised: <root cause>` (uncaught exception), or `killed after 30s without finishing` (hit the incarnation timeout).
-11. **Replay path** (`replay: runs/checkout_buggy/seed-52.min.json`): File you can pass to `--replay`.
+11. **Outcome line** (`finished`): The incarnation returned cleanly. Other endings are `-> process died` (killed by `crash_before` or `crash_after`), `process raised: <root cause>` (uncaught exception), or `killed after 30s without finishing` (hit the incarnation timeout).
+12. **Replay path** (`replay: runs/checkout_buggy/seed-52.min.json`): File you can pass to `--replay`.
 
 ### Crashes, restarts, exceptions, and model choices in a trace
 
@@ -165,5 +168,9 @@ Before filing a bug or changing production code, run through this checklist:
    Check that the `scope` string and the visible business `args` dict passed to `shape.approval(scope, args)` match the effect's visible arguments exactly (remember `HIDDEN_ARGS` and `hide=` are excluded from the effect hash). If the effect sits at a lower API layer with different argument names, pass `match=` to `approved_before`.
 9. **Did `exactly_once` fail on a polite user-facing refusal?**
    If your agent is supposed to give up and tell the user "I could not complete the refund" when the provider stays down, replace `exactly_once` with `at_most_once` + `claims_true()`.
-10. **Still unsure? Read `inc-<n>.out`.**
+10. **Did `scope assignment:` print a default-scope warning, or did two legitimate jobs collide?**
+    Provider fakes default to coarse heuristics (such as `to|subject` for SendGrid and SMTP) when `scope=` is omitted. Pass an explicit `scope=` callback to the fake or `@shape.effect` naming the business entity (such as `job_id` or `order_id`), and run CI with `--strict-scopes` (or `@shape.scenario(strict_scopes=True)`).
+11. **Does the trace say `harness redelivered the request (on_restart='redeliver')`?**
+    That duplicate came from the restarted incarnation redelivering the request under `on_restart="redeliver"`. Confirm your real app actually has an at-least-once queue or supervisor; if it does not, use `on_restart="none"` (the `shape.agents.drive` default) or pass your real recovery callable.
+12. **Still unsure? Read `inc-<n>.out`.**
     Open `runs/<scenario>/seed-<n>.min/inc-0.out` (and `inc-1.out`, etc.) to see full tracebacks, framework logs, and anything your scenario printed before dying.

@@ -91,7 +91,11 @@ with SqliteSaver.from_conn_string(str(run.dir / "ckpt.db")) as checkpointer:
 ```
 
 - On incarnation 0 (`run.restarts == 0`), `drive` calls `graph.invoke(input, config)`.
-- On restarts (`run.restarts > 0`), `drive` calls `graph.invoke(None, config)` to resume from the checkpointer.
+- On restarts (`run.restarts > 0`), `on_restart` controls recovery:
+  - `on_restart="resume"` (**default**): calls `graph.invoke(None, config)` to resume from the checkpointer. Resume-from-checkpoint is LangGraph's own recovery behavior, so it stays the LangGraph adapter default.
+  - `on_restart="none"`: does nothing and returns `None` (models a graph run without a supervisor or checkpoint recovery).
+  - `on_restart="redeliver"`: logs `harness redelivered the request (on_restart='redeliver')` in the trace and resends `input` to `graph.invoke(input, config)` (models an at-least-once queue).
+  - `on_restart=callable`: invokes `fn(run)` (sync, or async in `adrive`) for custom recovery logic.
 - `durability` is forwarded only when explicitly passed. Leaving `durability=None` tests LangGraph's own default (`"async"`).
 
 ### Dynamic `interrupt()` vs. static `interrupt_before`
@@ -136,16 +140,16 @@ Run:
 examples/langgraph/.venv/bin/shape test examples/langgraph/refund_agent.py --seeds 200 --jobs 4
 ```
 
-Without an idempotency key, `refund_repeat_unguarded` fails 37 of 200 seeds across 3 distinct causes. Cause 1 needs zero injected faults (the model repeats `issue_refund`), and cause 2 groups all three after-commit faults (`connection_reset_after_commit`, `crash_after`, `timeout_after_commit`) into one cause:
+Without an idempotency key, `refund_repeat_unguarded` fails 37 of 200 seeds across 4 distinct causes: cause 1 needs zero injected faults (the model repeats `issue_refund`), cause 2 groups reply-lost faults (`connection_reset_after_commit`, `timeout_after_commit`), cause 3 isolates `crash_after` (process died after the commit), and cause 4 is `crash_before` + model `'reissue'`:
 
 ```text
-3 distinct causes across 37 failing seeds
+4 distinct causes across 37 failing seeds
 
-cause 1 of 3: 19 of 37 failing seeds (4, 13, 20, 42, 49, ...)
+cause 1 of 4: 19 of 37 failing seeds (4, 13, 20, 42, 49, ...)
   needs: model choice
 FAIL examples/langgraph/refund_agent.py::refund_repeat_unguarded  seed=4  invariant=at_most_once(payments.refund)
   payments.refund happened 2 times for scope 'order:17' (at most 1 allowed)
-  minimized to 3 steps (1 of 1 deviations kept, 3 replays):
+  minimized to 3 steps (1 of 1 deviations kept, 2 replays):
     incarnation 0
       1. model chose 'repeat' at 'call 2: issue_refund' (nominal: issue_refund(order_id='17', amount_cents=4200))
       2. issue_refund(order_id='17', amount_cents=4200)
@@ -183,14 +187,14 @@ Run:
 examples/langgraph/.venv/bin/shape test examples/langgraph/retry_policy.py --seeds 200 --jobs 4
 ```
 
-LangGraph's default `RetryPolicy()` (`default_retry_on`) retries `ConnectionResetError`, `httpx.ReadTimeout`, and `requests.HTTPError` with status `402`. Without an idempotency key, an after-commit `httpx.ReadTimeout` double-charges inside a single incarnation (`retry_httpx_timeout`, cause 2 of 4):
+LangGraph's default `RetryPolicy()` (`default_retry_on`) retries `ConnectionResetError`, `httpx.ReadTimeout`, and `requests.HTTPError` with status `402`. Without an idempotency key, an after-commit `httpx.ReadTimeout` double-charges inside a single incarnation (`retry_httpx_timeout`, cause 2 of 6):
 
 ```text
-cause 2 of 4: 8 of 27 failing seeds (7, 32, 79, 86, 87, ...)
-  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, timeout_after_commit)
+cause 2 of 6: 8 of 27 failing seeds (7, 32, 79, 86, 87, ...)
+  needs: reply lost (commit landed, caller saw an error: connection_reset_after_commit, timeout_after_commit)
 FAIL examples/langgraph/retry_policy.py::retry_httpx_timeout  seed=7  invariant=at_most_once(payments.charge)
   payments.charge happened 2 times for scope 'order:ord-17' (at most 1 allowed)
-  minimized to 2 steps (1 of 1 deviations kept, 3 replays):
+  minimized to 2 steps (1 of 1 deviations kept, 2 replays):
     incarnation 0
       1. charge(order_id='ord-17', amount=5000, idempotency_key=None)
            effect landed, then timeout after commit: the caller saw ReadTimeout
@@ -242,21 +246,36 @@ Run:
 examples/langgraph/.venv/bin/shape test examples/langgraph/approval.py --seeds 200 --jobs 4
 ```
 
-`approved_before(transfers.send)` holds across every scenario (`approval_gate_only`, `approval_default`, `approval_sync_fixed`, and `approval_rejected` with `expect_effects=False`). However, `approval_default` fails `at_most_once(transfers.send)` on 21 of 200 seeds (all grouped into 1 cause covering `connection_reset_after_commit`, `crash_after`, and `timeout_after_commit`):
+`approved_before(transfers.send)` holds across every scenario (`approval_gate_only`, `approval_default`, `approval_sync_fixed`, and `approval_rejected` with `expect_effects=False`). However, `approval_default` fails `at_most_once(transfers.send)` on 21 of 200 seeds across 2 distinct causes: reply lost (`connection_reset_after_commit`, `timeout_after_commit`) and process crash after commit (`crash_after`):
 
 ```text
-1 distinct cause across 21 failing seeds
+2 distinct causes across 21 failing seeds
 
-cause 1 of 1: 21 of 21 failing seeds (37, 38, 40, 45, 49, ...)
-  needs: after-commit fault (the caller did not see the commit: connection_reset_after_commit, crash_after, timeout_after_commit)
+cause 1 of 2: 13 of 21 failing seeds (37, 38, 40, 45, 49, ...)
+  needs: reply lost (commit landed, caller saw an error: connection_reset_after_commit, timeout_after_commit)
 FAIL examples/langgraph/approval.py::approval_default  seed=37  invariant=at_most_once(transfers.send)
   transfers.send happened 2 times for scope 'order:ord-7' (at most 1 allowed)
-  minimized to 3 steps (1 of 1 deviations kept, 3 replays):
+  minimized to 3 steps (1 of 1 deviations kept, 2 replays):
     incarnation 0
       1. approval recorded for 'order:ord-7'
       2. send(order_id='ord-7', to='acct-42', amount=50000, idempotency_key=None)
            effect landed, then connection reset after commit: the caller saw ConnectionResetError
       process raised: ConnectionResetError: shape: injected connection_reset_after_commit
+    incarnation 1 (restarted)
+      3. send(order_id='ord-7', to='acct-42', amount=50000, idempotency_key=None)
+           effect landed
+      finished
+
+cause 2 of 2: 8 of 21 failing seeds (73, 93, 123, 127, 133, ...)
+  needs: crash after commit (process died after the commit: crash_after)
+FAIL examples/langgraph/approval.py::approval_default  seed=73  invariant=at_most_once(transfers.send)
+  transfers.send happened 2 times for scope 'order:ord-7' (at most 1 allowed)
+  minimized to 3 steps (1 of 1 deviations kept, 2 replays):
+    incarnation 0
+      1. approval recorded for 'order:ord-7'
+      2. send(order_id='ord-7', to='acct-42', amount=50000, idempotency_key=None)
+           effect landed, then process killed after the effect landed, before the caller saw it
+      -> process died
     incarnation 1 (restarted)
       3. send(order_id='ord-7', to='acct-42', amount=50000, idempotency_key=None)
            effect landed
