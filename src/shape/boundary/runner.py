@@ -627,7 +627,7 @@ def run_sweep(scen: api.Scenario, seeds: range, runs_dir: Path, jobs: int = 1, *
     failed = []
     defect_keys: dict[int, DefectKey] = {}
     for seed, invariant, op, scope, realized, stats in rows:
-        cov.add(stats)
+        cov.add(stats, seed)
         if invariant is not None:
             failed.append((seed, invariant, realized))
             defect_keys[seed] = DefectKey(invariant, op, scope_pattern(scope))
@@ -1242,6 +1242,8 @@ def check(scen: api.Scenario, seeds: int = 100, start: int = 0,
         return
     parts = [f"{len(swept.failing)} of {swept.seeds} seeds failed"
              + (f", {len(swept.flaky)} flaky" if swept.flaky else ""), swept.cov.render()]
+    if by_design := swept.cov.render_by_design():
+        parts.append(by_design)
     if scopes_text := swept.cov.render_scopes(scen.invariants):
         parts.append(scopes_text)
     if swept.failing:

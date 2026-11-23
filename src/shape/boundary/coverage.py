@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from collections.abc import Sequence
 from typing import Any
 
+from .failure import _TRIGGER_LABELS, fault_class
 from .faults import AFTER_COMMIT
 
 SCENARIO_OP = "(scenario)"  # the op that scenario-level faults (duplicate_trigger) are filed under
@@ -45,11 +46,12 @@ def of_run(world: Any, draws: list[dict]) -> dict:
             continue
         rule = e.get("scope_rule") or ""
         scopes[e["op"]].setdefault((source, rule), e["scope"])
-    by_design: dict[str, int] = {}
+    by_design: dict[str, dict] = {}
     for op, mode in world.delivery.items():
         if mode == "at-most-once":
             lost = {a["scope"] for a in world.attempts(op)} - {e["scope"] for e in world.effects(op)}
-            by_design[op] = 1 if lost else 0
+            hit = {fault_class(d["fault"]) for d in draws if d.get("op") == op and d.get("fault")}
+            by_design[op] = {"lost": bool(lost), "triggers": sorted(hit) if lost else []}
     return {
         "by_design": by_design,
         "effects": dict(Counter(e["op"] for e in world.effects())),
@@ -77,9 +79,10 @@ class Coverage:
         self.choices: Counter[str] = Counter()
         self.schedules: Counter[str] = Counter()
         self.scopes: dict[str, dict[tuple[str, str], str]] = defaultdict(dict)
-        self.by_design: Counter[str] = Counter()  # ops declared at-most-once -> seeds that lost one
+        # ops declared at-most-once: the seeds that lost one, and the fault classes behind it
+        self.by_design: dict[str, dict] = {}
 
-    def add(self, stats: dict) -> None:
+    def add(self, stats: dict, seed: int | None = None) -> None:
         self.seeds += 1
         self.effects.update(stats["effects"])
         self.attempts.update(stats["attempts"])
@@ -87,7 +90,11 @@ class Coverage:
         self.harness_errors.update(stats.get("harness_errors", {}))
         self.choices.update(stats["choices"])
         self.schedules.update(stats["schedules"])
-        self.by_design.update(stats.get("by_design", {}))
+        for op, row in stats.get("by_design", {}).items():
+            entry = self.by_design.setdefault(op, {"seeds": [], "triggers": Counter()})
+            if row["lost"]:
+                entry["seeds"].append(seed)
+                entry["triggers"].update(row["triggers"] or ["nominal"])
         for op, by_kind in stats["faults"].items():
             self.faults[op].update(by_kind)
         for op, items in stats.get("scopes", {}).items():
@@ -117,11 +124,28 @@ class Coverage:
         out.append(f"  model choices taken: {taken or 'none'}")
         taken = ", ".join(f"{k} x{n}" for k, n in sorted(self.schedules.items()))
         out.append(f"  interleaving choices taken: {taken or 'none'}")
-        if self.by_design:
-            out.append("by design (declared at-most-once, a lost effect is not a defect; "
-                       "a duplicate still fails):")
-            for op in sorted(self.by_design):
-                out.append(f"  {op}: lost in {self.by_design[op]} of {self.seeds} seeds")
+        return "\n".join(out)
+
+    def by_design_report(self) -> list[dict]:
+        """Each at-most-once op's losses, as the `--json` report carries them."""
+        return [{"op": op, "delivery": "at-most-once", "seeds": self.seeds,
+                 "lost_seeds": sorted(s for s in row["seeds"] if s is not None),
+                 "lost": len(row["seeds"]), "triggers": dict(sorted(row["triggers"].items()))}
+                for op, row in sorted(self.by_design.items())]
+
+    def render_by_design(self) -> str:
+        """Losses of effects declared at-most-once, apart from the coverage table and the
+        defects: a lost one is the design, so it is counted here and never fails a run."""
+        if not self.by_design:
+            return ""
+        out = [("by design (declared at-most-once, a lost effect is not a defect; "
+                "a duplicate still fails):")]
+        for row in self.by_design_report():
+            how = ", ".join(f"{_TRIGGER_LABELS[name]}: {n}" for name, n in row["triggers"].items())
+            example = f"e.g. seed {row['lost_seeds'][0]}" if row["lost_seeds"] else ""
+            detail = "; ".join(part for part in (how, example) if part)
+            out.append(f"  {row['op']}: lost in {row['lost']} of {row['seeds']} seeds"
+                       + (f" ({detail})" if detail else ""))
         return "\n".join(out)
 
     def render_scopes(self, invariants: Sequence[Any] = ()) -> str:

@@ -31,6 +31,7 @@ class Effect:
     hide: Sequence[str] = ()
     landed: Callable[..., Any] | None = None
     key_from_result: Callable[..., str | None] | None = None
+    delivery: str | None = None
 
 
 # Every option of `@shape.effect` is a field of `Effect`: unknown keys are rejected against the
