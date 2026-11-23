@@ -1,4 +1,6 @@
-# Boundary mode: test your own agent
+# Boundary mode: API reference
+
+> New to `shape`? Start with the [User Guide](guide/concepts.md) ([Invariants](guide/invariants.md), [Reading a trace](guide/reading-a-trace.md), [Plain Python](guide/plain-python.md), [LangGraph](guide/langgraph.md), [OpenAI Agents SDK](guide/openai-agents.md)). This document is the complete contract for boundary mode.
 
 Boundary mode tests agent code you already have, in any Python framework, without rewriting it. You mark the tool functions that have side effects. shape injects faults and real process crashes at those boundaries, records every real effect outside the agent process, checks invariants, and shrinks any failure to a minimal replayable trace.
 
@@ -192,7 +194,7 @@ Each fault is drawn independently, so a seed can crash or fail every incarnation
 
 ## What boundary mode does not control
 
-Threads, timers, and the model inside the agent process are not virtualized, and the simulation's `seal` (clock, random, socket guards) is not applied: your code and your test doubles run for real. Fault keys are per op and per incarnation, so a run is reproducible when the agent's sequence of calls to each op is reproducible, which holds for scripted models and sequential graphs. When a replay diverges, the report says so instead of claiming a minimal trace. Model control (scripted, replayed, or perturbed model outputs) is a separate wrapper and is not in the first version.
+Threads, timers, and the model inside the agent process are not virtualized, and the simulation's `seal` (clock, random, socket guards) is not applied: your code and your test doubles run for real. Fault keys are per op and per incarnation, so a run is reproducible when the agent's sequence of calls to each op is reproducible, which holds for scripted models and sequential graphs. When a replay diverges, the report says so instead of claiming a minimal trace. For deterministic model perturbations, use `shape.choose` directly or the scripted models in [docs/adapters.md](adapters.md).
 
 ## Reading the output
 
