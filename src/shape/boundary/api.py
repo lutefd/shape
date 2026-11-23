@@ -158,7 +158,8 @@ class _Context:
         self.world.close()
         self.realized.close()
 
-    def choose(self, label: str, options: Sequence[Any], weights: Sequence[float] | None) -> int:
+    def choose(self, label: str, options: Sequence[Any], weights: Sequence[float] | None,
+               nominal: str | None = None) -> int:
         """Draw which of `options` the untrusted input picks at this point. 0 is nominal."""
         w = list(weights) if weights is not None else [NOMINAL_WEIGHT] + [1.0] * (len(options) - 1)
         if len(w) != len(options):
@@ -173,7 +174,7 @@ class _Context:
                 self.seq += 1
                 self.realized.write({
                     "key": draw_key, "value": value, "choice": label,
-                    "chosen": _short(options[value]), "nominal": _short(options[0]),
+                    "chosen": _short(options[value]), "nominal": nominal or _short(options[0]),
                     "actor": self.actor, "inc": self.incarnation, "twin": self.twin,
                     "seq": self.seq})
         return value
@@ -297,14 +298,17 @@ def effect(op: str, *, scope: Callable[..., str] | None = None,
     return wrap
 
 
-def choose(label: str, options: Sequence[Any], weights: Sequence[float] | None = None) -> Any:
+def choose(label: str, options: Sequence[Any], weights: Sequence[float] | None = None,
+           nominal: str | None = None) -> Any:
     """Let shape pick what an untrusted input does here, usually your scripted model.
 
     `options[0]` is the nominal choice: what a well-behaved model would do. Inside a shape run,
     each seed may pick another option instead, and a failure shrinks back toward `options[0]`
     for every choice that was not needed to reproduce it. Outside a run, and on the last,
     fault-free incarnation, it returns `options[0]`. `weights` defaults to the nominal option
-    being 10 times as likely as each alternative.
+    being 10 times as likely as each alternative. `nominal` is how the trace names `options[0]`
+    when its own text would not say what the model was supposed to do (the planned tool call,
+    say); by default the option's repr is shown.
 
         action = shape.choose("after_tool_error", ["retry_once", "give_up", "retry_twice"])
     """
@@ -313,7 +317,7 @@ def choose(label: str, options: Sequence[Any], weights: Sequence[float] | None =
     ctx = _active
     if ctx is None or len(options) == 1:
         return options[0]
-    return options[ctx.choose(label, options, weights)]
+    return options[ctx.choose(label, options, weights, nominal)]
 
 
 def claim(scope: str, op: str) -> None:
