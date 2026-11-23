@@ -62,7 +62,7 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    if name in ("langgraph", "agents"):
+    if name in ("langgraph", "agents", "fakes"):
         import importlib
         return importlib.import_module(f".{name}", __name__)
     raise AttributeError(f"module 'shape' has no attribute {name!r}")
