@@ -3,6 +3,7 @@ It re-imports the scenario's file, then runs one incarnation exactly like a fork
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -15,10 +16,13 @@ from . import api, runner
 def load_module(path: str | Path):
     path = Path(path).resolve()
     if str(path.parent) not in sys.path:
-        sys.path.insert(0, str(path.parent))
-    spec = importlib.util.spec_from_file_location(path.stem, path)
+        sys.path.append(str(path.parent))
+    # A scenario can have the same filename as the installed client it exercises.
+    suffix = hashlib.blake2s(os.fsencode(path), digest_size=8).hexdigest()
+    name = f"_shape_scenario_{path.stem}_{suffix}"
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
-    sys.modules[path.stem] = module
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 

@@ -131,6 +131,13 @@ def _load_scenarios(path: str) -> dict | None:
 def cmd_test(args: argparse.Namespace) -> int:
     from .boundary import runner
 
+    try:
+        deadline = runner.deadline_for(args.budget)
+        if args.max_shrinks is not None and args.max_shrinks < 0:
+            raise ValueError("max-shrinks must be non-negative")
+    except ValueError as exc:
+        print(f"shape: {exc}", file=sys.stderr)
+        return 2
     path, _, name = args.target.partition("::")
     found = _load_scenarios(path)
     if found is None:
@@ -152,18 +159,21 @@ def cmd_test(args: argparse.Namespace) -> int:
         return code
     failed = False
     for scen in chosen.values():
-        swept = runner.run_sweep(scen, range(args.start, args.start + args.seeds), runs, args.jobs)
+        swept = runner.run_sweep(scen, range(args.start, args.start + args.seeds), runs, args.jobs,
+                                 deadline=deadline)
         flaky = f"  flaky={len(swept.flaky)}" if swept.flaky else ""
-        print(f"scenario={scen.name}  seeds={args.seeds} (from {args.start})  "
+        print(f"scenario={scen.name}  seeds={swept.seeds} (from {args.start})  "
               f"failing={len(swept.failing)}{flaky}  wall={swept.wall:.2f}s  "
-              f"{args.seeds / swept.wall:.0f} seeds/s")
+              f"{swept.seeds / swept.wall:.0f} seeds/s")
         print(swept.cov.render())
         print("\n".join(swept.notes(scen)), end="\n" if swept.notes(scen) else "")
         problems = swept.problems(scen)
         if swept.failing:
             target = f"{path}::{scen.name}"
+            limit = runner.MAX_INVESTIGATED if args.max_shrinks is None else args.max_shrinks
             print(runner.investigate_all(scen, swept.failing, runs, target,
-                                         failing_ops=swept.failing_ops).render())
+                                         limit=limit, failing_ops=swept.failing_ops,
+                                         deadline=deadline).render())
         if swept.flaky:
             print(runner.render_flaky(swept.flaky))
         print("\n".join(problems), end="\n" if problems else "")
@@ -183,6 +193,10 @@ def main(argv: list[str] | None = None) -> int:
     test.add_argument("--start", type=int, default=0)
     test.add_argument("--replay", help="replay a saved .min.json instead of running seeds")
     test.add_argument("--jobs", type=int, default=1, help="seeds to run in parallel")
+    test.add_argument("--budget", type=float, metavar="SECONDS",
+                      help="wall time for seeds, confirmations and shrinking")
+    test.add_argument("--max-shrinks", type=int, metavar="N",
+                      help="maximum failing seeds to minimize (default: 200)")
     test.add_argument("--runs-dir", default="runs")
     test.set_defaults(fn=cmd_test)
     run = sub.add_parser("run", help="run many seeds, shrink the first failure of each kind")

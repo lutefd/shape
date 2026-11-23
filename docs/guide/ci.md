@@ -47,7 +47,9 @@ Practical defaults:
 - **On every pull request:** `--seeds 200 --jobs 4` (or `300` for agents with many tool calls and model perturbations). Always start from `--start 0` so PR runs are deterministic and comparable.
 - **On a nightly schedule:** `--seeds 2000 --jobs 4` with a rotating `--start` (for example `--start $(( $(date +%j) * 2000 ))`) so each night explores fresh seeds.
 
-`--jobs J` forks `J` worker processes on Unix and produces the exact same report as `--jobs 1`. On platforms without `os.fork`, `shape` falls back to serial execution automatically.
+`--jobs J` forks workers on Unix. On platforms without `os.fork`, shape runs seeds serially. With a fixed seed set and no time budget, both modes inspect the same seeds.
+
+Use `--budget 30 --max-shrinks 10` to limit time and shrinking in a PR job. The budget covers seed execution, failure confirmation, and shrinking. Shape reports skipped seeds, confirmations, and shrinks. An incomplete seed sweep exits 1. `--max-shrinks 0` keeps original failing runs and skips minimization.
 
 ## Exit codes
 
@@ -56,7 +58,7 @@ Practical defaults:
 | Exit code | Meaning |
 | --- | --- |
 | `0` | Every selected scenario passed with zero failures, zero flaky seeds, and at least one effect called (unless `expect_effects=False`). |
-| `1` | At least one scenario failed an invariant, reported a `FLAKY` seed, or failed with `NOTHING TESTED`. |
+| `1` | At least one scenario failed an invariant, reported a `FLAKY` seed, or reported `NOTHING TESTED` or `INCOMPLETE`. |
 | `2` | Target file missing, syntax or import error in the scenario module, or named scenario not found. Set `SHAPE_TRACEBACK=1` to see the full import traceback. |
 | `141` | Stdout pipe closed early (for example `shape test ... \| head -1`). Prints nothing to stderr. |
 
@@ -70,7 +72,7 @@ Practical defaults:
 
 ## Running from `pytest`
 
-Call `shape.check(scenario, seeds=200, start=0, runs_dir=tmp_path, jobs=1)` inside a regular pytest function. Pass `jobs=4` for parallel forked execution on Unix. When a seed fails, is flaky, or hits `NOTHING TESTED`, `shape.check` raises `AssertionError` containing the coverage table and minimized traces.
+Call `shape.check(scenario, seeds=200, start=0, runs_dir=tmp_path, jobs=1)` inside a regular pytest function. Pass `jobs=4` for parallel forked execution on Unix. The matching limits are `budget=30` and `max_shrinks=10`. When the sweep fails or is incomplete, `shape.check` raises `AssertionError` with coverage and the findings it recorded.
 
 [`docs/guide/examples/test_async_agent.py`](examples/test_async_agent.py):
 

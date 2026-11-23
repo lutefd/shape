@@ -4,7 +4,7 @@
 
 ## Effects, ops, scopes, and keys
 
-An **effect** is a call that changes something outside the agent process: charging a card, sending an email, issuing a refund, or writing to an external API. You mark the function that performs it with `@shape.effect`:
+An **effect** is a call that changes something outside the agent process: charging a card, sending an email, issuing a refund, or writing to an external API. With [network capture](../boundary.md#network-capture), shape detects writes at the HTTP, SMTP, and IMAP transports. You can also mark a function with `@shape.effect`:
 
 ```python
 @shape.effect(

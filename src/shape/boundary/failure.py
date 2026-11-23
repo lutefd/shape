@@ -189,14 +189,17 @@ class Report:
     failing: int
     causes: list[Cause]
     skipped: int = 0  # failing seeds beyond the investigation limit
+    budget_skipped: int = 0
 
     def render(self) -> str:
         n = len(self.causes)
         word = "cause" if n == 1 else "causes"
         out = [f"{n} distinct {word} across {self.failing} failing seeds"]
         if self.skipped:
-            out.append(f"({self.skipped} more failing seeds were not minimized; the ones with the "
-                       f"fewest deviations were)")
+            out.append(f"({self.skipped} more failing seeds were not minimized due to max_shrinks)")
+        if self.budget_skipped:
+            out.append(f"({self.budget_skipped} more failing seeds were not minimized "
+                       "because the time budget expired)")
         for i, cause in enumerate(self.causes, 1):
             ordered = sorted(cause.seeds)
             seen = ", ".join(map(str, ordered[:5])) + (", ..." if len(ordered) > 5 else "")

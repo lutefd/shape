@@ -95,6 +95,18 @@ class EffectSpec:
 
 
 @dataclass(frozen=True)
+class _PendingEffect:
+    spec: EffectSpec
+    shown: dict[str, Any]
+    all_args: Mapping[str, Any]
+    call: str
+    scope: str
+    key: str | None
+    fault: str | None
+    error: Exception | None
+
+
+@dataclass(frozen=True)
 class Actor:
     """A function the parent process calls between incarnations to change the user's world."""
 
@@ -117,6 +129,7 @@ class Scenario:
     duplicate_trigger: bool = False
     expect_effects: bool = True
     concurrent: Sequence[Callable[[Run], None]] = ()
+    net: Sequence[Any] | None = None
 
     def __call__(self, run: Run) -> None:
         self.fn(run)
@@ -125,11 +138,20 @@ class Scenario:
 def scenario(fn: Callable[[Run], None] | None = None, *, invariants: Sequence[Any] = (),
              max_restarts: int = 3, actors: Sequence[Actor] = (),
              duplicate_trigger: bool = False, expect_effects: bool = True,
-             concurrent: Sequence[Callable[[Run], None]] = ()) -> Any:
+             concurrent: Sequence[Callable[[Run], None]] = (),
+             net: Sequence[Any] | None = None) -> Any:
     def wrap(f: Callable[[Run], None]) -> Scenario:
-        return Scenario(f, f.__name__, tuple(invariants), max_restarts,
+        checks = tuple(invariants)
+        if net is not None:
+            from ..net import _providers
+
+            fakes = tuple(net)
+            _providers(fakes)
+            checks += tuple(check for fake in fakes for check in fake.invariants())
+        return Scenario(f, f.__name__, checks, max_restarts,
                         inspect.getsourcefile(f) or "", f.__module__, tuple(actors),
-                        duplicate_trigger, expect_effects, tuple(concurrent))
+                        duplicate_trigger, expect_effects, tuple(concurrent),
+                        None if net is None else fakes)
     return wrap(fn) if fn is not None else wrap
 
 
@@ -271,7 +293,7 @@ class _Context:
 
     def __init__(self, workdir: Path, incarnation: int, choices: ChoiceSource,
                  quiet: bool = False, twin: int = 0, actors: bool = False, *,
-                 gate: Gate | None = None, actor_slot: int = 0) -> None:
+                 gate: Gate | None = None, actor_slot: int = 0, sync_logs: bool = True) -> None:
         self.incarnation = incarnation
         self.twin = twin  # 1 for the duplicate delivery of incarnation 0
         self.actors = actors  # the parent's context for world actors: choices, no faults
@@ -286,9 +308,10 @@ class _Context:
         self.choices = choices
         self.lock = threading.Lock()
         self.counts: Counter[str] = Counter()
+        self.async_points: dict[asyncio.Task, str] = {}
         self.seq = PARENT_SEQ + 1 if actors else 0
-        self.world = JsonlWriter(workdir / WORLD)
-        self.realized = JsonlWriter(workdir / REALIZED)
+        self.world = JsonlWriter(workdir / WORLD, fsync=sync_logs)
+        self.realized = JsonlWriter(workdir / REALIZED, fsync=sync_logs)
         self.weights = [NOMINAL_WEIGHT] + [1.0 if choices.enabled(f) else 0.0 for f in FAULTS]
 
     def append(self, writer: JsonlWriter, entry: dict) -> None:
@@ -337,12 +360,18 @@ class _Context:
             if index:
                 self._append(self.realized, {
                     "key": key, "value": index, "schedule": "tasks",
-                    "chosen": f"callback {index} ({_callback_name(ready[index])})",
-                    "nominal": f"callback 0 ({_callback_name(ready[0])})"})
+                    "chosen": self._task_label(index, ready[index]),
+                    "nominal": self._task_label(0, ready[0])})
         return index
 
+    def _task_label(self, index: int, handle: asyncio.Handle) -> str:
+        task = getattr(handle._callback, "__self__", None)
+        label = self.async_points.get(task) if isinstance(task, asyncio.Task) else None
+        point = f" at {label!r}" if label else ""
+        return f"callback {index} ({_callback_name(handle)}){point}"
+
     def before(self, spec: EffectSpec, fn: Callable, sig: inspect.Signature,
-               args: tuple, kwargs: dict) -> tuple | None:
+               args: tuple, kwargs: dict) -> _PendingEffect | None:
         """Draw this call's fault and apply the ones that fire before the function runs. Returns
         what `after` needs, or None when the call is malformed (the function raises its own error)."""
         named = _named_args(sig, args, kwargs)
@@ -366,6 +395,10 @@ class _Context:
             _call_args_hook(self, "key", spec.key, spec.op, named, extra)
             if spec.key else None
         )
+        return self.begin(spec, shown, all_args, call, scope, key)
+
+    def begin(self, spec: EffectSpec, shown: dict, all_args: Mapping[str, Any],
+              call: str, scope: str, key: str | None) -> _PendingEffect:
         with self.lock:
             n = self.counts[spec.op]
             self.counts[spec.op] += 1
@@ -378,41 +411,48 @@ class _Context:
             if fault:
                 self._append(self.realized, {
                     "key": draw_key, "value": value, "fault": fault, "op": spec.op, "call": call,
-                    "raised": type(error).__name__ if error else None})
+                    "raised": (getattr(error, "__shape_fault_label__", type(error).__name__)
+                               if error is not None else None)})
         self.append(self.world, {"kind": "attempt", "op": spec.op, "scope": scope, "call": call,
                                  "fault": fault})
         if fault == "crash_before":
             os._exit(CRASH_EXIT)
         if error is not None and fault not in AFTER_COMMIT:
             raise error
-        return spec, shown, all_args, call, scope, key, fault, error
+        return _PendingEffect(spec, shown, all_args, call, scope, key, fault, error)
 
-    def after(self, pending: tuple, value: Any) -> None:
+    def after(self, pending: _PendingEffect, value: Any) -> None:
         """Record the effect that just landed, then apply the faults that fire after it."""
-        spec, shown, all_args, call, scope, key, fault, error = pending
+        spec, call, scope, key = pending.spec, pending.call, pending.scope, pending.key
         if spec.landed is not None:
             is_landed = bool(
-                _call_result_hook(self, "landed", spec.landed, spec.op, value, all_args)
+                _call_result_hook(self, "landed", spec.landed, spec.op, value, pending.all_args)
             )
             if not is_landed:
-                self.append(self.world, {
-                    "kind": "no_effect", "op": spec.op, "scope": scope, "call": call,
-                })
+                self.without_effect(spec.op, scope, call)
                 return
         if key is None and spec.key_from_result is not None:
             derived = _call_result_hook(
-                self, "key_from_result", spec.key_from_result, spec.op, value, all_args
+                self, "key_from_result", spec.key_from_result, spec.op, value, pending.all_args
             )
             if derived is not None:
                 key = derived
         res = (
-            _call_result_hook(self, "result", spec.result, spec.op, value, all_args)
+            _call_result_hook(self, "result", spec.result, spec.op, value, pending.all_args)
             if spec.result is not None else None
         )
+        self.record_effect(pending, spec.op, scope, key, spec.irreversible, res)
+
+    def without_effect(self, op: str, scope: str, call: str) -> None:
+        self.append(self.world, {"kind": "no_effect", "op": op, "scope": scope, "call": call})
+
+    def record_effect(self, pending: _PendingEffect, op: str, scope: str, key: str | None,
+                      irreversible: bool, result: Any) -> None:
+        fault, error = pending.fault, pending.error
         self.append(self.world, {
-            "kind": "effect", "op": spec.op, "scope": scope, "key": key, "call": call,
-            "irreversible": spec.irreversible, "idempotent": spec.idempotent, "args": shown,
-            "args_hash": args_hash(shown), "result": res,
+            "kind": "effect", "op": op, "scope": scope, "key": key, "call": pending.call,
+            "irreversible": irreversible, "idempotent": pending.spec.idempotent,
+            "args": pending.shown, "args_hash": args_hash(pending.shown), "result": result,
             "fault": fault, "raised": type(error).__name__ if error else None})
         if fault == "crash_after":
             os._exit(CRASH_EXIT)
@@ -453,6 +493,17 @@ def point(label: str) -> None:
     ctx = _active
     if ctx is not None and ctx.gate is not None:
         ctx.gate.point(label, show=True)
+
+
+async def _async_point(label: str) -> None:
+    task = asyncio.current_task()
+    ctx = _active
+    if ctx is not None and task is not None:
+        ctx.async_points[task] = label
+        try:
+            await asyncio.sleep(0)
+        finally:
+            ctx.async_points.pop(task, None)
 
 
 def run_async[T](coro: Coroutine[Any, Any, T]) -> T:
