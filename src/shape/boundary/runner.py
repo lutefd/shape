@@ -21,8 +21,17 @@ from pathlib import Path
 from ..choices import ChoiceSource, ExplicitChoices, SeededChoices
 from ..shrink import shrink
 from . import api, coverage, recovery, schedule
-from .failure import Defect, DefectKey, Failure, Report, scope_pattern, trigger_classes
-from .faults import CRASH_EXIT, DUPLICATE_KEY, DUPLICATE_TRIGGER, FAULT_TEXT
+from .failure import (
+    Defect,
+    DefectKey,
+    Failure,
+    Report,
+    describe_triggers,
+    fault_class,
+    scope_pattern,
+    trigger_classes,
+)
+from .faults import CRASH_EXIT, DUPLICATE_KEY, DUPLICATE_TRIGGER, FAULT_TEXT, FAULTS
 from .invariants import Violation, World, check_strict_scope, scenario_terminates
 from .log import PARENT_SEQ, REALIZED, WORLD, JsonlWriter, event_order, read_jsonl
 from .rootcause import describe
@@ -324,15 +333,33 @@ def run_seed(scen: api.Scenario, seed: int, runs_dir: Path, *,
         raise
     shutil.rmtree(base / f"seed-{seed}.min", ignore_errors=True)
     (base / f"seed-{seed}.min.json").unlink(missing_ok=True)
+    (base / f"seed-{seed}.nominal.min.json").unlink(missing_ok=True)
     if out.ok:
         shutil.rmtree(work, ignore_errors=True)
         shutil.rmtree(base / f"seed-{seed}", ignore_errors=True)
+        shutil.rmtree(base / "flaky" / f"seed-{seed}", ignore_errors=True)
     else:
         kept = base / f"seed-{seed}"
         shutil.rmtree(kept, ignore_errors=True)
         work.rename(kept)
         out.dir = kept
     return out
+
+
+@dataclass
+class FlakyDetail:
+    seed: int
+    dir: Path
+    runs: int
+    divergence: str | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "seed": self.seed,
+            "dir": str(self.dir),
+            "runs": self.runs,
+            "divergence": self.divergence,
+        }
 
 
 @dataclass
@@ -345,6 +372,7 @@ class Sweep:
     defect_keys: dict[int, DefectKey] = field(default_factory=dict)
     skipped_seeds: int = 0
     unconfirmed: list[int] = field(default_factory=list)
+    flaky_details: dict[int, FlakyDetail] = field(default_factory=dict)
 
     def problems(self, scen: api.Scenario) -> list[str]:
         """Reasons a sweep that found no failure still proved nothing."""
@@ -390,19 +418,99 @@ class Sweep:
                 for op in coverage.never_ran(self.cov, ops)]
 
 
-def _reproduces(scen: api.Scenario, seed: int, invariant: str, runs_dir: Path,
-                deadline: float | None) -> bool:
-    work = runs_dir / scen.name / f".rerun-{os.getpid()}-{seed}"
+def _first_divergence(run_a: Path, run_b: Path, label_a: str, label_b: str,
+                      inv_a: str, invs_b: list[str]) -> str:
+    """Describe the first observable difference between two runs of the same seed."""
+    story_a, _ = story(read_story(run_a))
+    story_b, _ = story(read_story(run_b))
+    for i in range(max(len(story_a), len(story_b))):
+        la = story_a[i].strip() if i < len(story_a) else "<end of trace>"
+        lb = story_b[i].strip() if i < len(story_b) else "<end of trace>"
+        if la != lb:
+            return (f"first divergence ({label_a} vs {label_b}): "
+                    f"{label_a} had {la!r}, {label_b} had {lb!r}")
+    draws_a = {d["key"]: d["value"] for d in _read_draws(run_a)}
+    draws_b = {d["key"]: d["value"] for d in _read_draws(run_b)}
+    for k in sorted(set(draws_a) | set(draws_b)):
+        if draws_a.get(k) != draws_b.get(k):
+            return (f"first divergence ({label_a} vs {label_b}): "
+                    f"draw {k!r} was {draws_a.get(k)!r} in {label_a}, "
+                    f"{draws_b.get(k)!r} in {label_b}")
+    outs = sorted({p.name for p in run_a.glob("inc-*.out")}
+                  | {p.name for p in run_b.glob("inc-*.out")})
+    for name in outs:
+        pa, pb = run_a / name, run_b / name
+        ta = pa.read_text(errors="replace").splitlines() if pa.exists() else []
+        tb = pb.read_text(errors="replace").splitlines() if pb.exists() else []
+        for lineno in range(max(len(ta), len(tb))):
+            la = ta[lineno] if lineno < len(ta) else "<eof>"
+            lb = tb[lineno] if lineno < len(tb) else "<eof>"
+            if la != lb:
+                return (f"first divergence ({label_a} vs {label_b}, {name}:{lineno + 1}): "
+                        f"{label_a} had {la!r}, {label_b} had {lb!r}")
+    outcome_b = f"violated {', '.join(invs_b)}" if invs_b else "passed"
+    return (f"first divergence ({label_a} vs {label_b}): identical traces, "
+            f"but {label_a} violated {inv_a} while {label_b} {outcome_b}")
+
+
+def _save_flaky_runs(base: Path, seed: int, temp_dirs: list[Path], diverged_at: int,
+                     invariant: str, rerun_violations: list[list[str]]) -> dict:
+    flaky_dir = base / "flaky" / f"seed-{seed}"
+    shutil.rmtree(flaky_dir, ignore_errors=True)
+    flaky_dir.mkdir(parents=True, exist_ok=True)
+    initial = base / f"seed-{seed}"
+    run0 = flaky_dir / "run-0"
+    if initial.exists():
+        shutil.copytree(initial, run0)
+    saved = 0
+    for k, work in enumerate(temp_dirs, 1):
+        if work.exists() and (work / WORLD).exists():
+            work.rename(flaky_dir / f"run-{k}")
+            saved += 1
+    divergence = _first_divergence(
+        run0, flaky_dir / f"run-{diverged_at}",
+        "run-0", f"run-{diverged_at}",
+        invariant, rerun_violations[diverged_at - 1],
+    )
+    return {
+        "seed": seed,
+        "dir": str(flaky_dir),
+        "runs": saved + 1,
+        "divergence": divergence,
+    }
+
+
+def _confirm_seed(scen: api.Scenario, seed: int, invariant: str, runs_dir: Path,
+                  deadline: float | None) -> tuple[bool, dict | None]:
+    base = runs_dir / scen.name
+    temp_dirs: list[Path] = []
+    rerun_violations: list[list[str]] = []
+    diverged_at: int | None = None
     try:
-        for _ in range(RERUNS):
+        for k in range(1, RERUNS + 1):
+            work = base / f".rerun-{os.getpid()}-{seed}-{k}"
+            temp_dirs.append(work)
             # A killed process leaves unbuffered writes in the kernel page cache.
             out = execute(scen, {"seed": seed, "sync_logs": False}, work, deadline=deadline,
                           collect_stats=False)
-            if not out.violated(invariant):
-                return False
-        return True
+            rerun_violations.append([v.invariant for v in out.violations])
+            if diverged_at is None and not out.violated(invariant):
+                diverged_at = k
+        if diverged_at is None:
+            return True, None
+        detail = _save_flaky_runs(base, seed, temp_dirs, diverged_at, invariant, rerun_violations)
+        temp_dirs.clear()
+        return False, detail
+    except BudgetExpired:
+        if diverged_at is not None:
+            detail = _save_flaky_runs(base, seed, temp_dirs, diverged_at, invariant,
+                                      rerun_violations)
+            temp_dirs.clear()
+            return False, detail
+        raise
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        for work in temp_dirs:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def run_sweep(scen: api.Scenario, seeds: range, runs_dir: Path, jobs: int = 1, *,
@@ -435,18 +543,30 @@ def run_sweep(scen: api.Scenario, seeds: range, runs_dir: Path, jobs: int = 1, *
     again = {seed: invariant for seed, invariant, _ in failed}
 
     def rerun(seed: int) -> list:
-        return [seed, _reproduces(scen, seed, again[seed], runs_dir, deadline)]
+        ok, detail = _confirm_seed(scen, seed, again[seed], runs_dir, deadline)
+        return [seed, ok, detail]
 
-    verdicts = dict(_run_batch(list(again), jobs, rerun))
+    rerun_rows = _run_batch(list(again), jobs, rerun)
+    verdicts = {seed: ok for seed, ok, _ in rerun_rows}
+    flaky_details = {
+        seed: FlakyDetail(
+            seed=detail["seed"], dir=Path(detail["dir"]),
+            runs=detail["runs"], divergence=detail["divergence"],
+        )
+        for seed, ok, detail in rerun_rows
+        if ok is False and detail is not None
+    }
     failing = [f for f in failed if verdicts.get(f[0]) is True]
     flaky = [seed for seed in again if verdicts.get(seed) is False]
     unconfirmed = [seed for seed in again if seed not in verdicts]
     defect_keys = {seed: defect_keys[seed] for seed, _, _ in failing}
     if not failing and not flaky:
         with contextlib.suppress(OSError):
+            (runs_dir / scen.name / "flaky").rmdir()
+        with contextlib.suppress(OSError):
             (runs_dir / scen.name).rmdir()
     return Sweep(len(rows), failing, flaky, cov, time.perf_counter() - started, defect_keys,
-                 len(seeds) - len(rows), unconfirmed)
+                 len(seeds) - len(rows), unconfirmed, flaky_details)
 
 
 def sweep(scen: api.Scenario, seeds: range, runs_dir: Path,
@@ -571,43 +691,165 @@ def _consumed(spec_keys: dict[str, int], out: Outcome) -> bool:
     return all(k in out.realized for k in spec_keys)
 
 
-def investigate(scen: api.Scenario, seed: int, invariant: str, realized: dict[str, int],
-                runs_dir: Path, target: str, *, key: DefectKey | None = None,
-                deadline: float | None = None) -> Failure:
-    """Confirm a failing seed by replay, shrink it, and describe the minimal run."""
+def _failure_signature(outcome: Outcome, violation: Violation) -> tuple:
+    """Fingerprint how a defect failed, to tell nominal failures apart from fault-driven ones."""
+    if violation.invariant.startswith(("approved_before(", "requires(", "within_scopes(")):
+        return (violation.message,)
+    op = violation.op
+    raw_effects = [
+        e for e in outcome.entries
+        if e["kind"] == "effect" and (op is None or e["op"] == op)
+    ]
+    if raw_effects:
+        base_inc = raw_effects[0]["inc"]
+        effects = tuple(
+            (e["inc"] - base_inc, e["op"], e["scope"], e["call"])
+            for e in raw_effects
+        )
+        attempts = ()
+    else:
+        raw_attempts = [
+            e for e in outcome.entries
+            if e["kind"] == "attempt" and (op is None or e["op"] == op)
+        ]
+        base_inc = raw_attempts[0]["inc"] if raw_attempts else 0
+        effects = ()
+        attempts = tuple(
+            (e["inc"] - base_inc, e["op"], e["scope"], e["call"])
+            for e in raw_attempts
+        )
+    incarnations = () if outcome.completed else tuple(
+        (e["inc"], e["how"])
+        for e in outcome.entries
+        if e["kind"] == "incarnation"
+    )
+    return (violation.message, effects, attempts, incarnations)
+
+
+def _raw_triggers(realized: dict[str, int]) -> dict[str, set[str]]:
+    """Derive trigger classes directly from a realized map before shrinking."""
+    classes: dict[str, set[str]] = {}
+    for key, value in realized.items():
+        if key.startswith(("id:", "jitter:")):
+            continue
+        if key == DUPLICATE_KEY:
+            classes.setdefault("duplicate_trigger", set())
+        elif key.startswith("model:"):
+            classes.setdefault("model", set())
+        elif key.startswith("sched:"):
+            classes.setdefault("interleaving", set())
+        elif key.startswith("fault:") and 1 <= value <= len(FAULTS):
+            fault = FAULTS[value - 1]
+            classes.setdefault(fault_class(fault), set()).add(fault)
+    return classes or {"nominal": set()}
+
+
+def _rep_seeds(defect: Defect) -> set[int]:
+    seeds = {t.failure.seed for t in defect.triggers.values()}
+    if defect.failure is not None:
+        seeds.add(defect.failure.seed)
+    return seeds
+
+
+def _write_replay_json(path: Path, scen: api.Scenario, found: DefectKey, seed: int,
+                       realized: dict[str, int], *, reproduces: bool = True) -> None:
+    path.write_text(json.dumps({
+        "scenario": scen.name, "file": scen.file, **dataclasses.asdict(found), "seed": seed,
+        "realized": realized, "reproduces": reproduces,
+    }, indent=2))
+
+
+def _shrink_confirmed(
+    scen: api.Scenario,
+    seed: int,
+    invariant: str,
+    realized: dict[str, int],
+    runs_dir: Path,
+    target: str,
+    key: DefectKey,
+    first: Outcome,
+    first_v: Violation,
+    *,
+    deadline: float | None = None,
+    avoid_signature: tuple | None = None,
+    replay_path: Path | None = None,
+    final_dir: Path | None = None,
+) -> tuple[Failure, Outcome, Violation | None, dict[str, int]]:
+    """Shrink an already-confirmed failing seed and verify the minimal replay."""
     base = runs_dir / scen.name
     kept = base / f"seed-{seed}"
     work = base / f".shrink-{os.getpid()}"
-    final_dir = base / f"seed-{seed}.min"
-    replays = 0
+    out_dir = final_dir if final_dir is not None else base / f"seed-{seed}.min"
+    path = replay_path if replay_path is not None else base / f"seed-{seed}.min.json"
+    replays = 1  # `first` was the confirmation replay
 
     def matching(outcome: Outcome) -> Violation | None:
         return next((v for v in outcome.violations if v.invariant == invariant
-                     and (key is None or DefectKey.from_violation(v) == key)), None)
+                     and DefectKey.from_violation(v) == key), None)
 
     def fails(candidate: dict[str, int]) -> bool:
         nonlocal replays
         replays += 1
         outcome = execute(scen, {"explicit": candidate, "seed": seed, "sync_logs": False},
                           work, deadline=deadline, collect_stats=False)
-        return matching(outcome) is not None and _consumed(candidate, outcome)
+        v = matching(outcome)
+        if v is None or not _consumed(candidate, outcome):
+            return False
+        return avoid_signature is None or _failure_signature(outcome, v) != avoid_signature
 
-    def failure(entries: list[dict], message: str, small: dict[str, int],
-                problem: str | None = None) -> Failure:
-        path = base / f"seed-{seed}.min.json"
-        found = key or DefectKey(invariant, None, None)
-        path.write_text(json.dumps({
-            "scenario": scen.name, "file": scen.file, **dataclasses.asdict(found), "seed": seed,
-            "realized": small, "reproduces": problem is None}, indent=2))
+    def build_failure(entries: list[dict], message: str, small: dict[str, int],
+                      problem: str | None = None) -> Failure:
         trace, steps = story(entries)
-        return Failure(target, seed, found, message, trace, steps, len(small),
-                       len(realized), replays, path, problem,
-                       trigger_classes(entries) if problem is None else {})
+        return Failure(
+            target, seed, key, message, trace, steps, len(small), len(realized), replays, path,
+            problem,
+            trigger_classes(entries) if problem is None else {},
+            describe_triggers(entries) if problem is None else "",
+        )
+
+    try:
+        small = shrink(realized, fails) if realized else realized
+        final = first
+        if small != realized or first.dir != out_dir:
+            final = execute(scen, {"explicit": small, "seed": seed}, out_dir, deadline=deadline,
+                            collect_stats=False)
+            replays += 1
+        final_v = matching(final)
+        if final_v is None or not _consumed(small, final):
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return (
+                build_failure(
+                    read_story(kept), first_v.message, realized,
+                    "the minimized run diverged on replay, so the minimal trace is not trusted",
+                ),
+                final,
+                None,
+                realized,
+            )
+        return build_failure(final.entries, final_v.message, small), final, final_v, small
+    except BudgetExpired:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def investigate(scen: api.Scenario, seed: int, invariant: str, realized: dict[str, int],
+                runs_dir: Path, target: str, *, key: DefectKey | None = None,
+                deadline: float | None = None) -> Failure:
+    """Confirm a failing seed by replay, shrink it, and describe the minimal run."""
+    base = runs_dir / scen.name
+    kept = base / f"seed-{seed}"
+    final_dir = base / f"seed-{seed}.min"
+    path = base / f"seed-{seed}.min.json"
+
+    def matching(outcome: Outcome) -> Violation | None:
+        return next((v for v in outcome.violations if v.invariant == invariant
+                     and (key is None or DefectKey.from_violation(v) == key)), None)
 
     try:
         first = execute(scen, {"explicit": realized, "seed": seed}, final_dir, deadline=deadline,
                         collect_stats=False)
-        replays += 1
         first_v = matching(first)
         if first_v is None or not _consumed(realized, first):
             why = ("replaying its recorded draws " + (
@@ -616,56 +858,207 @@ def investigate(scen: api.Scenario, seed: int, invariant: str, realized: dict[st
             ) + ": the run depends on something shape does not control (time, threads,"
                 " an unscripted model), so it cannot be replayed or minimized")
             shutil.rmtree(final_dir, ignore_errors=True)
+            found_key = key or DefectKey(invariant, None, None)
+            _write_replay_json(path, scen, found_key, seed, realized, reproduces=False)
+            trace, steps = story(read_story(kept))
             message = first_v.message if first_v else "(did not reproduce)"
-            return failure(read_story(kept), message, realized, why)
+            return Failure(target, seed, found_key, message, trace, steps, len(realized),
+                           len(realized), 1, path, why, {})
 
-        key = DefectKey.from_violation(first_v)
-        small = shrink(realized, fails) if realized else realized
-        final = first
-        if small != realized:
-            final = execute(scen, {"explicit": small, "seed": seed}, final_dir, deadline=deadline,
-                            collect_stats=False)
-            replays += 1
-        final_v = matching(final)
-        if final_v is None or not _consumed(small, final):
-            shutil.rmtree(final_dir, ignore_errors=True)
-            return failure(read_story(kept), first_v.message, realized,
-                           "the minimized run diverged on replay, so the minimal trace is not trusted")
-        return failure(final.entries, final_v.message, small)
+        found_key = DefectKey.from_violation(first_v)
+        failure, _, _, small = _shrink_confirmed(
+            scen, seed, invariant, realized, runs_dir, target, found_key,
+            first, first_v, deadline=deadline, replay_path=path, final_dir=final_dir,
+        )
+        _write_replay_json(path, scen, found_key, seed, small, reproduces=failure.problem is None)
+        return failure
     except BudgetExpired:
         shutil.rmtree(final_dir, ignore_errors=True)
         raise
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
 
 
 def investigate_all(scen: api.Scenario, failing: list[tuple[int, str, dict]], runs_dir: Path,
                     target: str, limit: int = MAX_INVESTIGATED, *,
                     defect_keys: dict[int, DefectKey] | None = None,
                     deadline: float | None = None) -> Report:
-    """Group failing seeds by defect and minimize up to limit, fewest deviations first."""
+    """Group failing seeds by defect, minimize one representative per (defect, trigger class),
+    and confirm remaining seeds by replay without writing extra `.min.json` files."""
     ordered = sorted(failing, key=lambda f: (len(f[2]), f[0]))
     defects: dict[DefectKey, Defect] = {}
+    nominal_sigs: dict[DefectKey, tuple] = {}
+    attempted_combos: dict[DefectKey, set[frozenset[str]]] = {}
     report = Report(len(failing), [])
+    base = runs_dir / scen.name
+    work = base / f".confirm-{os.getpid()}"
     investigated = 0
-    for seed, invariant, realized in ordered:
-        key = defect_keys.get(seed) if defect_keys is not None else None
-        if investigated >= limit:
-            report.skipped_seeds.append(seed)
+
+    def needs_shrink(d_key: DefectKey, trig: dict[str, set[str]]) -> bool:
+        d = defects.get(d_key)
+        if d is None or not d.triggers:
+            return True
+        if frozenset(trig) in attempted_combos.get(d_key, ()):
+            return False
+        if set(trig) - set(d.triggers):
+            return True
+        return any(
+            len(trig) < len(d.triggers[c].failure.triggers)
+            for c in trig
+            if c in d.triggers
+        )
+
+    def record_rep(defect: Defect, found: Failure, small: dict[str, int], seed: int) -> None:
+        is_rep = (
+            defect.failure is None
+            or found.size < defect.failure.size
+            or any(
+                name not in defect.triggers or found.size < defect.triggers[name].failure.size
+                for name in found.triggers
+            )
+        )
+        if is_rep:
+            prev_reps = _rep_seeds(defect)
+            _write_replay_json(found.replay_file, scen, defect.key, seed, small, reproduces=True)
+            defect.record(found)
+            new_reps = _rep_seeds(defect)
+            for old_seed in prev_reps - new_reps:
+                (base / f"seed-{old_seed}.min.json").unlink(missing_ok=True)
+                shutil.rmtree(base / f"seed-{old_seed}.min", ignore_errors=True)
         else:
+            shutil.rmtree(base / f"seed-{seed}.min", ignore_errors=True)
+            defect.record_confirmed(seed, found.triggers)
+
+    try:
+        for seed, invariant, realized in ordered:
+            key = defect_keys.get(seed) if defect_keys is not None else None
+            if limit == 0:
+                report.skipped_seeds.append(seed)
+                if key is not None:
+                    defects.setdefault(key, Defect(key)).seeds.append(seed)
+                continue
+
+            raw_from_map = _raw_triggers(realized)
+            might_shrink = key is None or needs_shrink(key, raw_from_map)
+            if might_shrink and investigated >= limit:
+                report.skipped_seeds.append(seed)
+                if key is not None:
+                    defects.setdefault(key, Defect(key)).seeds.append(seed)
+                continue
+
+            confirm_dir = base / f"seed-{seed}.min" if might_shrink else work
             try:
-                found = investigate(scen, seed, invariant, realized, runs_dir, target, key=key,
-                                    deadline=deadline)
+                first = execute(
+                    scen,
+                    {"explicit": realized, "seed": seed, "sync_logs": might_shrink},
+                    confirm_dir,
+                    deadline=deadline,
+                    collect_stats=False,
+                )
+            except BudgetExpired:
+                if might_shrink:
+                    shutil.rmtree(confirm_dir, ignore_errors=True)
+                report.budget_skipped_seeds.append(seed)
+                if key is not None:
+                    defects.setdefault(key, Defect(key)).seeds.append(seed)
+                continue
+
+            first_v = next(
+                (v for v in first.violations if v.invariant == invariant
+                 and (key is None or DefectKey.from_violation(v) == key)),
+                None,
+            )
+            if first_v is None or not _consumed(realized, first):
+                if might_shrink:
+                    shutil.rmtree(confirm_dir, ignore_errors=True)
+                why = ("replaying its recorded draws " + (
+                    "did not reproduce the defect" if first_v is None
+                    else "reached only some of the recorded keys"
+                ) + ": the run depends on something shape does not control (time, threads,"
+                    " an unscripted model), so it cannot be replayed or minimized")
+                found_key = key or DefectKey(invariant, None, None)
+                trace, steps = story(read_story(base / f"seed-{seed}"))
+                message = first_v.message if first_v else "(did not reproduce)"
+                unrep = Failure(target, seed, found_key, message, trace, steps, len(realized),
+                                len(realized), 1, base / f"seed-{seed}.min.json", why, {})
+                defect = defects.setdefault(found_key, Defect(found_key))
+                defect.record(unrep)
+                defect.seeds.append(seed)
+                report.unreproducible.append(unrep)
+                continue
+
+            key = DefectKey.from_violation(first_v)
+            defect = defects.setdefault(key, Defect(key))
+            raw_triggers = trigger_classes(first.entries)
+            sig = _failure_signature(first, first_v)
+
+            nom_sig = nominal_sigs.get(key)
+            if nom_sig is not None and sig == nom_sig:
+                if might_shrink:
+                    shutil.rmtree(confirm_dir, ignore_errors=True)
+                defect.record_confirmed(seed, {"nominal": set()})
+                defect.seeds.append(seed)
+                continue
+
+            should_shrink = needs_shrink(key, raw_triggers)
+            if should_shrink and investigated >= limit:
+                if might_shrink:
+                    shutil.rmtree(confirm_dir, ignore_errors=True)
+                report.skipped_seeds.append(seed)
+                defect.seeds.append(seed)
+                continue
+
+            if not should_shrink:
+                if might_shrink:
+                    shutil.rmtree(confirm_dir, ignore_errors=True)
+                defect.record_confirmed(seed, raw_triggers)
+                defect.seeds.append(seed)
+                continue
+
+            attempted_combos.setdefault(key, set()).add(frozenset(raw_triggers))
+            avoid = nom_sig if (nom_sig is not None and sig != nom_sig) else None
+            try:
+                found, final_out, final_v, small = _shrink_confirmed(
+                    scen, seed, invariant, realized, runs_dir, target, key,
+                    first, first_v, deadline=deadline, avoid_signature=avoid,
+                )
             except BudgetExpired:
                 report.budget_skipped_seeds.append(seed)
-            else:
-                investigated += 1
-                key = found.key
-                defects.setdefault(key, Defect(key)).record(found)
-                if found.problem:
-                    report.unreproducible.append(found)
-        if key is not None:
-            defects.setdefault(key, Defect(key)).seeds.append(seed)
+                defect.seeds.append(seed)
+                continue
+
+            investigated += 1
+            if found.problem:
+                defect.record(found)
+                defect.seeds.append(seed)
+                report.unreproducible.append(found)
+                continue
+
+            if found.deviations == 0 and key not in nominal_sigs and final_v is not None:
+                nominal_sigs[key] = _failure_signature(final_out, final_v)
+                if realized and sig != nominal_sigs[key]:
+                    # This fault-driven seed shrank to nominal, revealing both a nominal bug and
+                    # a distinct fault-driven failure; preserve the nominal replay separately and
+                    # re-shrink while avoiding the nominal signature.
+                    nom_path = base / f"seed-{seed}.nominal.min.json"
+                    found.replay_file = nom_path
+                    record_rep(defect, found, small, seed)
+                    try:
+                        fault_found, _, _, fault_small = _shrink_confirmed(
+                            scen, seed, invariant, realized, runs_dir, target, key,
+                            first, first_v, deadline=deadline, avoid_signature=nominal_sigs[key],
+                        )
+                    except BudgetExpired:
+                        report.budget_skipped_seeds.append(seed)
+                    else:
+                        if not fault_found.problem:
+                            record_rep(defect, fault_found, fault_small, seed)
+                    defect.seeds.append(seed)
+                    continue
+
+            record_rep(defect, found, small, seed)
+            defect.seeds.append(seed)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
     report.defects = sorted(defects.values(), key=lambda d: (
         list(d.triggers) == ["nominal"], -len(d.seeds), min(d.seeds)
     ))
@@ -704,12 +1097,24 @@ def replay_file(scen: api.Scenario, path: Path, runs_dir: Path) -> tuple[int, st
     return 0, f"PASS {scen.name}: the recorded run no longer violates {invariant}\n{body}"
 
 
-def render_flaky(flaky: list[int]) -> str:
+def render_flaky(flaky: list[int], details: dict[int, FlakyDetail] | None = None) -> str:
     shown = ", ".join(map(str, flaky[:10])) + (", ..." if len(flaky) > 10 else "")
-    return (f"FLAKY: {len(flaky)} seeds failed once but did not fail the same way when re-run "
-            f"{RERUNS} more times ({shown}). They depend on something shape does not control "
-            f"(threads, timers, an unscripted model), so they are not counted as failures and "
-            f"were not minimized; their first runs are kept under the runs dir.")
+    lines = [(
+        f"FLAKY: {len(flaky)} seeds failed once but did not fail the same way when re-run "
+        f"{RERUNS} more times ({shown}). They depend on something shape does not control "
+        "(threads, timers, an unscripted model), so they are not counted as failures and "
+        "were not minimized; their runs and confirmation reruns are kept under the runs dir."
+    )]
+    if details:
+        for seed in flaky[:10]:
+            info = details.get(seed)
+            if info is None:
+                continue
+            last = max(info.runs - 1, 0)
+            lines.append(f"  seed {seed}: {info.dir} (run-0..run-{last})")
+            if info.divergence:
+                lines.append(f"    {info.divergence}")
+    return "\n".join(lines)
 
 
 def replay(scen: api.Scenario, path: str | Path, runs_dir: str | Path = "runs") -> None:
@@ -746,5 +1151,5 @@ def check(scen: api.Scenario, seeds: int = 100, start: int = 0,
                             defect_keys=swept.defect_keys, deadline=deadline).render()
         )
     if swept.flaky:
-        parts.append(render_flaky(swept.flaky))
+        parts.append(render_flaky(swept.flaky, swept.flaky_details))
     raise AssertionError("\n\n".join(parts + problems))

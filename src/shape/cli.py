@@ -193,6 +193,9 @@ def cmd_test(args: argparse.Namespace) -> int:
                 "seeds": swept.seeds,
                 "failing_seeds": sorted(seed for seed, _, _ in swept.failing),
                 "flaky_seeds": sorted(swept.flaky),
+                "flaky_details": [
+                    swept.flaky_details[s].as_dict() for s in sorted(swept.flaky_details)
+                ],
                 "skipped_seeds": swept.skipped_seeds,
                 "unconfirmed_seeds": sorted(swept.unconfirmed),
                 "problems": problems,
@@ -209,12 +212,13 @@ def cmd_test(args: argparse.Namespace) -> int:
         print(coverage)
         if scopes:
             print(scopes)
-        for note in notes:
-            print(note)
+        if args.verbose:
+            for note in notes:
+                print(note)
         if swept.failing:
             print(report.render(all_triggers=args.all_triggers))
         if swept.flaky:
-            print(runner.render_flaky(swept.flaky))
+            print(runner.render_flaky(swept.flaky, swept.flaky_details))
         for problem in problems:
             print(problem)
         if not scenario_failed:
@@ -246,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
                       help="maximum failing seeds to minimize (default: 200)")
     test.add_argument("--strict-scopes", action="store_true",
                       help="refuse default/derived scopes in duplicate-sensitive invariants")
+    test.add_argument("-v", "--verbose", action="store_true",
+                      help="show diagnostic notes such as watched ops that no seed called")
     test.add_argument("--runs-dir", default="runs")
     test.set_defaults(fn=cmd_test)
     run = sub.add_parser("run", help="run many seeds, shrink the first failure of each kind")

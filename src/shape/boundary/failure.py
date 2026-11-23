@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .faults import AFTER_COMMIT, DUPLICATE_TRIGGER
 from .invariants import Violation
+from .log import event_order
 
 _TRIGGER_LABELS = {
     "reply_lost": "reply lost",
@@ -67,6 +68,47 @@ def trigger_classes(entries: list[dict]) -> dict[str, set[str]]:
     return classes or {"nominal": set()}
 
 
+def _deviation_order(item: tuple[int, dict]) -> tuple[int, int, int, int]:
+    idx, event = item
+    if "inc" in event and "seq" in event:
+        inc, turn, seq = event_order(event)
+        return inc, turn, seq, idx
+    return 0, 0, idx, idx
+
+
+def _format_deviation(event: dict) -> str:
+    kind = event["kind"]
+    if kind == "choice":
+        return _TRIGGER_LABELS["model"]
+    if kind == "schedule":
+        return _TRIGGER_LABELS["interleaving"]
+    fault = event["fault"]
+    if fault == DUPLICATE_TRIGGER:
+        return _TRIGGER_LABELS["duplicate_trigger"]
+    cls = fault_class(fault)
+    label = _TRIGGER_LABELS[cls]
+    if cls in ("crash_after", "crash_before"):
+        return label
+    raised = event.get("raised") or ""
+    if isinstance(raised, str) and raised.startswith("HTTP "):
+        detail = raised.removeprefix("HTTP ")
+    else:
+        detail = fault
+    return f"{label} ({detail})"
+
+
+def describe_triggers(entries: list[dict]) -> str:
+    """Describe every kept deviation in a minimized trace, in execution order."""
+    events = [
+        (idx, event)
+        for idx, event in enumerate(entries)
+        if event.get("kind") in ("fault", "choice", "schedule")
+    ]
+    if not events:
+        return _TRIGGER_LABELS["nominal"]
+    return " + ".join(_format_deviation(e) for _, e in sorted(events, key=_deviation_order))
+
+
 @dataclass
 class Failure:
     target: str
@@ -81,10 +123,11 @@ class Failure:
     replay_file: Path
     problem: str | None = None
     triggers: dict[str, set[str]] = field(default_factory=dict)
+    trigger_label: str = ""
 
     @property
-    def size(self) -> tuple[bool, int, int, int]:
-        return self.problem is not None, self.deviations, self.steps, self.seed
+    def size(self) -> tuple[bool, int, int, int, int]:
+        return self.problem is not None, self.deviations, len(self.triggers), self.steps, self.seed
 
     def render(self) -> str:
         head = f"FAIL {self.target}  seed={self.seed}  invariant={self.key.invariant}"
@@ -93,6 +136,8 @@ class Failure:
             out += [f"  NOT MINIMIZED: {self.problem}",
                     f"  original run ({self.original_deviations} deviations) as it happened:"]
         else:
+            if self.trigger_label:
+                out.append(f"  trigger: {self.trigger_label}")
             out.append(f"  minimized to {self.steps} steps ({self.deviations} of "
                        f"{self.original_deviations} deviations kept, {self.replays} replays):")
         out += [f"    {line}" for line in self.trace]
@@ -109,9 +154,15 @@ class Trigger:
     faults: set[str] = field(default_factory=set)
 
     def record(self, failure: Failure) -> None:
-        self.seeds.append(failure.seed)
+        if failure.seed not in self.seeds:
+            self.seeds.append(failure.seed)
         self.faults.update(failure.triggers[self.name])
         self.failure = min(self.failure, failure, key=lambda f: f.size)
+
+    def record_confirmed(self, seed: int, faults: set[str] | tuple[str, ...] = ()) -> None:
+        if seed not in self.seeds:
+            self.seeds.append(seed)
+        self.faults.update(faults)
 
     @property
     def label(self) -> str:
@@ -125,6 +176,7 @@ class Trigger:
             "faults": sorted(self.faults),
             "representative_seed": self.failure.seed,
             "replay_path": str(self.failure.replay_file),
+            "trigger_label": self.failure.trigger_label,
         }
 
 
@@ -141,6 +193,21 @@ class Defect:
         for name in failure.triggers:
             self.triggers.setdefault(name, Trigger(name, failure)).record(failure)
 
+    def record_confirmed(self, seed: int, raw_triggers: dict[str, set[str]]) -> None:
+        matched = False
+        for name, faults in raw_triggers.items():
+            if name in self.triggers:
+                self.triggers[name].record_confirmed(seed, faults)
+                matched = True
+        if not matched and "nominal" in self.triggers:
+            self.triggers["nominal"].record_confirmed(seed)
+
+    def has_nominal_and_faults(self) -> bool:
+        return "nominal" in self.triggers and len(self.triggers) > 1
+
+    def fault_driven_seed_count(self) -> int:
+        return len({s for name, t in self.triggers.items() if name != "nominal" for s in t.seeds})
+
     def ranked_triggers(self) -> list[Trigger]:
         return sorted(self.triggers.values(), key=lambda t: (t.name == "nominal", -len(t.seeds),
                                                              t.name))
@@ -154,6 +221,7 @@ class Defect:
             "seeds": sorted(self.seeds),
             "representative_seed": failure.seed if failure else None,
             "replay_path": str(failure.replay_file) if failure and not failure.problem else None,
+            "trigger_label": failure.trigger_label if failure and not failure.problem else None,
             "message": failure.message if failure else None,
             "triggers": [t.as_dict() for t in self.ranked_triggers()],
         }
@@ -197,14 +265,23 @@ class Report:
                 out.append(f"  {trigger.label}: {count} {'seed' if count == 1 else 'seeds'}{faults}")
             if defect.failure is not None:
                 out.append(defect.failure.render())
-                if all_triggers:
-                    shown = {defect.failure.seed}
+                nominal_and_faults = defect.has_nominal_and_faults()
+                if nominal_and_faults:
+                    n_fault = defect.fault_driven_seed_count()
+                    clause = "seed also fails" if n_fault == 1 else "seeds also fail"
+                    out.append(
+                        f"  nominal path fails; {n_fault} fault-driven {clause}; "
+                        "their minimized traces differ:"
+                    )
+                if all_triggers or nominal_and_faults:
+                    shown = {defect.failure.replay_file}
                     for trigger in triggers:
-                        if trigger.failure.seed in shown:
-                            out.append(f"  {trigger.label} replay: shown above")
+                        if trigger.failure.replay_file in shown:
+                            if all_triggers:
+                                out.append(f"  {trigger.label} replay: shown above")
                         else:
                             out.extend([f"  {trigger.label} replay:", trigger.failure.render()])
-                            shown.add(trigger.failure.seed)
+                            shown.add(trigger.failure.replay_file)
         for failed in self.unreproducible:
             if all(defect.failure is not failed for defect in self.defects):
                 out.extend(["", failed.render()])
