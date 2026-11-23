@@ -61,10 +61,10 @@ FAULTS: tuple[Fault, ...] = (
     Fault("transient_5xx", "documented", 0.03, "*", "500/503 before commit; no effect"),
     Fault("compensation_failure", "documented", 0.15, "compensation",
           "a compensating call is rejected (e.g. refund processing_error)"),
-    Fault("rate_limit_burst", "observed", 0.08, "*",
+    Fault("rate_limit_burst", "theoretical", 0.08, "*",
           "429s arrive in runs: a shared quota stays exhausted past the advertised retry-after, "
           "so the next calls to the same op are limited too; no effect"),
-    Fault("outage_burst", "observed", 0.08, "*",
+    Fault("outage_burst", "theoretical", 0.08, "*",
           "5xx arrive in runs: a dependency outage outlasts a few retries; no effect"),
 )
 CALL_FAULTS = tuple(f.name for f in FAULTS)

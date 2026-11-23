@@ -104,8 +104,8 @@ def test_crash_at_every_durable_write_recovers(mode):
 
 @pytest.mark.parametrize("burst, base", [("rate_limit_burst", "rate_limit"),
                                          ("outage_burst", "transient_5xx")])
-def test_burst_faults_hit_the_next_calls_to_the_same_op_and_are_tagged_observed(burst, base):
-    assert PROVENANCE[burst] == "observed"
+def test_burst_faults_hit_the_next_calls_to_the_same_op_and_are_tagged_theoretical(burst, base):
+    assert PROVENANCE[burst] == "theoretical"
     result = replay("fixed", {"fault:payments.charge#0": index(burst),
                               "burst:payments.charge#0": 1})  # a burst of 3 calls
     hits = [e for e in result.trace.events if e.kind == "fault" and e.data["op"] == "charge"]

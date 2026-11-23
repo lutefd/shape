@@ -67,7 +67,7 @@ after the first fix. All are fixed, and each has a regression test that replays 
   fails; `pivot-guard` found it first, by failing while the guard held.
 
 The timeouts, crashes, and rate limits in these paths are documented faults in the simulator,
-except bursts of rate limits and 5xx errors, which are tagged `observed`. A plain seeded sweep
+except bursts of rate limits and 5xx errors, which are tagged `theoretical`. A plain seeded sweep
 (`shape run --seeds 10000 --saga fixed`) found the compensation finding on the unfixed runtime
 (13 failing seeds) because bursts persist across the retry budget and crashes inside tool calls
 are likelier. It also found the lost submission (56 failing seeds) once the oracle checked the
