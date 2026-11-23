@@ -87,6 +87,20 @@ This projection of the checkout report shows how the replay paths relate to the 
 
 When a budget or shrink limit prevents minimization, the corresponding seed IDs appear in `shrink_budget_skipped_seeds` or `shrink_limit_skipped_seeds`. A defect with no verified replay has a null `replay_path`. Each defect and trigger object also includes `trigger_label` (all kept deviations in order), and `flaky_details` lists each flaky seed's saved `runs/<scenario>/flaky/seed-<n>` directory and first divergence. Upload the runs directory along with the JSON to make the replay paths available after the job.
 
+Scenarios with a [Postgres fixture](world-fixtures.md#postgres) need a database in the job. Add a service container and set `SHAPE_PG_DSN`; without it `shape test` prints `SKIP <scenario>: fixture 'pg' is unavailable` for those scenarios and exits 0, and `shape.check` raises `shape.FixtureUnavailable`, which pytest reports as skipped:
+
+```yaml
+    services:
+      postgres:
+        image: postgres:17
+        env: { POSTGRES_PASSWORD: shape }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 10
+    env:
+      SHAPE_PG_DSN: postgresql://postgres:shape@127.0.0.1:5432/postgres
+```
+
 ## Exit codes
 
 ### Sweep mode (`shape test target --seeds N`)

@@ -102,7 +102,8 @@ The `except ConnectionResetError:` branch retried without `idempotency_key='char
 
 ## Framework guides
 
-- **Deployment recovery:** Set `recovery=` for a standalone job, queue, checkpointed thread, or scheduler. See [Recovery presets](docs/guide/recovery.md).
+- **Deployment recovery:** Set `recovery=` for a standalone job, queue, checkpointed thread, or scheduler. The presets enforce what APScheduler, Celery and lease-based queues really do, and say which are verified against the real library. See [Recovery presets](docs/guide/recovery.md).
+- **World fixtures:** A fault-free `setup=` phase, a database or queue per seed (SQLite copies, Postgres template clones) that `--jobs` never shares, a virtual clock for leases and retries, and `delivery="at-most-once"` for effects that may be lost by design. See [World fixtures](docs/guide/world-fixtures.md).
 - **Network clients:** Pass `net=[fake, ...]` to `@shape.scenario` to capture HTTP, SMTP, and IMAP. The [Mailtrap example](examples/net/mailtrap.py) uses the real SDK and reproduces a false failure report after an accepted send. See [Network capture](docs/boundary.md#network-capture).
 - **Plain Python (sync and async):** Decorate client methods directly with `@shape.effect`, persist state in `run.dir`, and explore model choices with `shape.choose`. See [Testing plain Python agents](docs/guide/plain-python.md).
 - **LangGraph (`shape.langgraph`):** Wrap tools with `effects()`, drive `StateGraph` and `interrupt()` flows with `drive()` / `adrive()`, and perturb plans with `ScriptedChatModel`. Catches missing idempotency keys, wrong-target tool calls, default `durability="async"` checkpoint loss, and `RetryPolicy()` double charges. See [Testing LangGraph agents](docs/guide/langgraph.md).
@@ -149,8 +150,9 @@ Replay a checked-in `.min.json` regression trace in milliseconds with `shape.rep
 3. [Reading a trace](docs/guide/reading-a-trace.md): line-by-line trace walkthrough, `.min.json` replay files, and a checklist to tell a real bug from a harness artifact.
 4. Framework guides: [Plain Python](docs/guide/plain-python.md), [LangGraph](docs/guide/langgraph.md), [OpenAI Agents SDK](docs/guide/openai-agents.md).
 5. [Provider fakes](docs/guide/fakes.md): reusable stdlib fakes for Stripe, SMTP/IMAP, Slack, GitHub, SendGrid, and Twilio, plus how to write custom fakes.
-6. [CI and pytest](docs/guide/ci.md): GitHub Actions, `--jobs`, exit codes, `shape.check`, and checked-in replay traces.
-7. [FAQ and honest limits](docs/guide/faq.md): when `shape` is the wrong tool, current limits, disk usage of `runs/`, and comparisons with other tools.
+6. [World fixtures](docs/guide/world-fixtures.md): setup phase, per-seed SQLite and Postgres resources, the virtual clock, and at-most-once effects.
+7. [CI and pytest](docs/guide/ci.md): GitHub Actions, `--jobs`, exit codes, `shape.check`, and checked-in replay traces.
+8. [FAQ and honest limits](docs/guide/faq.md): when `shape` is the wrong tool, current limits, disk usage of `runs/`, and comparisons with other tools.
 
 ### Reference
 
