@@ -128,7 +128,11 @@ def approval_sync_fixed(run: shape.Run) -> None:
     _run_approval_graph(run, decision=True, durability="sync", use_idempotency_key=True)
 
 
-@shape.scenario(invariants=[shape.approved_before("transfers.send")], max_restarts=3)
+@shape.scenario(
+    invariants=[shape.approved_before("transfers.send")],
+    max_restarts=3,
+    expect_effects=False,  # a rejected transfer must not call transfers.send at all
+)
 def approval_rejected(run: shape.Run) -> None:
     """Rejected transfer: human resumes with False; send must never run."""
     _run_approval_graph(run, decision=False, durability="sync", use_idempotency_key=True)

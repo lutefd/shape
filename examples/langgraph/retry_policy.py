@@ -35,6 +35,7 @@ HTTPX_402_ALL = {
     "timeout": HTTPX_402,
     "connection_reset_after_commit": HTTPX_402,
     "rate_limit": HTTPX_402,
+    "client_error": HTTPX_402,
 }
 REQUESTS_402_ON_SERVER = {**HTTPX_402_ALL, "server_error": REQUESTS_402}
 
