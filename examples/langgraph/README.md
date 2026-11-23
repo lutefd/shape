@@ -61,7 +61,7 @@ Classification follows [`docs/jepsen/methodology.md`](../../docs/jepsen/methodol
 | `approval.py` | `approval_sync_fixed` | `approved_before`, `at_most_once`, `exactly_once` (`transfers.send`) | **PASS** (0/200) | — | mitigated (`durability="sync"` + key) |
 | `approval.py` | `approval_rejected` | `approved_before(transfers.send)` | **PASS** (0/200; 0 transfers) | — | holds |
 
-*\*Note on the 402 fault mapping:* `shape`'s boundary fault table has no `client_error` kind yet, so `retry_requests_402_before_commit` maps `server_error` (a before-commit fault) to a `requests.HTTPError` carrying a status-402 response, and the other non-crash faults to `httpx.HTTPStatusError(402)`, so only a retry of the `requests` 402 trips the check. A 402 after the charge committed is not modeled: a declined card does not charge, so that combination would be an invented fault.
+*\*Note on the 402 fault mapping:* `retry_requests_402_before_commit` maps `server_error` (a before-commit fault) to a `requests.HTTPError` carrying a status-402 response, and the other non-crash faults (including `client_error`) to `httpx.HTTPStatusError(402)`, so only a retry of the `requests` 402 trips the check. A 402 after the charge committed is not modeled: a declined card does not charge, so that combination would be an invented fault.
 
 ## Finding details: `RetryPolicy()` vs documentation (LG-C24, class (a) / 1)
 
