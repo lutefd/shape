@@ -29,11 +29,10 @@ def _host(host: str) -> str:
 def _providers(fakes):
     providers = {}
     for index, fake in enumerate(fakes):
-        for name in fake.hosts:
-            host = _host(name)
-            if not host or host in providers:
-                raise ValueError(f"shape.net: empty or duplicate fake host {name!r}")
-            providers[host] = index, fake
+        for host in dict.fromkeys(map(_host, fake.hosts)):
+            if not host:
+                raise ValueError("shape.net: empty fake host")
+            providers.setdefault(host, []).append((index, fake))
     return providers
 
 
@@ -62,11 +61,14 @@ class _Capture:
         raise error("net", op, text)
 
     def provider(self, host, method):
-        provider = self.providers.get(_host(host))
-        if provider is None or not callable(getattr(provider[1], method, None)):
+        matches = [provider for provider in self.providers.get(_host(host), ())
+                   if callable(getattr(provider[1], method, None))]
+        if not matches:
             self.reject("net", f"shape.net: no {method} fake registered for host {host!r}",
                         UnregisteredHost)
-        return provider
+        if len(matches) > 1:
+            self.reject("net", f"shape.net: multiple {method} fakes registered for host {host!r}")
+        return matches[0]
 
     def perform(self, req, op, args, provider, invoke, errors, *, safe, key=None, result=None):
         index, fake = provider
