@@ -63,6 +63,7 @@ Pass provider fake instances to `@shape.scenario(net=[fake, ...])`. Shape instal
 | --- | --- |
 | `requests` | Default `HTTPAdapter.send`. Lost responses raise `requests.ReadTimeout` or `requests.ConnectionError`. |
 | `httpx` | Default sync and async HTTP transports. Lost responses raise `httpx.ReadTimeout` or `httpx.ReadError`. |
+| `httplib2` (Google API Python client) | `httplib2.Http.request`. Lost responses raise `TimeoutError` or `ConnectionResetError`. |
 | `urllib.request` | Standard HTTP and HTTPS handlers. Connect timeouts raise `URLError`. Lost responses raise `TimeoutError` or `ConnectionResetError`. |
 | `smtplib` | `SMTP` and `SMTP_SSL` capture `sendmail` and `send_message`. Sends use the client's envelope and serialized message. Lost replies raise `SMTPServerDisconnected`. |
 | `imaplib` | `IMAP4` and `IMAP4_SSL` capture mailbox commands, including `UID` variants. Lost replies raise `IMAP4.abort`. |
@@ -78,7 +79,7 @@ Import `Request`, `Response`, `EffectInfo`, `HttpFake`, `MailRequest`, and `Mail
 - `HttpFake.handle(req, state) -> Response` receives `Request(method, url, headers, body, json)`. Header lookup is case-insensitive, `body` is bytes, and `json` contains a decoded JSON body when its content type declares JSON. Return `Response(status, headers, body)`.
 - For mail, `send(from_addr, to_addrs, message, state)` returns the standard SMTP recipient refusal dict. `command(name, args, state)` returns `(status, data)` as in `imaplib`. The `UID` command carries the subcommand as its first argument. Text arguments are strings, and `APPEND` carries the message literal as its last argument in bytes. Both calls pass `MailRequest(method, host, args)` to the fake's metadata hooks. SMTP uses method `SEND`, with arguments ordered as in `send`.
 - Each write calls `effect(req, response)` to obtain `EffectInfo(op, scope, key, irreversible, landed)`. Return `None` or `landed=False` for a request that did not land. An optional pure `describe(req)` supplies the op and scope before fault injection. Without it, faults and attempts that never reach the fake use the transport label, for example `fault:POST api.stripe.com/v1/refunds#0.0`. Completed attempts and effects use the metadata from `effect` when available.
-- An `Idempotency-Key` header takes precedence over the fake's metadata key. The fake implements provider-side deduplication by that key. Shape uses the key to count effects in the world log.
+- By default, an `Idempotency-Key` header supplies the key for counting effects in the world log. Fakes for APIs that ignore this header set `use_idempotency_header = False` and can supply a provider-specific key in `EffectInfo`.
 - Keep mutable JSON state in the supplied `state` dict. Shape serializes calls for the run and commits that state to `run.dir/network.sqlite3` after each call. Separate actors and restarted processes share it. JSON responses are available in the effect's `result`. Traces show the method, host and path, query and form or JSON arguments, and idempotency key. Use test values for payloads.
 
 The [Mailtrap SDK example](../examples/net/mailtrap.py) captures an unmodified client at the transport and records the CLI's final status with `shape.claim`. Seed 931 reproduces an accepted first send followed by an HTTP 503 on the second send, after which the CLI prints `FAILED`.

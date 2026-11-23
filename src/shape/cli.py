@@ -192,6 +192,9 @@ def cmd_test(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .fakes.contracts import command as contract_command
+    from .fakes.contracts._suites import CONTRACTS
+
     parser = argparse.ArgumentParser(prog="shape")
     sub = parser.add_subparsers(dest="command", required=True)
     test = sub.add_parser("test", help="boundary mode: test your own agent code")
@@ -220,6 +223,13 @@ def main(argv: list[str] | None = None) -> int:
     shr = sub.add_parser("shrink", help="minimize a saved failing run")
     shr.add_argument("file")
     shr.set_defaults(fn=cmd_shrink)
+    fakes = sub.add_parser("fakes", help="provider fake utilities")
+    fakes_sub = fakes.add_subparsers(dest="fakes_command", required=True)
+    contract = fakes_sub.add_parser("contract", help="check a fake against its provider contract")
+    contract.add_argument("name", choices=sorted(CONTRACTS))
+    contract.add_argument("--live", action="store_true", help="compare with a configured test service")
+    contract.add_argument("--report", metavar="FILE", help="write a JSON report with contract evidence")
+    contract.set_defaults(fn=contract_command)
     args = parser.parse_args(argv)
     try:
         return args.fn(args)

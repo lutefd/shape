@@ -29,7 +29,7 @@ class _HTTPStatus(Exception):
 @functools.cache
 def optional_clients():
     clients = {}
-    for name in ("requests", "httpx"):
+    for name in ("requests", "httpx", "httplib2"):
         try:
             clients[name] = importlib.import_module(name)
         except ModuleNotFoundError as exc:
@@ -75,12 +75,17 @@ def _send(capture, method, url, headers, body, errors):
     elif content_type == "application/x-www-form-urlencoded":
         args.update(parse_qsl(body.decode(errors="replace"), keep_blank_values=True))
     key = headers.get("Idempotency-Key")
-    if method not in _SAFE:
+    fake = provider[1]
+    is_get_write = getattr(fake, "is_get_write", None)
+    safe = method in _SAFE and not (method == "GET" and is_get_write and is_get_write(req))
+    if not safe:
         args["Idempotency-Key"] = key
     try:
         return capture.perform(
             req, op, args, provider, lambda fake, state: fake.handle(req, state),
-            errors, safe=method in _SAFE, key=key, result=_result,
+            errors, safe=safe,
+            key=key if getattr(fake, "use_idempotency_header", True) else None,
+            result=_result,
         )
     except _HTTPStatus as exc:
         return Response(exc.status, {"Content-Type": "application/json"},
@@ -118,6 +123,17 @@ def install(stack, capture):
     _patch(stack, request.AbstractHTTPHandler, "do_open", urllib_open)
 
     clients = optional_clients()
+    if httplib2 := clients.get("httplib2"):
+        def httplib2_request(client, uri, method="GET", body=None, headers=None,
+                             redirections=5, connection_type=None):
+            response = _send(capture, method.upper(), uri, headers or {}, body,
+                             _errors(TimeoutError, ConnectionResetError))
+            wrapped = httplib2.Response({**response.headers, "status": str(response.status)})
+            wrapped.reason = http.client.responses.get(response.status, "")
+            return wrapped, response.body
+
+        _patch(stack, httplib2.Http, "request", httplib2_request)
+
     if requests := clients.get("requests"):
         def requests_send(adapter, req, *args, **kwargs):
             from urllib3.response import HTTPResponse

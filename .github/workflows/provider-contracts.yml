@@ -1,0 +1,74 @@
+name: provider-contracts
+on:
+  schedule:
+    - cron: "21 6 * * 3"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        provider:
+          - discord
+          - github
+          - gmail
+          - google-calendar
+          - jira
+          - langgraph
+          - linear
+          - sendgrid
+          - slack
+          - stripe
+          - telegram
+          - twilio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - name: Compare with provider test service
+        run: shape fakes contract "${{ matrix.provider }}" --live --report contract.json
+        env:
+          CALENDAR_CLIENT_ID: ${{ matrix.provider == 'google-calendar' && secrets.CALENDAR_CLIENT_ID || '' }}
+          CALENDAR_CLIENT_SECRET: ${{ matrix.provider == 'google-calendar' && secrets.CALENDAR_CLIENT_SECRET || '' }}
+          CALENDAR_REFRESH_TOKEN: ${{ matrix.provider == 'google-calendar' && secrets.CALENDAR_REFRESH_TOKEN || '' }}
+          CALENDAR_TEST_ID: ${{ matrix.provider == 'google-calendar' && secrets.CALENDAR_TEST_ID || '' }}
+          DISCORD_BOT_TOKEN: ${{ matrix.provider == 'discord' && secrets.DISCORD_BOT_TOKEN || '' }}
+          DISCORD_TEST_CHANNEL: ${{ matrix.provider == 'discord' && secrets.DISCORD_TEST_CHANNEL || '' }}
+          GITHUB_SCRATCH_REPO: ${{ matrix.provider == 'github' && secrets.CONTRACT_GITHUB_SCRATCH_REPO || '' }}
+          GITHUB_TOKEN: ${{ matrix.provider == 'github' && secrets.CONTRACT_GITHUB_TOKEN || '' }}
+          GMAIL_CLIENT_ID: ${{ matrix.provider == 'gmail' && secrets.GMAIL_CLIENT_ID || '' }}
+          GMAIL_CLIENT_SECRET: ${{ matrix.provider == 'gmail' && secrets.GMAIL_CLIENT_SECRET || '' }}
+          GMAIL_REFRESH_TOKEN: ${{ matrix.provider == 'gmail' && secrets.GMAIL_REFRESH_TOKEN || '' }}
+          GMAIL_TEST_EMAIL: ${{ matrix.provider == 'gmail' && secrets.GMAIL_TEST_EMAIL || '' }}
+          JIRA_TEST_API_TOKEN: ${{ matrix.provider == 'jira' && secrets.JIRA_TEST_API_TOKEN || '' }}
+          JIRA_TEST_EMAIL: ${{ matrix.provider == 'jira' && secrets.JIRA_TEST_EMAIL || '' }}
+          JIRA_TEST_ISSUE_TYPE: ${{ matrix.provider == 'jira' && secrets.JIRA_TEST_ISSUE_TYPE || '' }}
+          JIRA_TEST_PROJECT: ${{ matrix.provider == 'jira' && secrets.JIRA_TEST_PROJECT || '' }}
+          JIRA_TEST_SITE: ${{ matrix.provider == 'jira' && secrets.JIRA_TEST_SITE || '' }}
+          JIRA_TEST_TRANSITION: ${{ matrix.provider == 'jira' && secrets.JIRA_TEST_TRANSITION || '' }}
+          LANGGRAPH_TEST_API_KEY: ${{ matrix.provider == 'langgraph' && secrets.LANGGRAPH_TEST_API_KEY || '' }}
+          LANGGRAPH_TEST_ASSISTANT_ID: ${{ matrix.provider == 'langgraph' && secrets.LANGGRAPH_TEST_ASSISTANT_ID || '' }}
+          LANGGRAPH_TEST_URL: ${{ matrix.provider == 'langgraph' && secrets.LANGGRAPH_TEST_URL || '' }}
+          LINEAR_API_KEY: ${{ matrix.provider == 'linear' && secrets.LINEAR_API_KEY || '' }}
+          LINEAR_TEST_TEAM_ID: ${{ matrix.provider == 'linear' && secrets.LINEAR_TEST_TEAM_ID || '' }}
+          SENDGRID_API_KEY: ${{ matrix.provider == 'sendgrid' && secrets.SENDGRID_API_KEY || '' }}
+          SENDGRID_TEST_FROM: ${{ matrix.provider == 'sendgrid' && secrets.SENDGRID_TEST_FROM || '' }}
+          SLACK_BOT_TOKEN: ${{ matrix.provider == 'slack' && secrets.SLACK_BOT_TOKEN || '' }}
+          SLACK_TEST_CHANNEL: ${{ matrix.provider == 'slack' && secrets.SLACK_TEST_CHANNEL || '' }}
+          STRIPE_TEST_KEY: ${{ matrix.provider == 'stripe' && secrets.STRIPE_TEST_KEY || '' }}
+          TELEGRAM_BOT_TOKEN: ${{ matrix.provider == 'telegram' && secrets.TELEGRAM_BOT_TOKEN || '' }}
+          TELEGRAM_TEST_CHAT_ID: ${{ matrix.provider == 'telegram' && secrets.TELEGRAM_TEST_CHAT_ID || '' }}
+          TWILIO_TEST_ACCOUNT_SID: ${{ matrix.provider == 'twilio' && secrets.TWILIO_TEST_ACCOUNT_SID || '' }}
+          TWILIO_TEST_AUTH_TOKEN: ${{ matrix.provider == 'twilio' && secrets.TWILIO_TEST_AUTH_TOKEN || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: provider-contract-${{ matrix.provider }}
+          path: contract.json
+          if-no-files-found: ignore

@@ -54,9 +54,11 @@ class TwilioFake:
         scope: Callable[[Request, dict[str, Any]], str] | None = None,
         invalid_numbers: Collection[str] = (),
         hosts: tuple[str, ...] | None = None,
+        test_mode: bool = False,
     ) -> None:
         self._scope_fn = scope
         self._invalid_numbers = set(invalid_numbers)
+        self._test_mode = test_mode
         if hosts is not None:
             self.hosts = tuple(hosts)
 
@@ -91,7 +93,7 @@ class TwilioFake:
             scope=info.scope,
             key=None,
             irreversible=True,
-            landed=resp.status == 201,
+            landed=resp.status == 201 and not self._test_mode,
             scope_source=info.scope_source,
             scope_rule=info.scope_rule,
         )
@@ -100,6 +102,8 @@ class TwilioFake:
         state.setdefault("messages", {})
         method = req.method.upper()
         path, query = parse_url(req.url)
+        if self._test_mode and method == "GET":
+            return _twilio_err(403, 20008, "Resource not accessible with Test Account Credentials")
 
         if m := _MESSAGES_COL_RE.match(path):
             account_sid = m.group(1)
@@ -169,7 +173,8 @@ class TwilioFake:
             "error_message": None,
             "uri": uri,
         }
-        state["messages"][sid] = msg
+        if not self._test_mode:
+            state["messages"][sid] = msg
         return json_response(201, msg)
 
     def invariants(self) -> list[Invariant]:

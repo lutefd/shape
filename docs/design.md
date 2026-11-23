@@ -83,4 +83,4 @@ An intent is in doubt (`Intent.unknown`) when an attempt timed out or a crash cu
 
 ## Fakes
 
-Fakes are hand-written and model only the semantics the invariants depend on: resource state machines, idempotency behavior, error classes and retry safety, and visibility. Each fake records the real API version it mirrors. A contract suite that runs the same tests against the fake and the real sandbox comes after milestone 1. Databases are the exception to faking. `SimDB` is a versioned record store, not SQL, and real Postgres under simulator-controlled interleaving is planned work.
+Fakes are hand-written and model only the semantics the invariants depend on: resource state machines, idempotency behavior, error classes and retry safety, and visibility. Each fake records the real API version it mirrors. The [provider contract suites](guide/fakes.md#contract-tests) run the same probes against a fake and a configured test service. Databases are the exception to faking. `SimDB` is a versioned record store, not SQL, and real Postgres under simulator-controlled interleaving is planned work.
