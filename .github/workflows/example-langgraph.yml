@@ -11,7 +11,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e . -r examples/langgraph/requirements.txt
+      - run: pip install -e '.[dev,langgraph]' -r examples/langgraph/requirements.txt
+      - name: adapter unit tests
+        run: pytest -q tests/adapters/test_optional_imports.py tests/adapters/test_langgraph_adapter.py
       - name: retry_connection_reset must fail at_most_once and shrink to ConnectionResetError
         run: |
           set +e
@@ -73,3 +75,23 @@ jobs:
           shape test examples/langgraph/approval.py::approval_gate_only --seeds 200 --jobs 4
           shape test examples/langgraph/approval.py::approval_sync_fixed --seeds 200 --jobs 4
           shape test examples/langgraph/approval.py::approval_rejected --seeds 200 --jobs 4
+      - name: refund_agent perturbation scenarios fail unguarded and pass guarded
+        run: |
+          set +e
+          shape test examples/langgraph/refund_agent.py::refund_repeat_unguarded --seeds 200 --jobs 4 | tee repeat.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -eq 1
+          grep -q "invariant=at_most_once(payments.refund)" repeat.out
+          grep -q "model chose 'repeat' at 'call 2: issue_refund'" repeat.out
+
+          set +e
+          shape test examples/langgraph/refund_agent.py::refund_wrong_order_unguarded --seeds 200 --jobs 4 | tee wrong_order.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -eq 1
+          grep -q "invariant=approved_before(payments.refund)" wrong_order.out
+          grep -q "substitute order_id='18'" wrong_order.out
+
+          shape test examples/langgraph/refund_agent.py::refund_repeat_guarded --seeds 200 --jobs 4
+          shape test examples/langgraph/refund_agent.py::refund_wrong_order_guarded --seeds 200 --jobs 4

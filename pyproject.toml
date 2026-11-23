@@ -25,6 +25,8 @@ Issues = "https://github.com/lutefd/shape/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
+langgraph = ["langgraph>=1.0", "langgraph-checkpoint-sqlite>=3.0"]
+agents = ["openai-agents>=0.20"]
 
 [project.scripts]
 shape = "shape.cli:main"
@@ -37,7 +39,7 @@ build-backend = "hatchling.build"
 packages = ["src/shape"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src/shape", "/tests", "/README.md", "/LICENSE", "/docs/boundary.md", "/docs/design.md"]
+include = ["/src/shape", "/tests", "/README.md", "/LICENSE", "/docs/adapters.md", "/docs/boundary.md", "/docs/design.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

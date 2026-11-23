@@ -1,0 +1,401 @@
+"""Tests for the LangGraph adapter (`shape.langgraph`). Skipped when langgraph is not installed."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sqlite3
+from pathlib import Path
+from typing import Literal, TypedDict
+
+import pytest
+
+pytest.importorskip("langgraph")
+pytest.importorskip("langgraph.checkpoint.sqlite")
+
+from langchain_core.messages import HumanMessage
+from langchain_core.tools import BaseTool, StructuredTool, tool
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.types import Command, interrupt
+
+import shape
+import shape.langgraph
+from shape.boundary import runner
+from shape.boundary.faults import FAULTS
+
+
+def _fault(name: str) -> int:
+    return FAULTS.index(name) + 1
+
+
+def _build_refund_graph(
+    db_path: Path,
+    *,
+    keyed: bool = False,
+    alternatives: dict | None = None,
+    allowed_orders: frozenset[str] | None = None,
+    plan: list | None = None,
+):
+    with sqlite3.connect(db_path, timeout=30) as db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS refunds ("
+            "id INTEGER PRIMARY KEY, order_id TEXT, amount INTEGER, idempotency_key TEXT UNIQUE)"
+        )
+
+    @tool
+    def lookup_order(order_id: str) -> str:
+        """Look up an order."""
+        return json.dumps({"order_id": order_id, "amount": 4200})
+
+    @tool
+    def issue_refund(order_id: str, amount: int) -> str:
+        """Issue a refund."""
+        if allowed_orders is not None and order_id not in allowed_orders:
+            raise PermissionError(f"order {order_id} not allowed")
+        key = f"t1:refund:{order_id}" if keyed else None
+        with sqlite3.connect(db_path, timeout=30) as db:
+            if key is not None:
+                row = db.execute(
+                    "SELECT id FROM refunds WHERE idempotency_key = ?", (key,)
+                ).fetchone()
+                if row:
+                    return f"re_{row[0]}"
+            cur = db.execute(
+                "INSERT INTO refunds (order_id, amount, idempotency_key) VALUES (?, ?, ?)",
+                (order_id, amount, key),
+            )
+            return f"re_{cur.lastrowid}"
+
+    wrapped = shape.langgraph.effects(
+        [lookup_order, issue_refund],
+        ops={
+            "issue_refund": {
+                "op": "payments.refund",
+                "scope": lambda order_id, **_: f"order:{order_id}",
+                "key": lambda order_id, **_: f"t1:refund:{order_id}" if keyed else None,
+            }
+        },
+    )
+    default_plan = [
+        ("lookup_order", {"order_id": "17"}),
+        ("issue_refund", {"order_id": "17", "amount": 4200}),
+    ]
+    model = shape.langgraph.ScriptedChatModel(
+        plan if plan is not None else default_plan,
+        final="Order 17 is refunded.",
+        alternatives=alternatives,
+    ).bind_tools(wrapped)
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("agent", lambda s: {"messages": [model.invoke(s["messages"])]})
+    builder.add_node("tools", ToolNode(wrapped, handle_tool_errors=True))
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", tools_condition)
+    builder.add_edge("tools", "agent")
+    return builder
+
+
+def test_effects_wraps_sync_async_structured_and_base_tools(tmp_path):
+    @tool
+    def sync_op(order_id: str) -> str:
+        """Sync tool."""
+        return f"sync:{order_id}"
+
+    @tool
+    async def async_op(order_id: str) -> str:
+        """Async tool."""
+        await asyncio.sleep(0)
+        return f"async:{order_id}"
+
+    @tool
+    def read_only(order_id: str) -> str:
+        """Read-only tool."""
+        return f"read:{order_id}"
+
+    class CustomTool(BaseTool):
+        name: str = "custom_op"
+        description: str = "Custom BaseTool subclass."
+
+        def _run(self, order_id: str) -> str:
+            return f"custom:{order_id}"
+
+    both = StructuredTool.from_function(
+        name="dual_op",
+        description="Both sync and async.",
+        func=lambda order_id: f"s:{order_id}",
+        coroutine=_make_async_fn(),
+    )
+
+    wrapped = shape.langgraph.effects(
+        [sync_op, async_op, read_only, CustomTool(), both],
+        ops={
+            "sync_op": {"op": "t.sync", "scope": lambda order_id, **_: order_id},
+            "async_op": shape.langgraph.Effect("t.async", scope=lambda order_id, **_: order_id),
+            "custom_op": "t.custom",
+            "dual_op": "t.dual",
+        },
+    )
+    w_sync, w_async, w_read, w_custom, w_dual = wrapped
+    assert w_read is read_only
+    # Outside a shape run, tools work identically
+    assert w_sync.invoke({"order_id": "1"}) == "sync:1"
+    assert asyncio.run(w_async.ainvoke({"order_id": "2"})) == "async:2"
+    assert w_custom.invoke({"order_id": "3"}) == "custom:3"
+    assert w_dual.invoke({"order_id": "4"}) == "s:4"
+    assert asyncio.run(w_dual.ainvoke({"order_id": "5"})) == "a:5"
+
+    with pytest.raises(ValueError, match="unknown tool"):
+        shape.langgraph.effects([sync_op], ops={"nope": "t.nope"})
+
+    # Inside a shape run, both sync and async effects record into world log and inject faults
+    @shape.scenario(
+        invariants=[shape.exactly_once("t.sync"), shape.exactly_once("t.async")],
+        max_restarts=0,
+    )
+    def run_both(run: shape.Run) -> None:
+        w_sync.invoke({"order_id": "1"})
+        asyncio.run(w_async.ainvoke({"order_id": "2"}))
+        w_custom.invoke({"order_id": "3"})
+
+    out = runner.execute(run_both, {"explicit": {}}, tmp_path / "nominal")
+    assert out.ok, out.violations
+    ops = [e["op"] for e in out.entries if e["kind"] == "effect"]
+    assert ops == ["t.sync", "t.async", "t.custom"]
+
+    out_crash = runner.execute(
+        run_both, {"explicit": {"fault:t.async#0.0": _fault("crash_before")}}, tmp_path / "crash"
+    )
+    assert not out_crash.completed
+    ops_crash = [e["op"] for e in out_crash.entries if e["kind"] == "effect"]
+    assert ops_crash == ["t.sync"]
+
+
+def _make_async_fn():
+    async def _fn(order_id: str) -> str:
+        await asyncio.sleep(0)
+        return f"a:{order_id}"
+
+    return _fn
+
+
+def test_repeat_perturbation_fails_unguarded_and_passes_keyed(tmp_path):
+    @shape.scenario(invariants=[shape.at_most_once("payments.refund")], max_restarts=3)
+    def unguarded(run: shape.Run) -> None:
+        builder = _build_refund_graph(run.dir / "p.db", keyed=False)
+        with SqliteSaver.from_conn_string(str(run.dir / "ckpt.db")) as cp:
+            graph = builder.compile(checkpointer=cp)
+            shape.langgraph.drive(
+                graph,
+                {"messages": [HumanMessage(content="refund 17")]},
+                {"configurable": {"thread_id": "t1"}},
+                run,
+                durability="sync",
+            )
+
+    with pytest.raises(AssertionError) as info:
+        shape.check(unguarded, seeds=120, runs_dir=tmp_path)
+    text = str(info.value)
+    assert "at_most_once(payments.refund)" in text
+    assert "NOT MINIMIZED" not in text
+
+    # Explicit repeat choice (0 faults) renders the exact choice trace
+    rep = runner.execute(
+        unguarded, {"explicit": {"model:call 2: issue_refund#0.0": 1}}, tmp_path / "rep"
+    )
+    assert rep.violated("at_most_once(payments.refund)")
+    lines, _ = runner.story(rep.entries)
+    assert any("model chose 'repeat' at 'call 2: issue_refund'" in line for line in lines)
+
+    @shape.scenario(invariants=[shape.at_most_once("payments.refund")], max_restarts=3)
+    def guarded(run: shape.Run) -> None:
+        builder = _build_refund_graph(run.dir / "p.db", keyed=True)
+        with SqliteSaver.from_conn_string(str(run.dir / "ckpt.db")) as cp:
+            graph = builder.compile(checkpointer=cp)
+            shape.langgraph.drive(
+                graph,
+                {"messages": [HumanMessage(content="refund 17")]},
+                {"configurable": {"thread_id": "t1"}},
+                run,
+                durability="sync",
+            )
+
+    shape.check(guarded, seeds=100, runs_dir=tmp_path)
+
+
+def test_substitute_perturbation_fails_unguarded_and_passes_with_allowlist(tmp_path):
+    @shape.scenario(
+        invariants=[shape.at_most_once("payments.refund"), shape.approved_before("payments.refund")],
+        max_restarts=3,
+    )
+    def unguarded(run: shape.Run) -> None:
+        shape.approval("order:17", {"order_id": "17", "amount": 4200})
+        builder = _build_refund_graph(
+            run.dir / "p.db", keyed=True, alternatives={"order_id": ["18"]}
+        )
+        with SqliteSaver.from_conn_string(str(run.dir / "ckpt.db")) as cp:
+            graph = builder.compile(checkpointer=cp)
+            shape.langgraph.drive(
+                graph,
+                {"messages": [HumanMessage(content="refund 17")]},
+                {"configurable": {"thread_id": "t1"}},
+                run,
+                durability="sync",
+            )
+
+    with pytest.raises(AssertionError) as info:
+        shape.check(unguarded, seeds=150, runs_dir=tmp_path)
+    text = str(info.value)
+    assert "approved_before(payments.refund)" in text
+    assert "substitute order_id='18'" in text
+    assert "NOT MINIMIZED" not in text
+
+    @shape.scenario(
+        invariants=[shape.at_most_once("payments.refund"), shape.approved_before("payments.refund")],
+        max_restarts=3,
+    )
+    def guarded(run: shape.Run) -> None:
+        shape.approval("order:17", {"order_id": "17", "amount": 4200})
+        builder = _build_refund_graph(
+            run.dir / "p.db",
+            keyed=True,
+            alternatives={"order_id": ["18"]},
+            allowed_orders=frozenset({"17"}),
+        )
+        with SqliteSaver.from_conn_string(str(run.dir / "ckpt.db")) as cp:
+            graph = builder.compile(checkpointer=cp)
+            shape.langgraph.drive(
+                graph,
+                {"messages": [HumanMessage(content="refund 17")]},
+                {"configurable": {"thread_id": "t1"}},
+                run,
+                durability="sync",
+            )
+
+    shape.check(guarded, seeds=100, runs_dir=tmp_path)
+
+
+def test_drop_swap_and_error_retry_perturbations(tmp_path):
+    @shape.scenario(invariants=[shape.exactly_once("payments.refund")], max_restarts=0)
+    def drop_case(run: shape.Run) -> None:
+        builder = _build_refund_graph(run.dir / "p.db", keyed=True)
+        with SqliteSaver.from_conn_string(str(run.dir / "ckpt.db")) as cp:
+            graph = builder.compile(checkpointer=cp)
+            shape.langgraph.drive(
+                graph,
+                {"messages": [HumanMessage(content="refund 17")]},
+                {"configurable": {"thread_id": "t1"}},
+                run,
+            )
+
+    # Drop call 2 -> exactly_once violated
+    out = runner.execute(drop_case, {"explicit": {"model:call 2: issue_refund#0.0": 2}}, tmp_path / "d")
+    assert out.violated("exactly_once(payments.refund)")
+
+    # Error retry_0 vs retry_1 vs retry_2 on timeout fault
+    out_r0 = runner.execute(
+        drop_case,
+        {
+            "explicit": {
+                "fault:payments.refund#0.0": _fault("timeout"),
+                "model:error at call 2: issue_refund#0.0": 1,  # retry_0
+            }
+        },
+        tmp_path / "r0",
+    )
+    assert out_r0.violated("exactly_once(payments.refund)")
+
+    out_r1 = runner.execute(
+        drop_case,
+        {"explicit": {"fault:payments.refund#0.0": _fault("timeout")}},
+        tmp_path / "r1",
+    )
+    assert out_r1.ok, out_r1.violations
+
+    out_r2 = runner.execute(
+        drop_case,
+        {
+            "explicit": {
+                "fault:payments.refund#0.0": _fault("timeout"),
+                "fault:payments.refund#0.1": _fault("timeout"),
+                "model:error at call 2: issue_refund#0.0": 2,  # retry_2
+            }
+        },
+        tmp_path / "r2",
+    )
+    assert out_r2.ok, out_r2.violations
+
+
+def test_drive_interrupt_with_shape_choose_human_callback(tmp_path):
+    class GateState(TypedDict):
+        amount: int
+        decision: str
+
+    @shape.effect("wire.send", scope=lambda **_: "w1", key=lambda **_: "k1", irreversible=True)
+    def send_wire(amount: int) -> int:
+        return amount
+
+    @shape.scenario(invariants=[shape.approved_before("wire.send")], max_restarts=2)
+    def gate_with_choose(run: shape.Run) -> None:
+        with SqliteSaver.from_conn_string(str(run.dir / "ckpt.db")) as cp:
+            def approve_node(state: GateState) -> Command[Literal["send", "cancel"]]:
+                reply = interrupt({"amount": state["amount"]})
+                if reply["action"] == "reject":
+                    return Command(goto="cancel", update={"decision": "rejected"})
+                amt = reply.get("amount", state["amount"])
+                shape.approval("w1", {"amount": amt})
+                return Command(goto="send", update={"amount": amt, "decision": reply["action"]})
+
+            def send_node(state: GateState) -> dict:
+                send_wire(state["amount"])
+                return {"decision": "sent"}
+
+            b = StateGraph(GateState)
+            b.add_node("approve", approve_node)
+            b.add_node("send", send_node)
+            b.add_node("cancel", lambda _s: {"decision": "cancelled"})
+            b.add_edge(START, "approve")
+            b.add_edge("send", END)
+            b.add_edge("cancel", END)
+            g = b.compile(checkpointer=cp)
+
+            def human(payload):
+                return shape.choose(
+                    "human_review",
+                    [
+                        {"action": "approve"},
+                        {"action": "reject"},
+                        {"action": "edit", "amount": payload["amount"] // 2},
+                    ],
+                )
+
+            shape.langgraph.drive(
+                g,
+                {"amount": 1000, "decision": "pending"},
+                {"configurable": {"thread_id": "w1"}},
+                run,
+                human=human,
+                durability="sync",
+            )
+
+    shape.check(gate_with_choose, seeds=40, runs_dir=tmp_path)
+
+    # Missing human callback raises a clear error
+    @shape.scenario(max_restarts=0)
+    def missing_human(run: shape.Run) -> None:
+        with SqliteSaver.from_conn_string(str(run.dir / "ckpt.db")) as cp:
+            b = StateGraph(GateState)
+            b.add_node("approve", lambda s: {"decision": str(interrupt(s))})
+            b.add_edge(START, "approve")
+            b.add_edge("approve", END)
+            shape.langgraph.drive(
+                b.compile(checkpointer=cp),
+                {"amount": 1, "decision": "pending"},
+                {"configurable": {"thread_id": "w2"}},
+                run,
+            )
+
+    out = runner.execute(missing_human, {"explicit": {}}, tmp_path / "missing")
+    assert not out.completed
+    assert any("no human=" in e.get("text", "") for e in out.entries if e["kind"] == "error")

@@ -138,3 +138,49 @@ class TransferProvider:
 
     def close(self) -> None:
         self.db.close()
+
+
+ORDERS = {
+    "17": {"status": "delivered", "total_cents": 4200},
+    "18": {"status": "delivered", "total_cents": 900},
+}
+
+
+class RefundProvider:
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+        with self._connect() as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS refunds ("
+                "id INTEGER PRIMARY KEY, order_id TEXT, amount_cents INTEGER, "
+                "idempotency_key TEXT UNIQUE)"
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.db_path, timeout=30)
+
+    def lookup(self, order_id: str) -> dict | None:
+        return ORDERS.get(order_id)
+
+    def refund(
+        self,
+        order_id: str,
+        amount_cents: int,
+        idempotency_key: str | None = None,
+    ) -> str:
+        with self._connect() as db:
+            if idempotency_key is not None:
+                row = db.execute(
+                    "SELECT id FROM refunds WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if row:
+                    return f"re_{row[0]}"
+            cursor = db.execute(
+                "INSERT INTO refunds (order_id, amount_cents, idempotency_key) VALUES (?, ?, ?)",
+                (order_id, amount_cents, idempotency_key),
+            )
+            return f"re_{cursor.lastrowid}"
+
+    def close(self) -> None:
+        pass
