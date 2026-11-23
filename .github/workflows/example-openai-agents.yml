@@ -3,31 +3,41 @@ on:
   pull_request:
     paths:
       - "examples/openai_agents/**"
+      - "src/shape/adapters/**"
+      - "src/shape/agents.py"
       - "src/shape/boundary/**"
+      - "tests/adapters/**"
+      - "pyproject.toml"
       - ".github/workflows/example-openai-agents.yml"
   push:
     branches: [main]
     paths:
       - "examples/openai_agents/**"
+      - "src/shape/adapters/**"
+      - "src/shape/agents.py"
       - "src/shape/boundary/**"
+      - "tests/adapters/**"
+      - "pyproject.toml"
       - ".github/workflows/example-openai-agents.yml"
 jobs:
   openai-agents:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: examples/openai_agents
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: clean venv, pinned SDK, results table (exits 1 if any cell changed)
-        run: ./run.sh
+      - run: pip install -e '.[dev,agents]'
+      - name: adapter unit tests
+        run: pytest -q tests/adapters/test_optional_imports.py tests/adapters/test_agents_adapter.py
+      - name: results matrix (exits 1 if any cell changed)
+        working-directory: examples/openai_agents
+        run: python matrix.py
       - name: unkeyed refund must fail and shrink
+        working-directory: examples/openai_agents
         run: |
           set +e
-          .venv/bin/shape test checks.py::refund_unkeyed --seeds 300 | tee unkeyed.out
+          shape test checks.py::refund_unkeyed --seeds 300 --jobs 4 | tee unkeyed.out
           code=${PIPESTATUS[0]}
           set -e
           test "$code" -ne 0
@@ -35,24 +45,40 @@ jobs:
           grep -q "minimized to" unkeyed.out
           ! grep -q "NOT MINIMIZED" unkeyed.out
       - name: unkeyed approval flow must fail and shrink
+        working-directory: examples/openai_agents
         run: |
           set +e
-          .venv/bin/shape test checks.py::refund_approval_unkeyed --seeds 300 | tee approval.out
+          shape test checks.py::refund_approval_unkeyed --seeds 300 --jobs 4 | tee approval.out
           code=${PIPESTATUS[0]}
           set -e
           test "$code" -ne 0
           grep -q "invariant=at_most_once(payments.refund)" approval.out
           ! grep -q "NOT MINIMIZED" approval.out
-      - name: keyed refund must pass
-        run: .venv/bin/shape test checks.py::refund_keyed --seeds 300
-      - name: keyed approval flow must pass
-        run: .venv/bin/shape test checks.py::refund_approval_keyed --seeds 300
+      - name: wrong-order perturbation must fail unguarded and pass guarded
+        working-directory: examples/openai_agents
+        run: |
+          set +e
+          shape test checks.py::refund_wrong_order_unguarded --seeds 300 --jobs 4 | tee wrong_order.out
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -ne 0
+          grep -q "invariant=approved_before(payments.refund)" wrong_order.out
+          grep -q "substitute order_id='18'" wrong_order.out
+          ! grep -q "NOT MINIMIZED" wrong_order.out
+
+          shape test checks.py::refund_wrong_order_guarded --seeds 300 --jobs 4
+      - name: keyed refund and keyed approval must pass
+        working-directory: examples/openai_agents
+        run: |
+          shape test checks.py::refund_keyed --seeds 300 --jobs 4
+          shape test checks.py::refund_approval_keyed --seeds 300 --jobs 4
       - name: checked-in traces must replay to the same failure
+        working-directory: examples/openai_agents
         run: |
           for f in traces/*.min.json; do
             scenario=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['scenario'])" "$f")
             set +e
-            .venv/bin/shape test "checks.py::$scenario" --replay "$f" | tee replay.out
+            shape test "checks.py::$scenario" --replay "$f" | tee replay.out
             code=${PIPESTATUS[0]}
             set -e
             test "$code" -eq 1
