@@ -1,4 +1,4 @@
-"""Command line: `shape run | replay | shrink`."""
+"""Command line: `shape test` (boundary mode) and `shape run | replay | shrink` (simulation)."""
 
 from __future__ import annotations
 
@@ -96,9 +96,55 @@ def cmd_shrink(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_test(args: argparse.Namespace) -> int:
+    from .boundary import runner
+    from .boundary.child import load_module, scenarios_in
+
+    path, _, name = args.target.partition("::")
+    found = scenarios_in(load_module(path))
+    if name and name not in found:
+        known = ", ".join(found) or "none"
+        print(f"no scenario {name!r} in {path}; found: {known}", file=sys.stderr)
+        return 2
+    chosen = {name: found[name]} if name else found
+    if not chosen:
+        print(f"no @shape.scenario in {path}", file=sys.stderr)
+        return 2
+    runs = Path(args.runs_dir)
+    if args.replay:
+        replayed = Path(args.replay)
+        scen = chosen[name] if name else found[json.loads(replayed.read_text())["scenario"]]
+        code, text = runner.replay_file(scen, replayed, runs)
+        print(text)
+        return code
+    failed = False
+    for scen in chosen.values():
+        seeds = range(args.start, args.start + args.seeds)
+        failing, wall = runner.timed_sweep(scen, seeds, runs, args.jobs)
+        print(f"scenario={scen.name}  seeds={args.seeds} (from {args.start})  "
+              f"failing={len(failing)}  wall={wall:.2f}s  {args.seeds / wall:.0f} seeds/s")
+        if not failing:
+            print("PASS")
+            continue
+        failed = True
+        for invariant in dict.fromkeys(f[1] for f in failing):
+            seed, _, realized = runner.pick(failing, invariant)
+            target = f"{path}::{scen.name}"
+            print(runner.investigate(scen, seed, invariant, realized, runs, target).render())
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="shape")
     sub = parser.add_subparsers(dest="command", required=True)
+    test = sub.add_parser("test", help="boundary mode: test your own agent code")
+    test.add_argument("target", help="file.py or file.py::scenario")
+    test.add_argument("--seeds", type=int, default=100)
+    test.add_argument("--start", type=int, default=0)
+    test.add_argument("--replay", help="replay a saved .min.json instead of running seeds")
+    test.add_argument("--jobs", type=int, default=1, help="seeds to run in parallel")
+    test.add_argument("--runs-dir", default="runs")
+    test.set_defaults(fn=cmd_test)
     run = sub.add_parser("run", help="run many seeds, shrink the first failure of each kind")
     run.add_argument("--seeds", type=int, default=1000)
     run.add_argument("--start", type=int, default=0)
