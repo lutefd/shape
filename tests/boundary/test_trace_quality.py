@@ -112,11 +112,12 @@ def test_one_invariant_with_two_different_minimal_runs_is_two_causes(tmp_path):
     report = runner.investigate_all(sc.naive_retry, swept.failing, tmp_path, "x")
     invariants = {c.failure.invariant for c in report.causes}
     assert invariants == {"at_most_once(t.pay)"}
-    # After-commit faults (timeout_after_commit, connection_reset_after_commit, crash_after)
-    # share one coarse cause ("the caller did not see the commit"), with exact kinds listed.
-    assert len(report.causes) == 1
+    # Reply-lost faults (timeout_after_commit, connection_reset_after_commit) group separately
+    # from process death after commit (crash_after) because they need different fixes.
+    assert len(report.causes) == 2
     rendered = report.render()
-    assert "the caller did not see the commit" in rendered
+    assert "reply lost" in rendered
+    assert "process died after the commit" in rendered
     assert "timeout_after_commit" in rendered and "crash_after" in rendered
 
 

@@ -198,14 +198,14 @@ def test_nothing_tested_explains_no_attempts_vs_refused_vs_raised(tmp_path):
 # -------------------------------------------- 5, C, D. Coarse cause grouping & nominal-path label
 
 
-def test_after_commit_faults_group_into_one_cause_with_exact_kinds_listed(tmp_path):
+def test_after_commit_faults_split_reply_lost_from_crash_after(tmp_path):
     swept = runner.run_sweep(sc.naive_retry, range(300), tmp_path)
     report = runner.investigate_all(sc.naive_retry, swept.failing, tmp_path, "x")
-    assert len(report.causes) == 1
+    assert len(report.causes) == 2
     text = report.render()
-    assert "1 distinct cause across" in text
-    assert "needs: after-commit fault" in text
-    assert "the caller did not see the commit" in text
+    assert "2 distinct causes across" in text
+    assert "needs: reply lost" in text
+    assert "needs: crash after commit (process died after the commit: crash_after)" in text
     for kind_name in ("timeout_after_commit", "connection_reset_after_commit", "crash_after"):
         assert kind_name in text
 
@@ -272,7 +272,7 @@ def test_nominal_path_cause_is_labeled_and_printed_last(tmp_path):
     assert report.causes[-1].is_nominal
     assert len(report.causes[-1].seeds) > len(report.causes[0].seeds)
     text = report.render()
-    fault_pos = text.index("needs: after-commit fault")
+    fault_pos = text.index("needs: reply lost")
     nominal_pos = text.index(
         "nominal path (0 faults, 0 model choices): a plain unit test catches this"
     )
