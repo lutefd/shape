@@ -334,8 +334,8 @@ def classify_cell(workload: str, crash_point: str, variant: str, trials: list[Tr
                     "Command(resume=True) write is async; SIGKILL right after interrupt() returns loses approval and reverts thread to pending interrupt (0 effects).",
                 )
             return (
-                "(a) violates a documented guarantee",
-                "Even with durability='sync' ('persists changes synchronously before the next step starts'), Command(resume=True) put_writes is not awaited before running approval_node; SIGKILL loses approval 3/3 (0 effects; safety holds, approval liveness lost).",
+                "(c) works as designed",
+                "Even with durability='sync', the Command(resume=True) write is not awaited before approval_node runs; SIGKILL mid-step loses the approval 3/3 (0 effects; safety holds, approval liveness lost). The docs promise durability only at step boundaries, so this is surprising, not a broken guarantee.",
             )
         if crash_point == "at_execute_entry" and variant == "naive_two_node":
             return (
@@ -413,13 +413,13 @@ def render_results_md(reports: list[CellReport], trials_per_cell: int) -> str:
             "",
             "## Findings & Classification (with Verbatim Doc Quotes)",
             "",
-            "### 1. `(a)` Violates a Documented Guarantee — `Command(resume=True)` is lost on crash right after `interrupt()` returns, even with `durability=\"sync\"`",
+            "### 1. `(c)` Works as Designed, but Surprising — `Command(resume=True)` is lost on crash right after `interrupt()` returns, even with `durability=\"sync\"`",
             "",
             "- **Cells**: `approval-gate` x `after_resume_approved_in_approval` x `sync_two_node` and `mitigated` (`3/3` trials).",
             "- **Observed**: After Process 1 pauses at `interrupt()`, Process 2 invokes `graph.invoke(Command(resume=True), config, durability=\"sync\")`. Inside `approval_node`, `interrupt()` returns `True` and Process 2 dies with `SIGKILL` before `approval_node` returns `Command(goto=\"execute\")`. Fresh Process 3 calls `graph.invoke(None, config, durability=\"sync\")`. Result: **0 wire transfers** and the graph re-interrupts (`status=\"pending\"`), silently dropping the human's approval.",
             "- **Root cause in `langgraph==1.2.24`**: In `langgraph/pregel/_loop.py`, `_first()` persists the `Command(resume=...)` write via `self.put_writes(NULL_TASK_ID, [(RESUME, True)])`, which calls `self.submit(self.checkpointer_put_writes, ...)` on `BackgroundExecutor` without awaiting the future before executing the resumed node—even when `durability=\"sync\"`. (`durability=\"sync\"` only awaits `loop._put_checkpoint_fut.result()` at the end of each super-step in `langgraph/pregel/main.py`.)",
             "- **Safety vs. liveness**: Gate safety (`never_without_approval`, `at_most_once_after_approval`) holds (0 effects). What fails is approval durability (`exactly_once_after_approval` on `invoke(None, config)` recovery): callers must persist human approval decisions outside LangGraph and replay `Command(resume=...)` if a crash occurs before the approval super-step finishes.",
-            "- **Supporting doc quote** ([Checkpointers — Durability modes](https://docs.langchain.com/oss/python/langgraph/checkpointers)):",
+            "- **Why not `(a)`**: the quote below promises a checkpoint before the *next* step starts. The crash lands inside the resumed step, and no doc we found promises that a resume value is durable before that step finishes. Reclassify as `(a)` only if a doc stating that is found.\n- **Doc quote** ([Checkpointers — Durability modes](https://docs.langchain.com/oss/python/langgraph/checkpointers)):",
             "  > `\"sync\"`: LangGraph persists changes synchronously before the next step starts. This ensures that LangGraph writes every checkpoint before continuing execution, providing high durability at the cost of some performance overhead.",
             "",
             "### 2. `(b)` Dangerous Default / Tutorial Footgun — Default `durability=\"async\"` loses completed super-steps and completed `@task` results across node/task boundaries",
