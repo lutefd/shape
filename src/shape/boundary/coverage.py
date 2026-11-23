@@ -45,7 +45,13 @@ def of_run(world: Any, draws: list[dict]) -> dict:
             continue
         rule = e.get("scope_rule") or ""
         scopes[e["op"]].setdefault((source, rule), e["scope"])
+    by_design: dict[str, int] = {}
+    for op, mode in world.delivery.items():
+        if mode == "at-most-once":
+            lost = {a["scope"] for a in world.attempts(op)} - {e["scope"] for e in world.effects(op)}
+            by_design[op] = 1 if lost else 0
     return {
+        "by_design": by_design,
         "effects": dict(Counter(e["op"] for e in world.effects())),
         "attempts": dict(Counter(e["op"] for e in world.attempts())),
         "no_effects": dict(no_effects),
@@ -71,6 +77,7 @@ class Coverage:
         self.choices: Counter[str] = Counter()
         self.schedules: Counter[str] = Counter()
         self.scopes: dict[str, dict[tuple[str, str], str]] = defaultdict(dict)
+        self.by_design: Counter[str] = Counter()  # ops declared at-most-once -> seeds that lost one
 
     def add(self, stats: dict) -> None:
         self.seeds += 1
@@ -80,6 +87,7 @@ class Coverage:
         self.harness_errors.update(stats.get("harness_errors", {}))
         self.choices.update(stats["choices"])
         self.schedules.update(stats["schedules"])
+        self.by_design.update(stats.get("by_design", {}))
         for op, by_kind in stats["faults"].items():
             self.faults[op].update(by_kind)
         for op, items in stats.get("scopes", {}).items():
@@ -109,6 +117,11 @@ class Coverage:
         out.append(f"  model choices taken: {taken or 'none'}")
         taken = ", ".join(f"{k} x{n}" for k, n in sorted(self.schedules.items()))
         out.append(f"  interleaving choices taken: {taken or 'none'}")
+        if self.by_design:
+            out.append("by design (declared at-most-once, a lost effect is not a defect; "
+                       "a duplicate still fails):")
+            for op in sorted(self.by_design):
+                out.append(f"  {op}: lost in {self.by_design[op]} of {self.seeds} seeds")
         return "\n".join(out)
 
     def render_scopes(self, invariants: Sequence[Any] = ()) -> str:
