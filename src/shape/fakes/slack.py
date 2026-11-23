@@ -74,46 +74,53 @@ class SlackFake:
             return _slack_err("invalid_auth")
         return None
 
-    def _default_scope(self, api_method: str, params: dict[str, Any]) -> str:
+    def _default_scope(self, api_method: str, params: dict[str, Any]) -> tuple[str, str]:
         channel = str(params.get("channel") or "")
         if api_method == "chat.update":
-            return f"channel:{channel}:ts:{params.get('ts', '')}"
+            return f"channel:{channel}:ts:{params.get('ts', '')}", "channel:ts"
         meta = params.get("metadata")
         if isinstance(meta, dict):
             payload = meta.get("event_payload")
             if isinstance(payload, dict) and "scope" in payload:
-                return str(payload["scope"])
+                return str(payload["scope"]), "metadata.scope"
             if "scope" in meta:
-                return str(meta["scope"])
+                return str(meta["scope"]), "metadata.scope"
         thread_ts = params.get("thread_ts")
         if thread_ts:
-            return f"channel:{channel}:thread:{thread_ts}"
-        return f"channel:{channel}"
+            return f"channel:{channel}:thread:{thread_ts}", "channel:thread"
+        return f"channel:{channel}", "channel"
 
-    def _scope(self, req: Request, api_method: str, params: dict[str, Any]) -> str:
+    def _scope(self, req: Request, api_method: str, params: dict[str, Any]) -> tuple[str, str, str | None]:
         if self._scope_fn is not None:
-            return self._scope_fn(req, params)
-        return self._default_scope(api_method, params)
+            return self._scope_fn(req, params), "explicit", None
+        scope, rule = self._default_scope(api_method, params)
+        return scope, "fake_default", rule
 
     def describe(self, req: Request) -> EffectInfo | None:
         path, _ = parse_url(req.url)
         api_method = self._method_name(path)
         params = self._extract_params(req)
         if api_method == "chat.postMessage":
+            scope, scope_source, scope_rule = self._scope(req, api_method, params)
             return EffectInfo(
                 op="slack.chat.postMessage",
-                scope=self._scope(req, api_method, params),
+                scope=scope,
                 key=None,
                 irreversible=True,
                 landed=False,
+                scope_source=scope_source,
+                scope_rule=scope_rule,
             )
         if api_method == "chat.update":
+            scope, scope_source, scope_rule = self._scope(req, api_method, params)
             return EffectInfo(
                 op="slack.chat.update",
-                scope=self._scope(req, api_method, params),
+                scope=scope,
                 key=None,
                 irreversible=False,
                 landed=False,
+                scope_source=scope_source,
+                scope_rule=scope_rule,
             )
         return None
 
@@ -129,6 +136,8 @@ class SlackFake:
             key=info.key,
             irreversible=info.irreversible,
             landed=landed,
+            scope_source=info.scope_source,
+            scope_rule=info.scope_rule,
         )
 
     def handle(self, req: Request, state: dict) -> Response:

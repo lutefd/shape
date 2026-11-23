@@ -62,9 +62,9 @@ def test_smtp_records_headers_refusals_and_reply_invariant():
     bad_sender_req = MailRequest("SEND", "smtp.example.com", ("not-an-email", ("alice@example.com",), raw_reply))
     assert fake.effect(bad_sender_req, bad_sender).landed is False
 
-    # Default invariant: at most one reply per (thread, In-Reply-To)
+    # Default invariants: at most one reply per (thread, In-Reply-To) and at most one fresh send
     invs = fake.invariants()
-    assert len(invs) == 1 and invs[0].name == "at_most_once(smtp.reply)"
+    assert [inv.name for inv in invs] == ["at_most_once(smtp.reply)", "at_most_once(smtp.send)"]
     w_dup = World(
         entries=[
             {"kind": "effect", "op": "smtp.reply", "scope": eff.scope, "key": None},

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from typing import Any
 
 from .faults import AFTER_COMMIT
@@ -10,9 +11,18 @@ from .faults import AFTER_COMMIT
 SCENARIO_OP = "(scenario)"  # the op that scenario-level faults (duplicate_trigger) are filed under
 
 
+def _format_scope_derivation(source: str, rule: str) -> str:
+    if source == "explicit":
+        return f"explicit ({rule})" if rule else "explicit scope="
+    if source == "fake_default":
+        return f"fake default rule `{rule}`" if rule else "fake default rule"
+    return "effect default"
+
+
 def of_run(world: Any, draws: list[dict]) -> dict:
-    """One seed's counts: effects landed and attempts per op, faults per op and kind, and the
-    model choices taken. Plain dicts, so a parallel worker can send them back as JSON."""
+    """One seed's counts: effects landed and attempts per op, faults per op and kind, model
+    choices taken, and how each op's scope was derived. Plain dicts, so a parallel worker can
+    send them back as JSON."""
     faults: dict[str, Counter[str]] = defaultdict(Counter)
     choices: Counter[str] = Counter()
     schedules: Counter[str] = Counter()
@@ -28,11 +38,26 @@ def of_run(world: Any, draws: list[dict]) -> dict:
             faults[e["op"]][e["fault"]] += 1
     no_effects = Counter(e["op"] for e in world.entries if e["kind"] == "no_effect")
     harness_errors = Counter(e["text"] for e in world.entries if e["kind"] == "harness_error")
-    return {"effects": dict(Counter(e["op"] for e in world.effects())),
-            "attempts": dict(Counter(e["op"] for e in world.attempts())),
-            "no_effects": dict(no_effects),
-            "harness_errors": dict(harness_errors),
-            "faults": dict(faults), "choices": dict(choices), "schedules": dict(schedules)}
+    scopes: dict[str, dict[tuple[str, str], str]] = defaultdict(dict)
+    for e in (*world.effects(), *world.attempts()):
+        source = e.get("scope_source")
+        if source is None:
+            continue
+        rule = e.get("scope_rule") or ""
+        scopes[e["op"]].setdefault((source, rule), e["scope"])
+    return {
+        "effects": dict(Counter(e["op"] for e in world.effects())),
+        "attempts": dict(Counter(e["op"] for e in world.attempts())),
+        "no_effects": dict(no_effects),
+        "harness_errors": dict(harness_errors),
+        "faults": dict(faults),
+        "choices": dict(choices),
+        "schedules": dict(schedules),
+        "scopes": {
+            op: [[src, rule, ex] for (src, rule), ex in sorted(items.items())]
+            for op, items in scopes.items()
+        },
+    }
 
 
 class Coverage:
@@ -45,6 +70,7 @@ class Coverage:
         self.faults: dict[str, Counter[str]] = defaultdict(Counter)
         self.choices: Counter[str] = Counter()
         self.schedules: Counter[str] = Counter()
+        self.scopes: dict[str, dict[tuple[str, str], str]] = defaultdict(dict)
 
     def add(self, stats: dict) -> None:
         self.seeds += 1
@@ -56,6 +82,9 @@ class Coverage:
         self.schedules.update(stats["schedules"])
         for op, by_kind in stats["faults"].items():
             self.faults[op].update(by_kind)
+        for op, items in stats.get("scopes", {}).items():
+            for source, rule, example in items:
+                self.scopes[op].setdefault((source, rule), example)
 
     @property
     def calls(self) -> int:
@@ -80,6 +109,32 @@ class Coverage:
         out.append(f"  model choices taken: {taken or 'none'}")
         taken = ", ".join(f"{k} x{n}" for k, n in sorted(self.schedules.items()))
         out.append(f"  interleaving choices taken: {taken or 'none'}")
+        return "\n".join(out)
+
+    def render_scopes(self, invariants: Sequence[Any] = ()) -> str:
+        if not self.scopes:
+            return ""
+        dup_by_op: dict[str, list[str]] = defaultdict(list)
+        for inv in invariants:
+            if getattr(inv, "duplicate_sensitive", False):
+                for op in inv.ops:
+                    if inv.name not in dup_by_op[op]:
+                        dup_by_op[op].append(inv.name)
+        out = ["scope assignment:"]
+        for op in sorted(self.scopes):
+            items = sorted(self.scopes[op].items())
+            uses_default = False
+            for (source, rule), example in items:
+                if source in ("fake_default", "effect_default"):
+                    uses_default = True
+                desc = _format_scope_derivation(source, rule)
+                out.append(f"  {op}: {desc} (e.g. {example!r})")
+            if uses_default and dup_by_op.get(op):
+                invs = ", ".join(dup_by_op[op])
+                out.append(
+                    f"  warning: {op} uses a default scope rule with {invs}; "
+                    f"pass scope= to the fake or effect (or run with --strict-scopes)"
+                )
         return "\n".join(out)
 
 

@@ -36,6 +36,8 @@ class EffectInfo:
     key: str | None
     irreversible: bool
     landed: bool
+    scope_source: str = "explicit"
+    scope_rule: str | None = None
 
 
 @dataclass(frozen=True)
