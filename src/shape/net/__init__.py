@@ -122,6 +122,21 @@ class _Capture:
         return response
 
 
+def _seed(workdir, fakes):
+    """Write each fake's `initial_state` into the run's provider store before anything runs."""
+    rows = [(index, fake.initial_state) for index, fake in enumerate(fakes)
+            if getattr(fake, "initial_state", None)]
+    if not rows:
+        return
+    with contextlib.closing(sqlite3.connect(Path(workdir) / "network.sqlite3",
+                                            isolation_level=None)) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS providers (id INTEGER PRIMARY KEY, "
+                   "state TEXT NOT NULL)")
+        for index, state in rows:
+            db.execute("INSERT OR REPLACE INTO providers VALUES (?, ?)",
+                       (index, json.dumps(state)))
+
+
 def _patch(stack, target, name, fn):
     original = getattr(target, name)
     setattr(target, name, functools.wraps(original)(fn))

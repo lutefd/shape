@@ -1,6 +1,6 @@
 """Reusable, faithful provider test doubles for `shape`."""
 
-from .base import EffectInfo, HttpFake, MailFake, MailRequest, Request, Response
+from .base import EffectInfo, HttpFake, MailFake, MailRequest, Request, Response, seedable
 from .discord import DiscordFake
 from .github import GitHubFake
 from .gmail import GmailFake
@@ -38,6 +38,12 @@ __all__ = [
     "TelegramFake",
     "TwilioFake",
 ]
+
+
+for _fake in (DiscordFake, GitHubFake, GmailFake, GoogleCalendarFake, ImapFake, JiraFake,
+              LangGraphFake, LinearFake, SendGridFake, SlackFake, SmtpFake, StripeFake,
+              TelegramFake, TwilioFake):
+    seedable(_fake)
 
 
 def _load_metadata():

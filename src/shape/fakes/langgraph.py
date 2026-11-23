@@ -47,10 +47,26 @@ class LangGraphFake(WriteFake):
     api_version = "LangSmith Agent Server OpenAPI 0.1.0"
     once = ("langgraph.threads.create", "langgraph.runs.create", "langgraph.crons.create")
 
-    def __init__(self, *, hosts=None, scope=None, assistants=None, run_result=None):
+    def __init__(self, *, hosts=None, scope=None, assistants=None, run_result=None,
+                 threads=(), initial_state=None):
+        """`threads` seeds threads that already exist when each seed starts: dicts with an
+        optional `thread_id` (a UUID; one is derived from the position otherwise), `metadata`,
+        `values` and `status`. `initial_state` merges raw provider state, as on every fake."""
         super().__init__(hosts=hosts, scope=scope)
         self.assistants = None if assistants is None else dict(assistants)
         self.run_result = run_result
+        seeded = {}
+        for index, spec in enumerate(threads, 1):
+            ident = _uuid(spec.get("thread_id")) if spec.get("thread_id") else str(
+                uuid5(NAMESPACE_URL, f"shape:seed-thread:{index}"))
+            if ident is None:
+                raise ValueError(f"LangGraphFake(threads=...): {spec['thread_id']!r} is not a UUID")
+            thread = _thread(ident, spec.get("metadata"))
+            thread["values"] = spec.get("values")
+            thread["status"] = spec.get("status", "idle")
+            seeded[ident] = thread
+        state = {"threads": seeded} if seeded else {}
+        self.initial_state = {**state, **(initial_state or {})} or None
 
     def describe(self, req):
         path = parse_url(req.url)[0]

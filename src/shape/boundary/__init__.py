@@ -1,5 +1,6 @@
 """Boundary mode: test agent code you already have by faulting and killing its side effects."""
 
+from . import clock, fixtures, recovery
 from .api import (
     Actor,
     HarnessError,
@@ -15,6 +16,7 @@ from .api import (
     scenario,
 )
 from .faults import ClientError, RateLimited, ServerError
+from .fixtures import Fixture, FixtureUnavailable, fixture
 from .invariants import (
     Finding,
     World,
@@ -35,6 +37,8 @@ __all__ = [
     "Actor",
     "ClientError",
     "Finding",
+    "Fixture",
+    "FixtureUnavailable",
     "HarnessError",
     "RateLimited",
     "Run",
@@ -49,11 +53,15 @@ __all__ = [
     "choose",
     "claim",
     "claims_true",
+    "clock",
     "effect",
     "exactly_once",
+    "fixture",
+    "fixtures",
     "invariant",
     "max_calls",
     "point",
+    "recovery",
     "replay",
     "requires",
     "run_async",

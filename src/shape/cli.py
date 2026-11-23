@@ -132,6 +132,7 @@ def _load_scenarios(path: str) -> dict | None:
 
 def cmd_test(args: argparse.Namespace) -> int:
     from .boundary import runner
+    from .boundary.fixtures import FixtureUnavailable
 
     try:
         deadline = runner.deadline_for(args.budget)
@@ -159,7 +160,11 @@ def cmd_test(args: argparse.Namespace) -> int:
         scen = chosen[name] if name else found[json.loads(replayed.read_text())["scenario"]]
         if args.strict_scopes:
             scen = dataclasses.replace(scen, strict_scopes=True)
-        code, text = runner.replay_file(scen, replayed, runs)
+        try:
+            code, text = runner.replay_file(scen, replayed, runs)
+        except FixtureUnavailable as exc:
+            print(f"SKIP {scen.name}: {exc}")
+            return 0
         print(text)
         return code
     failed = False
@@ -168,9 +173,17 @@ def cmd_test(args: argparse.Namespace) -> int:
         if args.strict_scopes:
             scen = dataclasses.replace(scen, strict_scopes=True)
         with contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext():
-            swept = runner.run_sweep(
-                scen, range(args.start, args.start + args.seeds), runs, args.jobs, deadline=deadline,
-            )
+            try:
+                swept = runner.run_sweep(
+                    scen, range(args.start, args.start + args.seeds), runs, args.jobs,
+                    deadline=deadline,
+                )
+            except FixtureUnavailable as exc:
+                print(f"SKIP {scen.name}: {exc}")
+                if args.json:
+                    reports.append({"scenario": scen.name, "target": f"{path}::{scen.name}",
+                                    "status": "skip", "reason": str(exc)})
+                continue
             report = runner.Report(0, [])
             if swept.failing:
                 limit = runner.MAX_INVESTIGATED if args.max_shrinks is None else args.max_shrinks

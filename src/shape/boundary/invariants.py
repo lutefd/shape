@@ -53,25 +53,35 @@ class World:
     - `approvals`: `shape.approval(...)` entries (`scope`, `args_hash`).
     - `claims`: `shape.claim(...)` entries (`scope`, `op`).
     - `completed`: the scenario returned. `run`: the final `shape.Run`, so you can read `run.dir`.
+    - `setup`: the entries the scenario's `setup=` phase logged. `effects` and `attempts` leave
+      them out unless you pass `include_setup=True`, so setup never counts toward an invariant.
+    - `delivery`: ops declared `delivery="at-most-once"`, by effect or by scenario.
     """
 
     def __init__(self, entries: list[dict], completed: bool, incarnations: int, max_restarts: int,
-                 run: Any = None, *, strict_scopes: bool = False):
-        self.entries = entries
+                 run: Any = None, *, strict_scopes: bool = False,
+                 delivery: dict[str, str] | None = None):
+        self.all_entries = entries
+        self.entries = [e for e in entries if not e.get("setup")]
+        self.setup = [e for e in entries if e.get("setup")]
+        self.delivery = dict(delivery or {})
         self.completed = completed
         self.incarnations = incarnations
         self.max_restarts = max_restarts
         self.run = run
         self.strict_scopes = strict_scopes
 
-    def _kind(self, kind: str, op: str | None, scope: str | None) -> list[dict]:
-        return [e for e in self.entries if e["kind"] == kind
+    def _kind(self, kind: str, op: str | None, scope: str | None,
+              include_setup: bool = False) -> list[dict]:
+        source = self.all_entries if include_setup else self.entries
+        return [e for e in source if e["kind"] == kind
                 and (op is None or e["op"] == op) and (scope is None or e["scope"] == scope)]
 
-    def effects(self, op: str | None = None, scope: str | None = None) -> list[dict]:
+    def effects(self, op: str | None = None, scope: str | None = None, *,
+                include_setup: bool = False) -> list[dict]:
         seen: set[tuple] = set()
         out = []
-        for e in self.entries:
+        for e in (self.all_entries if include_setup else self.entries):
             if e["kind"] != "effect":
                 continue
             ids = _identities(e)
@@ -82,16 +92,18 @@ class World:
                 out.append(e)
         return out
 
-    def attempts(self, op: str | None = None, scope: str | None = None) -> list[dict]:
+    def attempts(self, op: str | None = None, scope: str | None = None, *,
+                 include_setup: bool = False) -> list[dict]:
+        source = self.all_entries if include_setup else self.entries
         resolved = {
             e["attempt_key"]: (e["op"], e["scope"], e.get("scope_source"), e.get("scope_rule"))
-            for e in self.entries
+            for e in source
             if e["kind"] in {"effect", "no_effect"} and "attempt_key" in e
         }
         if not resolved:
-            return self._kind("attempt", op, scope)
+            return self._kind("attempt", op, scope, include_setup)
         attempts = []
-        for entry in self._kind("attempt", None, None):
+        for entry in self._kind("attempt", None, None, include_setup):
             result = resolved.get(entry.get("attempt_key"))
             if result is not None:
                 entry = {
@@ -171,6 +183,9 @@ def at_most_once(op: str) -> Invariant:
 def exactly_once(op: str, *, failure_claim_ok: bool = False) -> Invariant:
     """At most once per scope, and, once the scenario finished, at least once overall.
 
+    An op declared `delivery="at-most-once"` (on `@shape.effect` or in the scenario) may be lost:
+    the loss is counted in the coverage report's "by design" section, and a duplicate still fails.
+
     With `failure_claim_ok=True`, a lost effect is acceptable when the agent explicitly recorded a
     failure claim (`shape.claim(scope, op, ok=False)`) for every attempted scope (or any scope if
     none was attempted) and never claimed success (`ok=True`). Still a violation if the agent
@@ -184,6 +199,8 @@ def exactly_once(op: str, *, failure_claim_ok: bool = False) -> Invariant:
             return Finding(f"{op} happened {count} times for {_where(scope)} "
                            "(it must happen exactly once)", scope=scope)
         if world.completed and not world.effects(op):
+            if world.delivery.get(op) == "at-most-once":
+                return None  # lossy by design: reported under "by design", not a defect
             if failure_claim_ok:
                 op_claims = [c for c in world.claims if c["op"] == op]
                 pos = [c for c in op_claims if c.get("ok", True)]

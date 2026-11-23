@@ -13,11 +13,13 @@ import threading
 import traceback
 from collections import Counter, deque
 from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..choices import ChoiceSource
+from . import clock as clock_module
+from . import fixtures as fixture_module
 from . import recovery as recovery_presets
 from .asyncio import BoundaryLoop
 from .faults import (
@@ -39,12 +41,46 @@ HIDDEN_ARGS = frozenset({"self", "cls", "config", "runtime", "callbacks", "run_m
 
 @dataclass(frozen=True)
 class Run:
-    """What a scenario gets. `dir` survives crashes, so keep your own persistence in it."""
+    """What a scenario gets. `dir` survives crashes, so keep your own persistence in it.
+
+    `fixtures` holds what the scenario's `@shape.fixture`s yielded (read it with `fixture(name)`).
+    `scheduled` is the virtual time (seconds since `shape.clock.EPOCH`) of the tick this start was
+    delivered for, when the recovery preset is a scheduler."""
 
     dir: Path
     restarts: int
     seed: int | None = None
     recovery: str | None = None
+    fixtures: Mapping[str, Any] = field(default_factory=dict)
+    scheduled: float | None = None
+
+    def fixture(self, name: str) -> Any:
+        """The value fixture `name` yielded for this seed (a DSN, a path)."""
+        try:
+            return self.fixtures[name]
+        except KeyError:
+            known = ", ".join(self.fixtures) or "none"
+            raise KeyError(f"no fixture {name!r} in this run (fixtures: {known})") from None
+
+    def unique(self, prefix: str = "shape") -> str:
+        """A name no other seed or `--jobs` worker uses: for databases, queues, buckets."""
+        return fixture_module.unique_name(self.dir, prefix)
+
+    def advance(self, seconds: float) -> None:
+        """Let `seconds` of virtual time pass (see `shape.clock`). A lease expires, a retry delay
+        elapses, without a real wait."""
+        _advance_clock(self.dir, seconds, "advance")
+
+    def now(self) -> Any:
+        """The virtual time in this run, as `shape.clock.now()` would read it."""
+        import datetime
+
+        return clock_module.EPOCH + datetime.timedelta(seconds=clock_module.offset(self.dir))
+
+    @property
+    def worker(self) -> str:
+        """Which worker this start is: `worker-0` first, then `worker-1` after a takeover."""
+        return f"worker-{self.restarts}"
 
 
 class HarnessError(BaseException):
@@ -94,6 +130,7 @@ class EffectSpec:
     hide: frozenset[str] = frozenset()
     landed: Callable[..., Any] | None = None
     key_from_result: Callable[..., str | None] | None = None
+    delivery: str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,10 +173,23 @@ class Scenario:
     concurrent: Sequence[Callable[[Run], None]] = ()
     net: Sequence[Any] | None = None
     strict_scopes: bool = False
-    recovery: str | None = None
+    recovery: str | recovery_presets.Policy | None = None
+    setup: Callable[[Run], None] | None = None
+    fixtures: Sequence[fixture_module.Fixture] = ()
+    delivery: Mapping[str, str] = field(default_factory=dict)
+    advance_on_restart: float = 0.0
 
     def __call__(self, run: Run) -> None:
         self.fn(run)
+
+
+DELIVERIES = ("at-least-once", "at-most-once")
+
+
+def _check_delivery(op: str, delivery: str | None) -> None:
+    if delivery is not None and delivery not in DELIVERIES:
+        raise ValueError(f"delivery for {op!r} must be one of {', '.join(DELIVERIES)}; "
+                         f"got {delivery!r}")
 
 
 def scenario(fn: Callable[[Run], None] | None = None, *, invariants: Sequence[Any] = (),
@@ -147,10 +197,26 @@ def scenario(fn: Callable[[Run], None] | None = None, *, invariants: Sequence[An
              duplicate_trigger: bool = False, expect_effects: bool = True,
              concurrent: Sequence[Callable[[Run], None]] = (),
              net: Sequence[Any] | None = None, strict_scopes: bool = False,
-             recovery: str | None = None) -> Any:
-    if recovery is not None and recovery not in recovery_presets.PRESETS:
-        choices = ", ".join(recovery_presets.PRESETS)
-        raise ValueError(f"unknown recovery preset {recovery!r}; choose from {choices}")
+             recovery: str | recovery_presets.Policy | None = None,
+             setup: Callable[[Run], None] | None = None,
+             fixtures: Sequence[fixture_module.Fixture] = (),
+             delivery: Mapping[str, str] | None = None,
+             advance_on_restart: float = 0.0) -> Any:
+    """Declare a scenario.
+
+    `setup(run)` runs once per seed before the first incarnation with no faults, crashes or model
+    choices; its effects and network calls are logged as setup and not counted by invariants.
+    `fixtures` are per-seed resources (`@shape.fixture`, `shape.fixtures.sqlite_copy`,
+    `shape.fixtures.postgres_clone`). `delivery` maps an effect op to "at-most-once" for effects
+    that are lossy by design (a lost one is reported separately, a duplicate still fails).
+    `advance_on_restart` is virtual seconds that pass before every restart.
+    """
+    recovery_presets.validate(recovery)
+    for op, mode in dict(delivery or {}).items():
+        _check_delivery(op, mode)
+    if advance_on_restart < 0:
+        raise ValueError("advance_on_restart must be non-negative")
+    declared = fixture_module.normalize(fixtures)
 
     def wrap(f: Callable[[Run], None]) -> Scenario:
         checks = tuple(invariants)
@@ -163,7 +229,8 @@ def scenario(fn: Callable[[Run], None] | None = None, *, invariants: Sequence[An
         return Scenario(f, f.__name__, checks, max_restarts,
                         inspect.getsourcefile(f) or "", f.__module__, tuple(actors),
                         duplicate_trigger, expect_effects, tuple(concurrent), fakes,
-                        strict_scopes, recovery)
+                        strict_scopes, recovery, setup, declared, dict(delivery or {}),
+                        float(advance_on_restart))
     return wrap(fn) if fn is not None else wrap
 
 
@@ -283,6 +350,18 @@ def _harness_fail(ctx: _Context, hook: str, fn: Callable, op: str, exc: Exceptio
     raise HarnessError(hook, op, msg) from exc
 
 
+def _harness_fail_setup(ctx: _Context, fn: Callable, exc: Exception) -> None:
+    msg = f"your setup raised {type(exc).__name__}: {exc}{_fn_location(fn, exc)}"
+    ctx.append(ctx.world, {"kind": "harness_error", "op": "setup", "hook": "setup", "text": msg})
+
+
+def declared_delivery(scen: Scenario, entries: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    """Each op's declared delivery guarantee: `@shape.effect(delivery=...)` as logged, then the
+    scenario's own `delivery=` map (which wins)."""
+    out = {e["op"]: e["delivery"] for e in entries if e["kind"] == "attempt" and e.get("delivery")}
+    return {**out, **scen.delivery}
+
+
 def _call_args_hook(ctx: _Context, hook: str, fn: Callable, op: str,
                     named: Mapping[str, Any], extra: Mapping[str, Any]) -> Any:
     try:
@@ -305,7 +384,10 @@ class _Context:
 
     def __init__(self, workdir: Path, incarnation: int, choices: ChoiceSource,
                  quiet: bool = False, twin: int = 0, actors: bool = False, *,
-                 gate: Gate | None = None, actor_slot: int = 0, sync_logs: bool = True) -> None:
+                 gate: Gate | None = None, actor_slot: int = 0, sync_logs: bool = True,
+                 setup: bool = False) -> None:
+        self.workdir = workdir
+        self.setup = setup  # the fault-free phase before incarnation 0: entries are tagged setup
         self.incarnation = incarnation
         self.twin = twin  # 1 for the duplicate delivery of incarnation 0
         self.actors = actors  # the parent's context for world actors: choices, no faults
@@ -322,6 +404,7 @@ class _Context:
         self.counts: Counter[str] = Counter()
         self.async_points: dict[asyncio.Task, str] = {}
         self.seq = PARENT_SEQ + 1 if actors else 0
+        self.phase = {"setup": True} if setup else {}
         self.world = JsonlWriter(workdir / WORLD, fsync=sync_logs)
         self.realized = JsonlWriter(workdir / REALIZED, fsync=sync_logs)
         self.weights = [NOMINAL_WEIGHT] + [1.0 if choices.enabled(f) else 0.0 for f in FAULTS]
@@ -333,8 +416,8 @@ class _Context:
     def _append(self, writer: JsonlWriter, entry: dict) -> None:
         self.seq += 1
         position = self.gate.position() if self.gate else {}
-        writer.write({**entry, **position, "inc": self.incarnation, "twin": self.twin,
-                      "seq": self.seq})
+        writer.write({**entry, **position, **self.phase, "inc": self.incarnation,
+                      "twin": self.twin, "seq": self.seq})
 
     def close(self) -> None:
         self.world.close()
@@ -434,6 +517,8 @@ class _Context:
             "kind": "attempt", "op": spec.op, "scope": scope, "call": call, "fault": fault,
             "scope_source": scope_source, "scope_rule": scope_rule,
         }
+        if spec.delivery:
+            attempt["delivery"] = spec.delivery
         attempt_key = draw_key if resolve_after else None
         if attempt_key is not None:
             attempt["attempt_key"] = attempt_key
@@ -568,7 +653,8 @@ def effect(op: str, *, scope: Callable[..., str] | None = None,
            errors: Mapping[str, Callable[[], Exception]] | None = None,
            idempotent: bool = False, result: Callable[..., Any] | None = None,
            hide: Sequence[str] = (), landed: Callable[..., Any] | None = None,
-           key_from_result: Callable[..., str | None] | None = None) -> Callable:
+           key_from_result: Callable[..., str | None] | None = None,
+           delivery: str | None = None) -> Callable:
     """Mark a side-effecting function (sync or `async def`). Outside a shape run it is the plain
     function.
 
@@ -581,10 +667,14 @@ def effect(op: str, *, scope: Callable[..., str] | None = None,
     arguments one effect (a PUT-style write). `result` maps the return value to what the world
     log records as the effect's `result`, for invariants to read. `hide` names more arguments to
     leave out of the rendered call, on top of the ones frameworks inject. `errors` maps a fault
-    name to a zero-argument exception factory.
+    name to a zero-argument exception factory. `delivery="at-most-once"` declares that losing
+    this effect is by design (a fire-and-forget notification): `shape.exactly_once` then reports
+    a lost one in its own "by design" section instead of as a defect, while a duplicate still
+    fails.
     """
+    _check_delivery(op, delivery)
     spec = EffectSpec(op, scope, key, irreversible, dict(errors or {}), idempotent, result,
-                      frozenset(hide), landed, key_from_result)
+                      frozenset(hide), landed, key_from_result, delivery)
 
     def wrap(fn: Callable) -> Callable:
         sig = inspect.signature(fn)
@@ -659,3 +749,12 @@ def approval(scope: str, args: Mapping[str, Any] | None = None) -> None:
     if ctx is not None:
         ctx.append(ctx.world, {"kind": "approval", "scope": scope,
                                "args_hash": args_hash(dict(args or {}))})
+
+
+def _advance_clock(workdir: Path, seconds: float, why: str) -> None:
+    """Move the run's virtual clock and log it, so the trace shows where time passed."""
+    total = clock_module.advance_dir(workdir, seconds)
+    ctx = _active
+    if ctx is not None and ctx.workdir == workdir and seconds:
+        ctx.append(ctx.world, {"kind": "clock", "advance": seconds, "now": clock_module.stamp(total),
+                               "why": why})

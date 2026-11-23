@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import copy
+import functools
+import inspect
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -93,3 +97,33 @@ class MailFake(Protocol):
 
     def effect(self, req: MailRequest, resp: Any) -> EffectInfo | None: ...
     def invariants(self) -> list: ...
+
+
+def seedable(cls: type) -> type:
+    """Let `cls(..., initial_state={...})` start the fake with that provider state.
+
+    The dict is merged over the provider's empty state before the first call of every seed (so
+    a restarted incarnation sees what the agent changed, not the seed again). Its keys are the
+    provider's own state keys, the same JSON the fake keeps between calls; fakes with friendlier
+    seeding (`LangGraphFake(threads=[...])`) document their own arguments.
+    """
+    init = cls.__init__
+    cls.initial_state = None
+    if "initial_state" in inspect.signature(init).parameters:
+        return cls
+
+    @functools.wraps(init)
+    def __init__(self, *args: Any, initial_state: Mapping[str, Any] | None = None,
+                 **kwargs: Any) -> None:
+        init(self, *args, **kwargs)
+        if initial_state:
+            json.dumps(initial_state)  # a seed must be JSON, like the state it merges into
+            self.initial_state = {**(self.initial_state or {}), **copy.deepcopy(dict(initial_state))}
+
+    signature = inspect.signature(init)
+    params = [p for p in signature.parameters.values() if p.kind is not p.VAR_KEYWORD]
+    params.append(inspect.Parameter("initial_state", inspect.Parameter.KEYWORD_ONLY, default=None))
+    params += [p for p in signature.parameters.values() if p.kind is p.VAR_KEYWORD]
+    __init__.__signature__ = signature.replace(parameters=params)
+    cls.__init__ = __init__
+    return cls

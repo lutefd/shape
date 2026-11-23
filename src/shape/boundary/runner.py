@@ -20,7 +20,7 @@ from pathlib import Path
 
 from ..choices import ChoiceSource, ExplicitChoices, SeededChoices
 from ..shrink import shrink
-from . import api, coverage, recovery, schedule
+from . import api, clock, coverage, fixtures, recovery, schedule
 from .failure import (
     Defect,
     DefectKey,
@@ -129,11 +129,13 @@ def child_main(scen: api.Scenario, spec: dict, workdir: Path, inc: int, twin: in
         if gate is not None:
             gate.enter()
         with _network(scen, workdir):
-            if inc and actor_slot == 0 and scen.recovery in recovery.ACTIONS:
-                api._note(f"harness: {recovery.ACTIONS[scen.recovery]} (recovery={scen.recovery!r})")
-            (fn if fn is not None else scen.fn)(
-                api.Run(workdir, inc, spec.get("seed"), scen.recovery)
-            )
+            policy = recovery.resolve(scen.recovery)
+            if inc and actor_slot == 0 and policy.action:
+                api._note(f"harness: {policy.action} (recovery={policy.name!r})")
+            for tick in spec.get("fires") or [None]:
+                if tick is not None and actor_slot == 0:
+                    api._note(f"harness: tick scheduled for {clock.stamp(tick)}")
+                (fn if fn is not None else scen.fn)(_run_for(scen, spec, workdir, inc, tick))
         return 0
     except api.HarnessError as exc:
         sys.stderr.write(f"harness error: {exc}\n")
@@ -142,6 +144,12 @@ def child_main(scen: api.Scenario, spec: dict, workdir: Path, inc: int, twin: in
         ctx.append(ctx.world, {"kind": "error", "text": describe(exc)})
         sys.stderr.write(traceback.format_exc())
         return 1
+
+
+def _run_for(scen: api.Scenario, spec: dict, workdir: Path, inc: int,
+             scheduled: float | None = None) -> api.Run:
+    return api.Run(workdir, inc, spec.get("seed"), recovery.name_of(scen.recovery),
+                   spec.get("fixtures", {}), scheduled)
 
 
 def _classify(code: int) -> str:
@@ -248,7 +256,7 @@ def _run_actors(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> bool
             for act in scen.actors:
                 ctx.actor = act.name
                 try:
-                    act(api.Run(workdir, inc + 1, spec.get("seed"), scen.recovery))
+                    act(_run_for(scen, spec, workdir, inc + 1))
                 except api.HarnessError:
                     return False
                 except Exception as exc:  # noqa: BLE001 - a broken actor is reported, not fatal
@@ -260,39 +268,121 @@ def _run_actors(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> bool
     return True
 
 
+def _run_setup(scen: api.Scenario, spec: dict, workdir: Path) -> bool:
+    """Run the scenario's setup phase in the parent: no faults, no crashes, no model choices. Its
+    effects are logged as setup. False means setup failed and the run must not start."""
+    if scen.setup is None:
+        return True
+    ctx = api._Context(workdir, -1, make_choices(spec), quiet=True, setup=True,
+                       sync_logs=spec.get("sync_logs", True))
+    api.activate(ctx)
+    try:
+        with _network(scen, workdir):
+            try:
+                scen.setup(_run_for(scen, spec, workdir, 0))
+            except api.HarnessError:
+                return False
+            except Exception as exc:  # noqa: BLE001 - a broken setup is reported, not fatal
+                api._harness_fail_setup(ctx, scen.setup, exc)
+                return False
+    finally:
+        api.activate(None)
+        ctx.close()
+    return True
+
+
 # ------------------------------------------------------------------------------------------ a seed
 
 
 def execute(scen: api.Scenario, spec: dict, workdir: Path, *, deadline: float | None = None,
             collect_stats: bool = True) -> Outcome:
-    """Run one seed (or one explicit replay) in `workdir`, restarting after every death."""
+    """Run one seed (or one explicit replay) in `workdir`, restarting after every death. The
+    scenario's fixtures live from before its setup until after its invariants have read the world."""
+    stack = contextlib.ExitStack()
+    try:
+        out = _execute(scen, spec, workdir, stack, deadline, collect_stats)
+    except BaseException:
+        with contextlib.suppress(Exception):
+            stack.close()
+        raise
+    try:
+        stack.close()
+    except Exception as exc:  # noqa: BLE001 - a fixture that cannot clean up is the user's to fix
+        out.violations.append(Violation(
+            "harness_error", f"a fixture's teardown raised {describe(exc)}", None))
+    return out
+
+
+def _fixture_failed(workdir: Path, exc: BaseException) -> None:
+    with contextlib.closing(JsonlWriter(workdir / WORLD, fsync=False)) as log:
+        log.write({"kind": "harness_error", "op": "fixture", "hook": "fixture", "inc": -1,
+                   "twin": 0, "seq": 0, "text": f"your fixture raised {describe(exc)}"})
+
+
+def _pass_time(parent: JsonlWriter, workdir: Path, inc: int, seconds: float) -> None:
+    """Let virtual time pass before incarnation `inc` starts, and show it in the trace."""
+    if seconds <= 0:
+        return
+    total = clock.advance_dir(workdir, seconds)
+    parent.write({"kind": "clock", "advance": seconds, "now": clock.stamp(total), "why": "restart",
+                  "inc": inc, "twin": 0, "seq": 0})
+
+
+def _execute(scen: api.Scenario, spec: dict, workdir: Path, stack: contextlib.ExitStack,
+             deadline: float | None, collect_stats: bool) -> Outcome:
     _time_left(deadline)
     if scen.net is not None:
-        from ..net import _prepare
+        from ..net import _prepare, _seed
 
         _prepare()
     shutil.rmtree(workdir, ignore_errors=True)
     workdir.mkdir(parents=True, exist_ok=True)
+    if scen.net is not None:
+        _seed(workdir, scen.net)
     copies = 2 if _delivered_twice(scen, spec, workdir) else 1
     completed, incarnations = False, 0
+    policy = recovery.resolve(scen.recovery)
+    ready = True
+    try:
+        values = fixtures.enter(stack, scen.fixtures, lambda made: api.Run(
+            workdir, 0, spec.get("seed"), recovery.name_of(scen.recovery), made))
+    except fixtures.FixtureUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a broken fixture is reported, not fatal
+        _fixture_failed(workdir, exc)
+        values, ready = {}, False
+    spec = {**spec, "fixtures": values}
+    if ready:
+        ready = _run_setup(scen, spec, workdir)
+    scheduled = fires = None
     with contextlib.closing(JsonlWriter(workdir / WORLD, fsync=False)) as parent:
-        for inc in range(scen.max_restarts + 1):
+        for inc in range(scen.max_restarts + 1 if ready else 0):
             incarnations += 1
-            state = _incarnate(scen, spec, workdir, inc, copies if inc == 0 else 1, parent, deadline)
+            began = clock.offset(workdir)
+            if scheduled is None:
+                scheduled = began
+            state = _incarnate(scen, {**spec, "fires": fires}, workdir, inc,
+                               copies if inc == 0 else 1, parent, deadline)
             if state == "harness_error":
                 break
             if state == "done":
                 completed = True
                 break
-            if not recovery.restarts_after(scen.recovery, state):
+            resume = policy.resume(recovery.Died(inc, state, began, clock.offset(workdir),
+                                                 scheduled))
+            if resume is None:
                 break
-            if inc < scen.max_restarts and not _run_actors(scen, spec, workdir, inc):
-                break
+            if inc < scen.max_restarts:
+                _pass_time(parent, workdir, inc + 1, resume.advance + scen.advance_on_restart)
+                if not _run_actors(scen, spec, workdir, inc):
+                    break
+                fires = list(resume.fires) or None
+                scheduled = resume.fires[-1] if resume.fires else clock.offset(workdir)
     entries = read_jsonl(workdir / WORLD)
     draws = _read_draws(workdir)
     world = World(entries, completed, incarnations, scen.max_restarts,
-                  api.Run(workdir, incarnations - 1, spec.get("seed"), scen.recovery),
-                  strict_scopes=scen.strict_scopes)
+                  _run_for(scen, spec, workdir, max(incarnations - 1, 0)),
+                  strict_scopes=scen.strict_scopes, delivery=api.declared_delivery(scen, entries))
     violations = []
     harness_errors = [e for e in entries if e["kind"] == "harness_error"]
     if harness_errors:
@@ -517,6 +607,7 @@ def run_sweep(scen: api.Scenario, seeds: range, runs_dir: Path, jobs: int = 1, *
               deadline: float | None = None) -> Sweep:
     """Run every seed, then re-run each failing seed: one that does not fail the same way
     again is flaky (it depends on something shape does not control), not a failure."""
+    fixtures.require(scen.fixtures)
     started = time.perf_counter()
 
     def one(seed: int) -> list:
@@ -625,7 +716,7 @@ def story(entries: list[dict]) -> tuple[list[str], int]:
     """The trace in the code's words, and its step count (calls, approvals and deaths)."""
     events = [e for e in entries
               if e["kind"] in ("effect", "no_effect", "approval", "claim", "choice", "error",
-                               "harness_error", "incarnation", "note", "point", "schedule")
+                               "harness_error", "incarnation", "note", "point", "schedule", "clock")
               or (e["kind"] == "fault" and e["fault"] not in api.AFTER_COMMIT)]
     events.sort(key=event_order)
     copies = any(e.get("twin") for e in events)  # the trigger was delivered twice
@@ -635,14 +726,21 @@ def story(entries: list[dict]) -> tuple[list[str], int]:
         group = (e["inc"], e.get("twin", 0), e.get("actor_id"))
         if group != current:
             current = group
-            label = f"incarnation {group[0]}" + (" (restarted)" if group[0] else "")
+            label = ("setup (no faults)" if group[0] < 0
+                     else f"incarnation {group[0]}" + (" (restarted)" if group[0] else ""))
             if copies and group[0] == 0 and group[2] in (None, 0, 1):
                 label += f" (copy {'AB'[group[1]]} of the duplicate delivery)"
             if group[2] is not None:
                 label += f", actor {group[2]} {e['actor_name']}"
             lines.append(label)
         kind = e["kind"]
-        if kind in ("effect", "fault"):
+        if kind == "clock":
+            lines.append(f"  time passed: {e['advance']:g}s (clock {e['now']})")
+        elif e.get("setup"):
+            if kind in ("effect", "no_effect"):
+                lines.append(f"  {e['call']}" + (" returned without effect" if kind == "no_effect"
+                                                  else ""))
+        elif kind in ("effect", "fault"):
             steps += 1
             fault = e["fault"]
             note = FAULT_TEXT[fault].format(exc=e["raised"]) if fault else ""
@@ -1078,6 +1176,7 @@ def read_story(workdir: Path) -> list[dict]:
 def replay_file(scen: api.Scenario, path: Path, runs_dir: Path) -> tuple[int, str]:
     """Replay a saved failure. Returns (exit code, text)."""
     data = json.loads(path.read_text())
+    fixtures.require(scen.fixtures)
     seed = data.get("seed") if "scope_pattern" in data else None
     out = execute(scen, {"explicit": data["realized"], "seed": seed},
                   runs_dir / scen.name / "replay")
