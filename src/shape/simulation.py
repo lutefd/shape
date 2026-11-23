@@ -115,21 +115,28 @@ class Simulation:
                               "[documented]", record=target, delta=delta)
 
         actor = asyncio.ensure_future(outsider())
-        def first_round():
-            return agent(store, host, approver).run(order, policy)
+        world.submitted.append(dict(order))  # the client hands the order over, once
+        acked = False
 
-        def recovery_round():
-            return agent(store, host, approver).recover(policy)
+        def ack(saga_id: str) -> None:
+            nonlocal acked
+            acked = True
+            trace.add("client", f"order {order['order']} acknowledged as {saga_id}")
 
-        start = first_round
-        for _ in range(MAX_ROUNDS):
+        for attempt in range(MAX_ROUNDS):
+            runtime = agent(store, host, approver)
             try:
-                await start()
-                if not store.open_sagas():
+                if attempt == 0:
+                    await runtime.run(order, policy, ack)
+                else:
+                    await runtime.recover(policy)
+                    if not acked:  # no ack ever arrived, so the client submits again
+                        trace.add("client", f"no ack for order {order['order']}; resubmitting")
+                        await runtime.run(order, policy, ack)
+                if acked and not store.open_sagas():
                     break
             except Crash:
                 trace.add("runtime", "process restarts; recover() on the durable store")
-            start = recovery_round
         finished = True
         actor.cancel()
         await asyncio.gather(actor, return_exceptions=True)

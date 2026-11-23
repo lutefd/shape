@@ -89,6 +89,11 @@ def compensation_idempotent(o: Outcome) -> list[str]:
 
 def saga_terminates(o: Outcome) -> list[str]:
     out = [f"run did not finish: {o.stuck}"] if o.stuck else []
+    # The client's own record, not the store's: an order that never reached a durable row is
+    # invisible to a check over persisted sagas and would pass vacuously.
+    persisted = {s.order["order"] for s in o.store.sagas.values()}
+    out += [f"order {order['order']} was submitted but no saga for it was ever persisted"
+            for order in o.world.submitted if order["order"] not in persisted]
     for saga in o.store.sagas.values():
         if saga.state not in TERMINAL:
             out.append(f"{saga.id} ended in state {saga.state!r}")

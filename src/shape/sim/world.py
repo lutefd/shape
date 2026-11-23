@@ -63,6 +63,7 @@ class World:
     idempotency: dict[tuple[str, str], tuple[str, dict[str, Any]]] = field(default_factory=dict)
     outbox: list[dict[str, Any]] = field(default_factory=list)
     gates: list[Gate] = field(default_factory=list)
+    submitted: list[dict[str, Any]] = field(default_factory=list)  # orders the client handed over
 
     def seed_record(self, record_id: str, value: dict[str, Any]) -> None:
         self.records[record_id] = Record(json.loads(json.dumps(value)))

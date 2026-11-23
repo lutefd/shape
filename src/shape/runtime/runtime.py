@@ -10,6 +10,8 @@ The agent (a Policy) proposes tool calls. The runtime decides what actually happ
 * if the saga cannot finish it compensates in reverse order. Releasing inventory is
   conflict-aware: it applies a delta by compare-and-set instead of overwriting a record that
   someone else changed, and flags a conflict it cannot resolve;
+* an order is accepted by its first durable write, and only the ack that follows tells the client
+  to stop resubmitting; submitting again is idempotent by order id;
 * after a crash, `recover()` resumes every unfinished saga from the durable store alone. A new
   process has no call in flight, so every intent still `started` was cut off by the crash: its
   effect may exist, and `recover()` records that durably (`Intent.unknown`) before anything else;
@@ -77,10 +79,22 @@ class Runtime:
 
     # ---- entry points -------------------------------------------------------------------
 
-    async def run(self, order: dict[str, Any], policy: Policy) -> None:
-        saga = SagaRecord(f"saga-{order['order']}", order)
-        self.store.put_saga(saga)
-        await self._drive(saga.id, policy)
+    async def submit(self, order: dict[str, Any]) -> str:
+        """Accept an order: the first durable write. Idempotent by order id.
+
+        Returning is the ack. Until the client has it the order may not exist anywhere durable,
+        so the client must submit again; a retry after the write landed finds the row and keeps it.
+        """
+        saga_id = f"saga-{order['order']}"
+        if not self.store.has_saga(saga_id):
+            self.store.put_saga(SagaRecord(saga_id, order))
+        return saga_id
+
+    async def run(self, order: dict[str, Any], policy: Policy,
+                  ack: Callable[[str], None] = lambda saga_id: None) -> None:
+        saga_id = await self.submit(order)
+        ack(saga_id)  # the client now knows the order is durable and stops resubmitting
+        await self._drive(saga_id, policy)
 
     async def recover(self, policy: Policy) -> None:
         for saga_id in self.store.open_sagas():

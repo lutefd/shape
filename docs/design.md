@@ -62,6 +62,10 @@ Each fault kind carries its provenance. A finding states the provenance of every
 
 Independent faults never produce the failure runs real providers do, so two kinds are correlated. `rate_limit_burst` (429s while a shared quota stays exhausted, past the advertised retry-after) and `outage_burst` (5xx while a dependency is down) hit the drawing call and then the next 1 to 7 calls to the same op, longer than the runtime's four attempts. Their provenance is `observed`: the single 429 or 5xx is documented, the persistence is not. Process crashes inside a tool call are drawn five times as often as at a durable write (`CALL_CRASH_WEIGHT`), because a call is in flight for real time and a write is not.
 
+## The client
+
+The simulation is also the client that submits the order. It records the order in `world.submitted` before handing it over, treats it as accepted only on the ack (`Runtime.run` acks after `submit`, the first durable write), and with no ack resubmits after the restart. `submit` is idempotent by order id. `saga_terminates` checks every order in `world.submitted`, not only persisted rows, so an order that never became a saga fails instead of passing vacuously.
+
 ## Saga end states
 
 A saga ends `committed`, `compensated`, or `escalated`. `escalated` means the runtime could not finish or undo the saga (an irreversible step with unknown outcome, or a compensation that kept failing) and said so in the audit log. `saga_terminates` accepts it only with that audit entry, and the other invariants skip `rollback_restores_state` for it.
