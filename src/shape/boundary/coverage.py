@@ -5,13 +5,15 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from typing import Any
 
+from .faults import AFTER_COMMIT
+
 SCENARIO_OP = "(scenario)"  # the op that scenario-level faults (duplicate_trigger) are filed under
 
 
 def of_run(world: Any, draws: list[dict]) -> dict:
     """One seed's counts: effects landed and attempts per op, faults per op and kind, and the
     model choices taken. Plain dicts, so a parallel worker can send them back as JSON."""
-    faults: dict[str, dict[str, int]] = defaultdict(dict)
+    faults: dict[str, Counter[str]] = defaultdict(Counter)
     choices: Counter[str] = Counter()
     schedules: Counter[str] = Counter()
     for d in draws:
@@ -19,9 +21,11 @@ def of_run(world: Any, draws: list[dict]) -> dict:
             schedules[f"{d['schedule']}: {d['chosen']} before {d['nominal']}"] += 1
         elif "choice" in d:
             choices[f"{d['choice']} -> {d['chosen']}"] += 1
-        else:
-            by_kind = faults[d["op"]]
-            by_kind[d["fault"]] = by_kind.get(d["fault"], 0) + 1
+        elif d["fault"] not in AFTER_COMMIT:
+            faults[d["op"]][d["fault"]] += 1
+    for e in world.entries:
+        if e["kind"] == "effect" and e.get("fault") in AFTER_COMMIT:
+            faults[e["op"]][e["fault"]] += 1
     no_effects = Counter(e["op"] for e in world.entries if e["kind"] == "no_effect")
     harness_errors = Counter(e["text"] for e in world.entries if e["kind"] == "harness_error")
     return {"effects": dict(Counter(e["op"] for e in world.effects())),

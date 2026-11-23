@@ -2,7 +2,7 @@
 
 > New to `shape`? Start with the [User Guide](guide/concepts.md) ([Invariants](guide/invariants.md), [Reading a trace](guide/reading-a-trace.md), [Plain Python](guide/plain-python.md), [LangGraph](guide/langgraph.md), [OpenAI Agents SDK](guide/openai-agents.md)). This document is the complete contract for boundary mode.
 
-Boundary mode tests agent code you already have, in any Python framework, without rewriting it. You mark the tool functions that have side effects. shape injects faults and real process crashes at those boundaries, records every real effect outside the agent process, checks invariants, and shrinks any failure to a minimal replayable trace.
+Boundary mode tests agent code you already have, in any Python framework. Use provider fakes to capture calls at the network boundary, or mark the tool functions that have side effects. Shape injects faults and real process crashes, records effects outside the agent process, checks invariants, and shrinks failures to replayable traces.
 
 ## User-facing API
 
@@ -51,9 +51,42 @@ def test_place_order_is_crash_safe():
     shape.check(place_order, seeds=200)    # raises AssertionError carrying the minimized trace
 ```
 
-`check(scenario, seeds=100, start=0, runs_dir="runs", jobs=1)` runs seeds (optionally in `jobs` forked workers) and raises `AssertionError` on failure. `replay(scenario, path, runs_dir="runs")` replays a saved `.min.json` regression trace and raises `AssertionError` if the failure still reproduces or diverges.
+`check(scenario, seeds=100, start=0, runs_dir="runs", jobs=1, *, budget=None, max_shrinks=200)` runs seeds (optionally in `jobs` forked workers) and raises `AssertionError` on failure. `replay(scenario, path, runs_dir="runs")` replays a saved `.min.json` regression trace and raises `AssertionError` if the failure still reproduces or diverges.
 
-`@shape.scenario(invariants=, max_restarts=3, actors=(), duplicate_trigger=False, expect_effects=True, concurrent=())`. `actors` and `duplicate_trigger` are described under Faults, and `concurrent` under Concurrency. `expect_effects=False` says the scenario may legitimately call no effect (a rejected request must do nothing). See Coverage.
+`@shape.scenario(invariants=, max_restarts=3, actors=(), duplicate_trigger=False, expect_effects=True, concurrent=(), net=None)`. `actors` and `duplicate_trigger` are described under Faults, and `concurrent` under Concurrency. `expect_effects=False` says the scenario may legitimately call no effect (a rejected request must do nothing). See Coverage.
+
+### Network capture
+
+Pass provider fake instances to `@shape.scenario(net=[fake, ...])`. Shape installs transport hooks for the scenario, concurrent actors, and world actors. Outside those calls, the clients operate normally. Shape routes by hostname, ignoring the port and comparing names case-insensitively. Aliases on the same fake share its state. Duplicate hostname registrations are configuration errors. A request without a registered fake raises `shape.net.UnregisteredHost`, a harness failure even if the agent catches ordinary client exceptions.
+
+| Client | Capture and fault behavior |
+| --- | --- |
+| `requests` | Default `HTTPAdapter.send`. Lost responses raise `requests.ReadTimeout` or `requests.ConnectionError`. |
+| `httpx` | Default sync and async HTTP transports. Lost responses raise `httpx.ReadTimeout` or `httpx.ReadError`. |
+| `urllib.request` | Standard HTTP and HTTPS handlers. Connect timeouts raise `URLError`. Lost responses raise `TimeoutError` or `ConnectionResetError`. |
+| `smtplib` | `SMTP` and `SMTP_SSL` capture `sendmail` and `send_message`. Sends use the client's envelope and serialized message. Lost replies raise `SMTPServerDisconnected`. |
+| `imaplib` | `IMAP4` and `IMAP4_SSL` capture mailbox commands, including `UID` variants. Lost replies raise `IMAP4.abort`. |
+
+HTTP writes, SMTP sends, and IMAP writes such as `STORE`, `APPEND`, `EXPUNGE`, `COPY`, and `MOVE` draw the usual shape faults. For an after-commit fault, the fake handles the request and commits its state before shape drops the reply or crashes the caller. A refusal passes through to the client. Injected HTTP rate limits, server errors, and client errors produce 429, 503, and 400 responses, so the SDK keeps its normal status handling. HTTP reads and IMAP reads such as `SELECT`, `SEARCH`, and `FETCH` are automatic process scheduling points. Async `httpx` calls also yield to task scheduling under `shape.run_async`.
+
+Capture simulates SMTP and IMAP connection setup, authentication, and TLS negotiation. It blocks ordinary Python Internet sockets during the run so uncaptured transports fail before contacting a real host. Imports, native code, and independently launched subprocesses are outside this interception. Create network clients that connect eagerly inside the scenario. The optional HTTP libraries are only hooked when installed. A response body is buffered in memory.
+
+#### Provider protocol
+
+Import `Request`, `Response`, `EffectInfo`, `HttpFake`, `MailRequest`, and `MailFake` from `shape.fakes.base`. Supply `hosts`, the provider's `api_version`, and `invariants()`, whose checks are added to the scenario.
+
+- `HttpFake.handle(req, state) -> Response` receives `Request(method, url, headers, body, json)`. Header lookup is case-insensitive, `body` is bytes, and `json` contains a decoded JSON body when its content type declares JSON. Return `Response(status, headers, body)`.
+- For mail, `send(from_addr, to_addrs, message, state)` returns the standard SMTP recipient refusal dict. `command(name, args, state)` returns `(status, data)` as in `imaplib`. The `UID` command carries the subcommand as its first argument. Text arguments are strings, and `APPEND` carries the message literal as its last argument in bytes. Both calls pass `MailRequest(method, host, args)` to the fake's metadata hooks. SMTP uses method `SEND`, with arguments ordered as in `send`.
+- Each write calls `effect(req, response)` to obtain `EffectInfo(op, scope, key, irreversible, landed)`. Return `None` or `landed=False` for a request that did not land. An optional pure `describe(req)` supplies the op and scope before fault injection. Without it, faults are keyed by the transport label, for example `fault:POST api.stripe.com/v1/refunds#0.0`. The completed effect uses the metadata from `effect`.
+- An `Idempotency-Key` header takes precedence over the fake's metadata key. The fake implements provider-side deduplication by that key. Shape uses the key to count effects in the world log.
+- Keep mutable JSON state in the supplied `state` dict. Shape serializes calls for the run and commits that state to `run.dir/network.sqlite3` after each call. Separate actors and restarted processes share it. JSON responses are available in the effect's `result`. Traces show the method, host and path, query and form or JSON arguments, and idempotency key. Use test values for payloads.
+
+The [Mailtrap SDK example](../examples/net/mailtrap.py) captures an unmodified client at the transport and records the CLI's final status with `shape.claim`. Seed 931 reproduces an accepted first send followed by an HTTP 503 on the second send, after which the CLI prints `FAILED`.
+
+```sh
+pip install -r examples/net/requirements.txt
+shape test examples/net/mailtrap.py::mailtrap_reports_last_result --start 931 --seeds 1
+```
 
 ### Effects, scopes and idempotency keys
 
@@ -140,7 +173,7 @@ coverage over 200 seeds:
   model choices taken: after_refund -> 'refund_again' x5
 ```
 
-A pass that tested nothing is not a pass. When no seed called any `@shape.effect` function, or when attempts ran but zero effects ever landed, and nothing failed, the sweep fails with `NOTHING TESTED` and exits 1. The message explains which case occurred: zero attempts (the agent never reached its tools), attempts that returned without effect (check `landed=` or whether the tool refused every call), attempts that all raised before completing, or harness hook errors. A scenario that must legitimately do nothing sets `expect_effects=False`. When an invariant watches an op that no seed ever called, the report adds a `note:` line (it does not fail: "this must never run" is a valid thing to assert).
+A pass that tested nothing is not a pass. When no seed made an effect attempt, or attempts ran but zero effects landed, and nothing failed, the sweep fails with `NOTHING TESTED` and exits 1. The message explains which case occurred: zero attempts (the agent never reached its tools), attempts that returned without effect (check `landed=` or whether the tool refused every call), attempts that all raised before completing, or harness hook errors. A scenario that must legitimately do nothing sets `expect_effects=False`. When an invariant watches an op that no seed ever called, the report adds a `note:` line (it does not fail: "this must never run" is a valid thing to assert). Coverage counts after-commit faults only when an effect landed and the fault fired.
 
 ### Flaky seeds
 
@@ -158,6 +191,8 @@ Failing seeds are grouped by root cause. The signature is the violated invariant
 
 Each cause is labeled by what it took to trigger (`needs: after-commit fault (...)`, `needs: model choice`, etc.). Causes that fail on the nominal path with 0 faults and 0 model choices are printed **last**, labeled `nominal path (0 faults, 0 model choices): a plain unit test catches this`, so findings that only fault injection or model perturbation can produce stand out first. Seeds go fewest deviations first; a seed that still contains every coarse deviation of a cause already found joins it without being shrunk again and adds its exact fault kinds to that cause; any other seed is minimized. At most 200 seeds are minimized per sweep, and the report says how many were not.
 
+Use `--max-shrinks N` or `shape.check(max_shrinks=N)` to change that limit. A value of zero preserves original failures and skips all shrinking. `--budget SECONDS` or `shape.check(budget=seconds)` limits wall time across seed execution, confirmation, and shrinking. Shape reports skipped work at each phase. A sweep with untested seeds or unconfirmed failures reports `INCOMPLETE` and exits 1. Parent-process invariants and world actors finish their current call before shape checks the deadline again.
+
 ### Disk usage and cleaning runs
 
 Each scenario writes run state under `--runs-dir` (default `runs/<scenario>/`). Passing seeds' directories are deleted as soon as they pass (along with any stale `seed-<n>` directory from an earlier failing run), and an empty scenario directory is removed when the sweep passes. Only failing seeds (`seed-<n>/`), flaky seeds, minimized traces (`seed-<n>.min.json`, `seed-<n>.min/`), and replays (`replay/`) are kept on disk. To remove all saved run artifacts:
@@ -174,7 +209,7 @@ rm -rf runs/
 4. A crash fault ends the child with `os._exit(137)`, either before the function runs or after it returns (the effect landed, the caller never sees it). Nothing in the child gets to clean up, flush, or checkpoint. That is the point.
 5. The parent sees the child died and forks the next incarnation with `run.restarts` incremented, up to `max_restarts`. An incarnation ends one of four ways: the scenario returned (done), an injected crash (exit 137), an uncaught exception (the process died, so it restarts like any other death; the trace shows the root cause: the exception shape injected, or the innermost one in its `__cause__`/`__context__` chain, with the framework wrapper that surfaced it in parentheses), or no return within 30 seconds (killed). A scenario that has not finished after `max_restarts` is a `scenario_terminates` failure, reported with the last exception. Each incarnation's stdout and stderr go to `run.dir/inc-<n>.out`.
 6. Every real effect and approval is appended and fsynced to the world log at `run.dir/world.jsonl` before the call returns to the agent, so the log survives the crash. Every call is also logged as an attempt before its fault is applied, and every nonzero draw is appended to `run.dir/realized.jsonl` the same way.
-7. After the last incarnation, the parent evaluates the invariants over the world log. A failing seed is first confirmed: its realized map replays through `ExplicitChoices` in a fresh run, and the replay must fail the same invariant and reach every recorded key. Then ddmin shrinks the map, the minimal map is replayed once more and checked the same way, and the failure is printed in the code's own words (function names and arguments, faults, deaths) and written to `seed-<n>.min.json`. Deviations include injected faults, model choices, a duplicate delivery and scheduling changes. Failing seeds are first re-run to rule out flakiness and then grouped into distinct causes (see above).
+7. After the last incarnation, the parent evaluates the invariants over the world log. Failing seeds are re-run to rule out flakiness and then grouped into distinct causes. For a seed selected for shrinking, its realized map replays through `ExplicitChoices` in a fresh run. The replay must fail the same invariant and reach every recorded key. Then ddmin shrinks the map and any changed map is confirmed the same way. The failure is printed in the code's own words and written to `seed-<n>.min.json`. Scratch logs for confirmation reruns and shrink probes are written directly to the OS without waiting for disk sync. Shape fsyncs the retained runs. Deviations include injected faults, model choices, a duplicate delivery and scheduling changes.
 8. If either replay does not fail again or does not reach every recorded key, the run depends on something shape does not control. The report says `NOT MINIMIZED` with the original run and the reason, and claims no minimal trace.
 
 ## Faults at the boundary

@@ -29,6 +29,10 @@ class Gate:
         self.turn = 0
         self.lock = threading.Lock()
 
+    def enter(self) -> None:
+        # The parent already knows a new actor starts at "entry".
+        self.turn = self.conn.recv()
+
     def point(self, label: str, show: bool = False) -> None:
         with self.lock:
             self.conn.send((label, show))
@@ -103,7 +107,7 @@ def run_processes(scen: Scenario, spec: dict, workdir: Path, inc: int, copies: i
     """Wait for all entry points, then hand the turn to one actor at a time."""
     context = multiprocessing.get_context("fork" if use_fork else "spawn")
     actors: list[_Actor] = []
-    realized = JsonlWriter(workdir / REALIZED)
+    realized = JsonlWriter(workdir / REALIZED, fsync=spec.get("sync_logs", True))
     deadline = time.monotonic() + timeout
     try:
         for index, fn in enumerate([scen.fn] * copies + list(scen.concurrent)):
@@ -146,17 +150,13 @@ def run_processes(scen: Scenario, spec: dict, workdir: Path, inc: int, copies: i
 
 def _schedule(actors: list[_Actor], choices: ChoiceSource, quiet: bool, inc: int,
               deadline: float, world: JsonlWriter, realized: JsonlWriter) -> _Actor | None:
-    for a in actors:
-        if not a.receive(deadline):
-            return a
     turn, picks = 0, 0
     # Run each actor's setup before its first real point, in declaration order.
     for a in actors:
-        if a.code is None:
-            turn += 1
-            a.turn = turn
-            if not a.advance(deadline):
-                return a
+        turn += 1
+        a.turn = turn
+        if not a.advance(deadline):
+            return a
     weight = 1.0 if choices.enabled("interleave") else 0.0
     while ready := [a for a in actors if a.code is None]:
         if time.monotonic() >= deadline:

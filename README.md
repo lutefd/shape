@@ -2,7 +2,7 @@
 
 An agent calls a payment API, the charge commits, and a timeout or connection reset hides the reply so the caller retries and charges twice. A worker crashes mid-tool and restarts from a checkpoint or redelivered job without knowing the external action already landed. The model itself is an untrusted input that can repeat a tool call, skip a step, or substitute the wrong order ID.
 
-`shape` tests whether the system around your agent stays safe under those failures. You mark the calls that touch the outside world, name the invariants that must hold, and `shape` injects faults, real `os._exit(137)` crashes, restarts, and model perturbations across hundreds of seeds, shrinking every failure to a minimal replayable trace.
+`shape` tests whether the system around your agent stays safe under those failures. Register network fakes or mark the calls that touch the outside world, then name the invariants that must hold. `shape` injects faults, real `os._exit(137)` crashes, restarts, and model perturbations across hundreds of seeds and shrinks failures to replayable traces.
 
 ## Who this is for (and who does not need it)
 
@@ -98,6 +98,7 @@ The `except ConnectionResetError:` branch retried without `idempotency_key='char
 
 ## Framework guides
 
+- **Network clients:** Pass `net=[fake, ...]` to `@shape.scenario` to capture HTTP, SMTP, and IMAP. The [Mailtrap example](examples/net/mailtrap.py) uses the real SDK and reproduces a false failure report after an accepted send. See [Network capture](docs/boundary.md#network-capture).
 - **Plain Python (sync and async):** Decorate client methods directly with `@shape.effect`, persist state in `run.dir`, and explore model choices with `shape.choose`. See [Testing plain Python agents](docs/guide/plain-python.md).
 - **LangGraph (`shape.langgraph`):** Wrap tools with `effects()`, drive `StateGraph` and `interrupt()` flows with `drive()` / `adrive()`, and perturb plans with `ScriptedChatModel`. Catches missing idempotency keys, wrong-target tool calls, default `durability="async"` checkpoint loss, and `RetryPolicy()` double charges. See [Testing LangGraph agents](docs/guide/langgraph.md).
 - **OpenAI Agents SDK (`shape.agents`):** Wrap `FunctionTool`s with `effects()`, run locally with `ScriptedModel` and `drive()` (using `SQLiteSession` and `RunState` persistence, no API key required). Catches model repeats, tool-error retries, mid-tool crashes, and unapproved targets. See [Testing OpenAI Agents SDK agents](docs/guide/openai-agents.md).

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -28,8 +29,30 @@ from .rootcause import describe
 INCARNATION_TIMEOUT = 30.0  # seconds; a hung incarnation counts as one that never finished
 TIMEOUT_EXIT = 124
 HARNESS_EXIT = 78  # a user-supplied shape hook (scope/key/result/landed) raised
+BUDGET_EXIT = 79
 RERUNS = 2  # a failing seed must fail the same way this many more times to count as a failure
 MAX_INVESTIGATED = 200  # failing seeds minimized per sweep, fewest deviations first
+
+
+class BudgetExpired(Exception):
+    pass
+
+
+def deadline_for(budget: float | None) -> float | None:
+    if budget is None:
+        return None
+    if not math.isfinite(budget) or budget < 0:
+        raise ValueError("budget must be a finite, non-negative number of seconds")
+    return time.monotonic() + budget
+
+
+def _time_left(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise BudgetExpired
+    return remaining
 
 
 @dataclass
@@ -53,11 +76,20 @@ def make_choices(spec: dict) -> ChoiceSource:
     return SeededChoices(spec["seed"]) if "seed" in spec else ExplicitChoices(spec["explicit"])
 
 
+def _network(scen: api.Scenario, workdir: Path):
+    if scen.net is None:
+        return contextlib.nullcontext()
+    from ..net import _capture
+
+    return _capture(workdir, scen.net)
+
+
 # ---------------------------------------------------------------------------------- incarnations
 
 
 def child_main(scen: api.Scenario, spec: dict, workdir: Path, inc: int, twin: int = 0, *,
-               fn=None, gate: schedule.Gate | None = None, actor_slot: int = 0) -> int:
+               fn=None, gate: schedule.Gate | None = None, actor_slot: int = 0,
+               deadline: float | None = None) -> int:
     """Run a scenario or its concurrent actor in an isolated process and return its exit code."""
     suffix = f"-p{actor_slot}" if actor_slot else f"-t{twin}" if twin else ""
     out = os.open(workdir / f"inc-{inc}{suffix}.out", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -70,16 +102,24 @@ def child_main(scen: api.Scenario, spec: dict, workdir: Path, inc: int, twin: in
     # so scenario_terminates asks whether the agent recovers, not whether the harness can outlast it.
     quiet = scen.max_restarts > 0 and inc == scen.max_restarts
     ctx = api._Context(workdir, inc, make_choices(spec), quiet, twin, gate=gate,
-                       actor_slot=actor_slot)
+                       actor_slot=actor_slot, sync_logs=spec.get("sync_logs", True))
     api.activate(ctx)
     if gate is None:
-        ctx.watchdog = threading.Timer(INCARNATION_TIMEOUT, lambda: os._exit(TIMEOUT_EXIT))
+        try:
+            remaining = _time_left(deadline)
+        except BudgetExpired:
+            return BUDGET_EXIT
+        timeout, exit_code = INCARNATION_TIMEOUT, TIMEOUT_EXIT
+        if remaining is not None and remaining < timeout:
+            timeout, exit_code = remaining, BUDGET_EXIT
+        ctx.watchdog = threading.Timer(timeout, lambda: os._exit(exit_code))
         ctx.watchdog.daemon = True
         ctx.watchdog.start()
     try:
         if gate is not None:
-            gate.point("entry")
-        (fn if fn is not None else scen.fn)(api.Run(workdir, inc, spec.get("seed")))
+            gate.enter()
+        with _network(scen, workdir):
+            (fn if fn is not None else scen.fn)(api.Run(workdir, inc, spec.get("seed")))
         return 0
     except api.HarnessError as exc:
         sys.stderr.write(f"harness error: {exc}\n")
@@ -99,45 +139,58 @@ def _classify(code: int) -> str:
     }.get(code, "error")
 
 
-def _fork_incarnation(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> int:
+def _fork_incarnation(scen: api.Scenario, spec: dict, workdir: Path, inc: int,
+                      deadline: float | None = None) -> int:
     sys.stdout.flush()
     sys.stderr.flush()
     pid = os.fork()
     if pid == 0:
         code = 70
         try:
-            code = child_main(scen, spec, workdir, inc)
+            code = child_main(scen, spec, workdir, inc, deadline=deadline)
         finally:
             os._exit(code)
     _, status = os.waitpid(pid, 0)
     return os.waitstatus_to_exitcode(status)
 
 
-def _spawn_incarnation(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> int:
+def _spawn_incarnation(scen: api.Scenario, spec: dict, workdir: Path, inc: int,
+                       deadline: float | None = None) -> int:
     root = str(Path(__file__).resolve().parents[2])
     paths = [root, *filter(None, [os.environ.get("PYTHONPATH")])]
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(paths)}
     payload = json.dumps({"file": scen.file, "name": scen.name, "spec": spec,
                           "workdir": str(workdir), "inc": inc})
-    return subprocess.run([sys.executable, "-m", "shape.boundary.child", payload],
-                          env=env, check=False).returncode
+    try:
+        return subprocess.run([sys.executable, "-m", "shape.boundary.child", payload],
+                              env=env, timeout=_time_left(deadline), check=False).returncode
+    except subprocess.TimeoutExpired as exc:
+        raise BudgetExpired from exc
 
 
 def _incarnate(scen: api.Scenario, spec: dict, workdir: Path, inc: int, copies: int,
-               world: JsonlWriter) -> str:
+               world: JsonlWriter, deadline: float | None = None) -> str:
+    remaining = _time_left(deadline)
     use_fork = hasattr(os, "fork") and os.environ.get("SHAPE_START_METHOD") != "spawn"
     if copies == 1 and not scen.concurrent:
-        code = (_fork_incarnation if use_fork else _spawn_incarnation)(scen, spec, workdir, inc)
+        run = _fork_incarnation if use_fork else _spawn_incarnation
+        code = run(scen, spec, workdir, inc, deadline)
+        if code == BUDGET_EXIT:
+            raise BudgetExpired
         world.write({"kind": "incarnation", "inc": inc, "twin": 0, "seq": PARENT_SEQ,
                      "how": _classify(code)})
         return "harness_error" if code == HARNESS_EXIT else ("done" if code == 0 else "retry")
+    budgeted = remaining is not None and remaining < INCARNATION_TIMEOUT
     actors = schedule.run_processes(
         scen, spec, workdir, inc, copies, use_fork=use_fork, choices=make_choices(spec),
         quiet=scen.max_restarts > 0 and inc == scen.max_restarts,
-        timeout=INCARNATION_TIMEOUT, timeout_exit=TIMEOUT_EXIT, world=world)
+        timeout=remaining if budgeted else INCARNATION_TIMEOUT,
+        timeout_exit=TIMEOUT_EXIT, world=world)
+    codes = [a.code for a in actors]
+    if budgeted and TIMEOUT_EXIT in codes:
+        raise BudgetExpired
     for a in actors:
         world.write(a.event(inc, PARENT_SEQ, kind="incarnation", how=_classify(a.code)))
-    codes = [a.code for a in actors]
     if HARNESS_EXIT in codes:
         return "harness_error"
     if (0 in codes[:copies] and all(code == 0 for code in codes[copies:])
@@ -154,7 +207,7 @@ def _delivered_twice(scen: api.Scenario, spec: dict, workdir: Path) -> bool:
     weights = [1.0, 1.0 if choices.enabled(DUPLICATE_TRIGGER) else 0.0]
     if not choices.draw(DUPLICATE_KEY, weights):
         return False
-    log = JsonlWriter(workdir / REALIZED)
+    log = JsonlWriter(workdir / REALIZED, fsync=spec.get("sync_logs", True))
     log.write({"key": DUPLICATE_KEY, "value": 1, "fault": DUPLICATE_TRIGGER,
                "op": coverage.SCENARIO_OP, "call": "the scenario is triggered", "raised": None,
                "inc": 0, "twin": 0, "seq": 0})
@@ -162,46 +215,56 @@ def _delivered_twice(scen: api.Scenario, spec: dict, workdir: Path) -> bool:
     return True
 
 
-def _run_actors(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> None:
+def _run_actors(scen: api.Scenario, spec: dict, workdir: Path, inc: int) -> bool:
     """Call the world actors in the parent, between incarnation `inc` and the next one."""
     if not scen.actors:
-        return
-    ctx = api._Context(workdir, inc, make_choices(spec), actors=True)
+        return True
+    ctx = api._Context(workdir, inc, make_choices(spec), actors=True,
+                       sync_logs=spec.get("sync_logs", True))
     api.activate(ctx)
     try:
-        for act in scen.actors:
-            ctx.actor = act.name
-            try:
-                act(api.Run(workdir, inc + 1, spec.get("seed")))
-            except Exception as exc:  # noqa: BLE001 - a broken actor is reported, not fatal
-                ctx.append(ctx.world, {"kind": "error",
-                                       "text": f"world actor {act.name} raised {describe(exc)}"})
+        with _network(scen, workdir):
+            for act in scen.actors:
+                ctx.actor = act.name
+                try:
+                    act(api.Run(workdir, inc + 1, spec.get("seed")))
+                except api.HarnessError:
+                    return False
+                except Exception as exc:  # noqa: BLE001 - a broken actor is reported, not fatal
+                    ctx.append(ctx.world, {"kind": "error",
+                                           "text": f"world actor {act.name} raised {describe(exc)}"})
     finally:
         api.activate(None)
         ctx.close()
+    return True
 
 
 # ------------------------------------------------------------------------------------------ a seed
 
 
-def execute(scen: api.Scenario, spec: dict, workdir: Path) -> Outcome:
+def execute(scen: api.Scenario, spec: dict, workdir: Path, *, deadline: float | None = None,
+            collect_stats: bool = True) -> Outcome:
     """Run one seed (or one explicit replay) in `workdir`, restarting after every death."""
+    _time_left(deadline)
+    if scen.net is not None:
+        from ..net import _prepare
+
+        _prepare()
     shutil.rmtree(workdir, ignore_errors=True)
     workdir.mkdir(parents=True, exist_ok=True)
-    parent = JsonlWriter(workdir / WORLD, fsync=False)
     copies = 2 if _delivered_twice(scen, spec, workdir) else 1
     completed, incarnations = False, 0
-    for inc in range(scen.max_restarts + 1):
-        incarnations += 1
-        state = _incarnate(scen, spec, workdir, inc, copies if inc == 0 else 1, parent)
-        if state == "harness_error":
-            break
-        if state == "done":
-            completed = True
-            break
-        if inc < scen.max_restarts:
-            _run_actors(scen, spec, workdir, inc)
-    parent.close()
+    with contextlib.closing(JsonlWriter(workdir / WORLD, fsync=False)) as parent:
+        for inc in range(scen.max_restarts + 1):
+            incarnations += 1
+            state = _incarnate(scen, spec, workdir, inc, copies if inc == 0 else 1, parent, deadline)
+            if state == "harness_error":
+                break
+            if state == "done":
+                completed = True
+                break
+            if inc < scen.max_restarts and not _run_actors(scen, spec, workdir, inc):
+                break
     entries = read_jsonl(workdir / WORLD)
     draws = _read_draws(workdir)
     world = World(entries, completed, incarnations, scen.max_restarts,
@@ -220,23 +283,25 @@ def execute(scen: api.Scenario, spec: dict, workdir: Path) -> Outcome:
             if message:
                 op = getattr(message, "op", None) or (inv.ops[0] if len(inv.ops) == 1 else None)
                 violations.append(Violation(inv.name, str(message), op))
+    stats = coverage.of_run(world, draws) if collect_stats else {}
     return Outcome(workdir, completed, entries + draws, {d["key"]: d["value"] for d in draws},
-                   violations, coverage.of_run(world, draws))
+                   violations, stats)
 
 
-def run_seed(scen: api.Scenario, seed: int, runs_dir: Path) -> Outcome:
+def run_seed(scen: api.Scenario, seed: int, runs_dir: Path, *,
+             deadline: float | None = None) -> Outcome:
     base = runs_dir / scen.name
     work = base / f".work-{os.getpid()}-{seed}"
     try:
-        out = execute(scen, {"seed": seed}, work)
+        out = execute(scen, {"seed": seed}, work, deadline=deadline)
     except BaseException:
         shutil.rmtree(work, ignore_errors=True)
         raise
+    shutil.rmtree(base / f"seed-{seed}.min", ignore_errors=True)
+    (base / f"seed-{seed}.min.json").unlink(missing_ok=True)
     if out.ok:
         shutil.rmtree(work, ignore_errors=True)
         shutil.rmtree(base / f"seed-{seed}", ignore_errors=True)
-        shutil.rmtree(base / f"seed-{seed}.min", ignore_errors=True)
-        (base / f"seed-{seed}.min.json").unlink(missing_ok=True)
     else:
         kept = base / f"seed-{seed}"
         shutil.rmtree(kept, ignore_errors=True)
@@ -253,9 +318,20 @@ class Sweep:
     cov: coverage.Coverage
     wall: float
     failing_ops: dict[int, str | None] = field(default_factory=dict)
+    skipped_seeds: int = 0
+    unconfirmed: list[int] = field(default_factory=list)
 
     def problems(self, scen: api.Scenario) -> list[str]:
         """Reasons a sweep that found no failure still proved nothing."""
+        if self.skipped_seeds or self.unconfirmed:
+            notes = []
+            if self.skipped_seeds:
+                notes.append(f"skipped {self.skipped_seeds} of "
+                             f"{self.seeds + self.skipped_seeds} requested seeds")
+            if self.unconfirmed:
+                notes.append(f"skipped confirmation and minimization for {len(self.unconfirmed)} "
+                             "seeds that failed on their first run")
+            return ["INCOMPLETE: time budget exhausted, " + ", ".join(notes)]
         if self.failing or self.flaky:
             return []
         if not scen.expect_effects:
@@ -265,7 +341,7 @@ class Sweep:
             return [(f"NOTHING TESTED: harness hook raised across {self.seeds} seeds "
                      f"({sample}), so no effect could be checked.")]
         if not self.cov.calls:
-            return [("NOTHING TESTED: no @shape.effect function was called in any of "
+            return [("NOTHING TESTED: no effect was called in any of "
                      f"{self.seeds} seeds (0 attempts), so every invariant passed vacuously. "
                      "Check that the agent reaches its tools (a model output that fails "
                      "validation never gets there). A scenario that must do nothing sets "
@@ -289,21 +365,29 @@ class Sweep:
                 for op in coverage.never_ran(self.cov, ops)]
 
 
-def _reproduces(scen: api.Scenario, seed: int, invariant: str, runs_dir: Path) -> bool:
+def _reproduces(scen: api.Scenario, seed: int, invariant: str, runs_dir: Path,
+                deadline: float | None) -> bool:
     work = runs_dir / scen.name / f".rerun-{os.getpid()}-{seed}"
     try:
-        return all(execute(scen, {"seed": seed}, work).violated(invariant) for _ in range(RERUNS))
+        for _ in range(RERUNS):
+            # A killed process leaves unbuffered writes in the kernel page cache.
+            out = execute(scen, {"seed": seed, "sync_logs": False}, work, deadline=deadline,
+                          collect_stats=False)
+            if not out.violated(invariant):
+                return False
+        return True
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def run_sweep(scen: api.Scenario, seeds: range, runs_dir: Path, jobs: int = 1) -> Sweep:
+def run_sweep(scen: api.Scenario, seeds: range, runs_dir: Path, jobs: int = 1, *,
+              deadline: float | None = None) -> Sweep:
     """Run every seed, then re-run each failing seed: one that does not fail the same way
     again is flaky (it depends on something shape does not control), not a failure."""
     started = time.perf_counter()
 
     def one(seed: int) -> list:
-        out = run_seed(scen, seed, runs_dir)
+        out = run_seed(scen, seed, runs_dir, deadline=deadline)
         first = None if out.ok else out.violations[0]
         return [
             seed,
@@ -313,10 +397,7 @@ def run_sweep(scen: api.Scenario, seeds: range, runs_dir: Path, jobs: int = 1) -
             out.stats,
         ]
 
-    if jobs <= 1 or not hasattr(os, "fork"):
-        rows = [one(s) for s in seeds]
-    else:
-        rows = _parallel(list(seeds), jobs, one)
+    rows = _run_batch(seeds, jobs, one)
     cov = coverage.Coverage()
     failed = []
     failed_ops: dict[int, str | None] = {}
@@ -328,20 +409,18 @@ def run_sweep(scen: api.Scenario, seeds: range, runs_dir: Path, jobs: int = 1) -
     again = {seed: invariant for seed, invariant, _ in failed}
 
     def rerun(seed: int) -> list:
-        return [seed, _reproduces(scen, seed, again[seed], runs_dir)]
+        return [seed, _reproduces(scen, seed, again[seed], runs_dir, deadline)]
 
-    seeds_failed = [f[0] for f in failed]
-    if jobs <= 1 or not hasattr(os, "fork") or len(seeds_failed) < 2:
-        verdicts = dict(rerun(s) for s in seeds_failed)
-    else:
-        verdicts = dict(_parallel(seeds_failed, jobs, rerun))
-    failing = [f for f in failed if verdicts[f[0]]]
-    flaky = [f[0] for f in failed if not verdicts[f[0]]]
+    verdicts = dict(_run_batch(list(again), jobs, rerun))
+    failing = [f for f in failed if verdicts.get(f[0]) is True]
+    flaky = [seed for seed in again if verdicts.get(seed) is False]
+    unconfirmed = [seed for seed in again if seed not in verdicts]
     failing_ops = {f[0]: failed_ops[f[0]] for f in failing}
     if not failing and not flaky:
         with contextlib.suppress(OSError):
             (runs_dir / scen.name).rmdir()
-    return Sweep(len(seeds), failing, flaky, cov, time.perf_counter() - started, failing_ops)
+    return Sweep(len(rows), failing, flaky, cov, time.perf_counter() - started, failing_ops,
+                 len(seeds) - len(rows), unconfirmed)
 
 
 def sweep(scen: api.Scenario, seeds: range, runs_dir: Path,
@@ -350,7 +429,20 @@ def sweep(scen: api.Scenario, seeds: range, runs_dir: Path,
     return run_sweep(scen, seeds, runs_dir, jobs).failing
 
 
-def _parallel(seeds: list[int], jobs: int, one) -> list:
+def _until_budget(seeds, one) -> list:
+    rows = []
+    for seed in seeds:
+        try:
+            rows.append(one(seed))
+        except BudgetExpired:
+            break
+    return rows
+
+
+def _run_batch(seeds, jobs: int, one) -> list:
+    jobs = min(jobs, len(seeds))
+    if jobs <= 1 or not hasattr(os, "fork"):
+        return _until_budget(seeds, one)
     workers = []
     sys.stdout.flush()  # a forked worker must not inherit, and later flush, the parent's output
     sys.stderr.flush()
@@ -361,7 +453,7 @@ def _parallel(seeds: list[int], jobs: int, one) -> list:
             os.close(read)
             code = 1
             try:
-                payload = json.dumps([one(s) for s in chunk])
+                payload = json.dumps(_until_budget(chunk, one))
                 with os.fdopen(write, "w") as f:
                     f.write(payload)
                 code = 0
@@ -458,17 +550,19 @@ def _signature(invariant: str, op: str | None, coarse_devs: tuple[str, ...]) -> 
 
 
 def investigate(scen: api.Scenario, seed: int, invariant: str, realized: dict[str, int],
-                runs_dir: Path, target: str) -> Failure:
+                runs_dir: Path, target: str, *, deadline: float | None = None) -> Failure:
     """Confirm a failing seed by replay, shrink it, and describe the minimal run."""
     base = runs_dir / scen.name
     kept = base / f"seed-{seed}"
     work = base / f".shrink-{os.getpid()}"
+    final_dir = base / f"seed-{seed}.min"
     replays = 0
 
     def fails(candidate: dict[str, int]) -> bool:
         nonlocal replays
         replays += 1
-        return execute(scen, {"explicit": candidate}, work).violated(invariant)
+        return execute(scen, {"explicit": candidate, "sync_logs": False}, work, deadline=deadline,
+                       collect_stats=False).violated(invariant)
 
     def failure(entries: list[dict], message: str, op: str | None, small: dict[str, int],
                 problem: str | None) -> Failure:
@@ -484,9 +578,9 @@ def investigate(scen: api.Scenario, seed: int, invariant: str, realized: dict[st
                        _signature(invariant, op, coarse_devs), op, coarse_devs, exact)
 
     try:
-        first = execute(scen, {"explicit": realized}, work)
+        first = execute(scen, {"explicit": realized}, final_dir, deadline=deadline,
+                        collect_stats=False)
         replays += 1
-        original = read_story(kept)
         first_v = next((v for v in first.violations if v.invariant == invariant), None)
         message = first_v.message if first_v else ""
         op = first_v.op if first_v else None
@@ -495,12 +589,15 @@ def investigate(scen: api.Scenario, seed: int, invariant: str, realized: dict[st
                    if not first.violated(invariant) else "reached only some of the recorded keys")
                    + ": the run depends on something shape does not control (time, threads,"
                    " an unscripted model), so it cannot be replayed or minimized")
-            return failure(original, message or "(did not reproduce)", op, realized, why)
+            shutil.rmtree(final_dir, ignore_errors=True)
+            return failure(read_story(kept), message or "(did not reproduce)", op, realized, why)
 
-        small = shrink(realized, fails)
-        final_dir = base / f"seed-{seed}.min"
-        final = execute(scen, {"explicit": small}, final_dir)
-        replays += 1
+        small = shrink(realized, fails) if realized else realized
+        final = first
+        if small != realized:
+            final = execute(scen, {"explicit": small}, final_dir, deadline=deadline,
+                            collect_stats=False)
+            replays += 1
         final_v = next((v for v in final.violations if v.invariant == invariant), None)
         message = final_v.message if final_v else ""
         op = final_v.op if final_v else op
@@ -509,6 +606,9 @@ def investigate(scen: api.Scenario, seed: int, invariant: str, realized: dict[st
             return failure(read_story(kept), message, op, realized,
                            "the minimized run diverged on replay, so the minimal trace is not trusted")
         return failure(final.entries, message, op, small, None)
+    except BudgetExpired:
+        shutil.rmtree(final_dir, ignore_errors=True)
+        raise
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -524,7 +624,8 @@ def _cause_op_matches(cause: Cause, seed_op: str | None, has_ops: bool) -> bool:
 
 def investigate_all(scen: api.Scenario, failing: list[tuple[int, str, dict]], runs_dir: Path,
                     target: str, limit: int = MAX_INVESTIGATED,
-                    failing_ops: dict[int, str | None] | None = None) -> Report:
+                    failing_ops: dict[int, str | None] | None = None, *,
+                    deadline: float | None = None) -> Report:
     """Group failing seeds by root cause: the invariant, violating op, and coarse deviation
     classes of the minimized run. Seeds go fewest deviations first. A seed that still contains
     every coarse deviation of a cause already found (same invariant and op) joins that cause
@@ -532,7 +633,7 @@ def investigate_all(scen: api.Scenario, failing: list[tuple[int, str, dict]], ru
     Nominal-path causes (0 deviations) are listed last so shape-only findings stand out."""
     ordered = sorted(failing, key=lambda f: (len(f[2]), f[0]))
     causes: dict[tuple, Cause] = {}
-    investigated = skipped = 0
+    investigated = skipped = budget_skipped = 0
     for seed, invariant, realized in ordered:
         raw_coarse = raw_coarse_kinds(realized)
         has_ops = failing_ops is not None and seed in failing_ops
@@ -551,13 +652,18 @@ def investigate_all(scen: api.Scenario, failing: list[tuple[int, str, dict]], ru
         elif investigated >= limit:
             skipped += 1
         else:
-            found = investigate(scen, seed, invariant, realized, runs_dir, target)
+            try:
+                found = investigate(scen, seed, invariant, realized, runs_dir, target,
+                                    deadline=deadline)
+            except BudgetExpired:
+                budget_skipped += 1
+                continue
             investigated += 1
             cause = causes.setdefault(found.signature, Cause(found))
             cause.seeds.append(seed)
             cause.exact_kinds.update(found.exact_kinds)
     ranked = sorted(causes.values(), key=lambda c: (c.is_nominal, -len(c.seeds), c.failure.seed))
-    return Report(len(failing), ranked, skipped)
+    return Report(len(failing), ranked, skipped, budget_skipped)
 
 
 def _read_draws(workdir: Path) -> list[dict]:
@@ -604,20 +710,25 @@ def replay(scen: api.Scenario, path: str | Path, runs_dir: str | Path = "runs") 
 
 
 def check(scen: api.Scenario, seeds: int = 100, start: int = 0,
-          runs_dir: str | Path = "runs", jobs: int = 1) -> None:
+          runs_dir: str | Path = "runs", jobs: int = 1, *, budget: float | None = None,
+          max_shrinks: int = MAX_INVESTIGATED) -> None:
     """Run `seeds` seeds (in `jobs` forked workers where available). Raises AssertionError
-    carrying the minimized trace on failure."""
+    carrying the minimized trace on failure. A time budget includes confirmation and shrinking.
+    `max_shrinks` limits failed seeds investigated and can be zero."""
+    if max_shrinks < 0:
+        raise ValueError("max_shrinks must be non-negative")
+    deadline = deadline_for(budget)
     runs = Path(runs_dir)
-    swept = run_sweep(scen, range(start, start + seeds), runs, jobs=jobs)
+    swept = run_sweep(scen, range(start, start + seeds), runs, jobs=jobs, deadline=deadline)
     problems = swept.problems(scen)
     if not (swept.failing or swept.flaky or problems):
         return
-    parts = [f"{len(swept.failing)} of {seeds} seeds failed"
+    parts = [f"{len(swept.failing)} of {swept.seeds} seeds failed"
              + (f", {len(swept.flaky)} flaky" if swept.flaky else ""), swept.cov.render()]
     if swept.failing:
         parts.append(
-            investigate_all(scen, swept.failing, runs, scen.name,
-                            failing_ops=swept.failing_ops).render()
+            investigate_all(scen, swept.failing, runs, scen.name, limit=max_shrinks,
+                            failing_ops=swept.failing_ops, deadline=deadline).render()
         )
     if swept.flaky:
         parts.append(render_flaky(swept.flaky))

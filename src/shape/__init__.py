@@ -50,6 +50,7 @@ __all__ = [
     "exactly_once",
     "invariant",
     "max_calls",
+    "net",
     "point",
     "replay",
     "requires",
@@ -62,7 +63,7 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    if name in ("langgraph", "agents", "fakes"):
+    if name in ("langgraph", "agents", "fakes", "net"):
         import importlib
         return importlib.import_module(f".{name}", __name__)
     raise AttributeError(f"module 'shape' has no attribute {name!r}")

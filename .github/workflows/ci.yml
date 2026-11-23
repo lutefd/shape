@@ -11,7 +11,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e '.[dev]'
+      - run: pip install -e '.[dev]' httpx -r examples/net/requirements.txt
       - run: ruff check
       - run: pytest -q
       - name: toy saga must fail and shrink
@@ -36,6 +36,15 @@ jobs:
         run: shape test examples/plain_python/checks.py::checkout_fixed --seeds 200
       - name: README quickstart and guide docs check
         run: python scripts/check_docs.py
+      - name: Mailtrap SDK example must find the false failure report
+        run: |
+          code=0
+          shape test examples/net/mailtrap.py::mailtrap_reports_last_result +            --start 931 --seeds 1 > mailtrap.out || code=$?
+          cat mailtrap.out
+          test "$code" -eq 1
+          grep -q 'invariant=claims_true' mailtrap.out
+          grep -q '2 of 2 deviations kept' mailtrap.out
+          grep -q 'caller saw HTTP 503' mailtrap.out
       - name: race examples must fail, shrink, replay and pass with the fix
         run: |
           for case in lead_summary:summary:every_stored_lead_appears_in_a_summary job_claim:queue:job_processed_once; do
