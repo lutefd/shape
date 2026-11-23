@@ -248,3 +248,115 @@ def test_drive_approval_and_custom_session_factory(tmp_path):
         )
 
     shape.check(approval_flow, seeds=60, runs_dir=tmp_path)
+
+
+@dataclass
+class _TenantCtx:
+    tenant: str
+    allow: bool = True
+
+
+def test_agents_adapter_passes_context_and_supports_landed_key_from_result_and_harness_errors(
+    tmp_path,
+):
+    @function_tool
+    def open_case(wrapper: RunContextWrapper[_TenantCtx], subject: str) -> str:
+        """Open a support case."""
+        if not wrapper.context.allow:
+            return "refused: account frozen"
+        return json.dumps({"case_id": f"{wrapper.context.tenant}-5170", "subject": subject})
+
+    # 1. Context (via wrapper, ctx, and context) flows into scope, key_from_result, result, landed
+    tools = shape.agents.effects(
+        [open_case],
+        ops={
+            "open_case": {
+                "op": "cases.open",
+                "scope": lambda wrapper, subject, **_: f"{wrapper.context.tenant}:{subject}",
+                "landed": lambda res, ctx, **_: (
+                    ctx.context.tenant == "acme" and not res.startswith("refused:")
+                ),
+                "key_from_result": lambda res, context, **_: (
+                    json.loads(res)["case_id"] if context.context.allow else None
+                ),
+                "result": lambda res, ctx, **_: f"{ctx.context.tenant}:{json.loads(res)['case_id']}",
+            }
+        },
+    )
+    model = shape.agents.ScriptedModel(
+        [("open_case", {"subject": "billing"}), ("open_case", {"subject": "billing"})],
+        final="done",
+    )
+    agent = Agent(name="Support", instructions="Open cases.", model=model, tools=tools)
+
+    @shape.scenario(invariants=[shape.at_most_once("cases.open")], max_restarts=0)
+    def deduped_with_ctx(run: shape.Run) -> None:
+        shape.agents.drive(agent, "open", run, context=_TenantCtx(tenant="acme", allow=True))
+
+    out = runner.execute(deduped_with_ctx, {"explicit": {}}, tmp_path / "ctx")
+    assert out.ok, out.violations
+    effects = [e for e in out.entries if e["kind"] == "effect"]
+    assert len(effects) == 2
+    assert effects[0]["scope"] == "acme:billing"
+    assert effects[0]["key"] == "acme-5170"
+    assert effects[0]["result"] == "acme:acme-5170"
+    # Framework context must not pollute rendered call or args
+    assert "wrapper" not in effects[0]["call"] and "ctx" not in effects[0]["args"]
+
+    # 2. Refusal string with landed= logs no_effect, not effect
+    @shape.scenario(invariants=[shape.at_most_once("cases.open")], max_restarts=0)
+    def refused_with_ctx(run: shape.Run) -> None:
+        shape.agents.drive(agent, "open", run, context=_TenantCtx(tenant="acme", allow=False))
+
+    out_ref = runner.execute(refused_with_ctx, {"explicit": {}}, tmp_path / "ref")
+    assert [e for e in out_ref.entries if e["kind"] == "effect"] == []
+    assert len([e for e in out_ref.entries if e["kind"] == "no_effect"]) == 2
+    trace, _ = runner.story(out_ref.entries)
+    assert any("returned without effect" in line for line in trace)
+
+    # 3. Harness error in scope= is NEVER swallowed by Agents SDK into a tool error string
+    bad_tools = shape.agents.effects(
+        [open_case],
+        ops={"open_case": {"op": "cases.open", "scope": lambda missing_arg: missing_arg}},
+    )
+    bad_agent = Agent(
+        name="Support",
+        instructions="Open cases.",
+        model=shape.agents.ScriptedModel([("open_case", {"subject": "billing"})], final="done"),
+        tools=bad_tools,
+    )
+
+    @shape.scenario(invariants=[shape.at_most_once("cases.open")], max_restarts=2)
+    def bad_scope(run: shape.Run) -> None:
+        shape.agents.drive(bad_agent, "open", run, context=_TenantCtx(tenant="acme"))
+
+    out_bad = runner.execute(bad_scope, {"explicit": {}}, tmp_path / "bad_scope")
+    assert not out_bad.ok
+    assert out_bad.violations[0].invariant == "harness_error"
+    assert "your scope for cases.open raised TypeError:" in out_bad.violations[0].message
+    assert "test_agents_adapter.py:" in out_bad.violations[0].message
+
+
+def test_agents_adapter_auto_detects_framework_error_string_as_not_landed(tmp_path):
+    from agents import FunctionTool
+
+    async def converted_error(_ctx, _raw: str) -> str:
+        return "An error occurred while running the tool. Please try again."
+
+    raw_tool = FunctionTool(
+        name="flaky_tool",
+        description="Returns converted framework error.",
+        params_json_schema={"type": "object", "properties": {"x": {"type": "string"}}},
+        on_invoke_tool=converted_error,
+    )
+    wrapped = shape.agents.effects([raw_tool], ops={"flaky_tool": "t.flaky"})
+    model = shape.agents.ScriptedModel([("flaky_tool", {"x": "1"})], final="done")
+    agent = Agent(name="A", instructions="i", model=model, tools=wrapped)
+
+    @shape.scenario(invariants=[shape.at_most_once("t.flaky")], max_restarts=0)
+    def run_converted(run: shape.Run) -> None:
+        shape.agents.drive(agent, "go", run)
+
+    out = runner.execute(run_converted, {"explicit": {}}, tmp_path / "conv")
+    assert [e for e in out.entries if e["kind"] == "effect"] == []
+    assert len([e for e in out.entries if e["kind"] == "no_effect"]) >= 1

@@ -39,7 +39,7 @@ build-backend = "hatchling.build"
 packages = ["src/shape"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src/shape", "/tests", "/README.md", "/LICENSE", "/docs/adapters.md", "/docs/boundary.md", "/docs/design.md"]
+include = ["/src/shape", "/tests", "/README.md", "/LICENSE", "/docs/adapters.md", "/docs/boundary.md", "/docs/design.md", "/docs/guide"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -5,6 +5,8 @@ Install the optional dependency extra with `pip install 'agent-shape[langgraph]'
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import inspect
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -14,6 +16,8 @@ try:
     from langchain_core.language_models.chat_models import BaseChatModel
     from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
     from langchain_core.outputs import ChatGeneration, ChatResult
+    from langchain_core.runnables import RunnableConfig
+    from langchain_core.runnables.config import var_child_runnable_config
     from langchain_core.tools import BaseTool, StructuredTool
     from langgraph.types import Command
     from pydantic import ConfigDict, PrivateAttr
@@ -22,6 +26,12 @@ except ImportError as exc:  # pragma: no cover - verified by missing-dep test
         "shape.langgraph requires langgraph; install with: pip install 'agent-shape[langgraph]'"
     ) from exc
 
+try:
+    from langgraph.prebuilt.tool_node import _get_all_injected_args
+except ImportError:  # pragma: no cover
+    _get_all_injected_args = None
+
+from ..boundary import api
 from ..boundary.api import Run
 from ._plan import (
     Call,
@@ -34,6 +44,7 @@ from ._plan import (
     HistoryUser,
     PlanRunner,
     PlanStep,
+    compose_landed,
     make_effect_decorator,
     normalize_effect,
 )
@@ -47,9 +58,75 @@ def _tool_name(tool: Any) -> str:
     return getattr(tool, "__name__", repr(tool))
 
 
+def _is_error_result(value: Any) -> bool:
+    if isinstance(value, ToolMessage):
+        return getattr(value, "status", None) == "error"
+    if isinstance(value, Command) and isinstance(value.update, Mapping):
+        msgs = value.update.get("messages")
+        if isinstance(msgs, Sequence) and not isinstance(msgs, (str, bytes)):
+            return any(
+                isinstance(m, ToolMessage) and getattr(m, "status", None) == "error"
+                for m in msgs
+            )
+    return False
+
+
+def _injected_arg_names(tool: BaseTool) -> frozenset[str]:
+    """Argument names LangGraph injects into `tool` (InjectedState, InjectedStore, ToolRuntime).
+    Hidden from rendered calls and approval hashes, while still passed to shape hooks."""
+    if _get_all_injected_args is None:
+        return frozenset()
+    try:
+        injected = _get_all_injected_args(tool)
+    except Exception:  # noqa: BLE001
+        return frozenset()
+    names = set(getattr(injected, "all_injected_keys", ()))
+    names.update(getattr(injected, "state", {}).keys())
+    if store := getattr(injected, "store", None):
+        names.add(store)
+    if runtime := getattr(injected, "runtime", None):
+        names.add(runtime)
+    return frozenset(names)
+
+
+def _current_config(explicit: RunnableConfig | None = None) -> dict[str, Any] | None:
+    cfg = explicit if explicit is not None else var_child_runnable_config.get()
+    return {"config": cfg} if cfg is not None else None
+
+
+def _wrap_callable_with_config(fn: Callable, dec: Callable) -> Callable:
+    wrapped = dec(fn)
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def async_with_ctx(*args: Any, **kwargs: Any) -> Any:
+            with api.with_context(_current_config()):
+                return await wrapped(*args, **kwargs)
+        return async_with_ctx
+
+    @functools.wraps(fn)
+    def sync_with_ctx(*args: Any, **kwargs: Any) -> Any:
+        with api.with_context(_current_config()):
+            return wrapped(*args, **kwargs)
+    return sync_with_ctx
+
+
+def _accepts_param(fn: Callable, name: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def _wrap_base_tool(tool: BaseTool, decorator: Callable) -> BaseTool:
     run_fn = decorator(tool._run)
     arun_fn = decorator(tool._arun)
+    run_wants_rm = _accepts_param(tool._run, "run_manager")
+    run_wants_cfg = _accepts_param(tool._run, "config")
+    arun_wants_rm = _accepts_param(tool._arun, "run_manager")
+    arun_wants_cfg = _accepts_param(tool._arun, "config")
 
     class _EffectTool(BaseTool):
         model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -60,25 +137,30 @@ def _wrap_base_tool(tool: BaseTool, decorator: Callable) -> BaseTool:
         def _run(
             self,
             *args: Any,
+            config: RunnableConfig | None = None,
             run_manager: CallbackManagerForToolRun | None = None,
             **kwargs: Any,
         ) -> Any:
-            if run_manager is not None and "run_manager" in inspect.signature(tool._run).parameters:
+            if run_manager is not None and run_wants_rm:
                 kwargs["run_manager"] = run_manager
-            return self._wrapped_run(*args, **kwargs)
+            if config is not None and run_wants_cfg:
+                kwargs["config"] = config
+            with api.with_context(_current_config(config)):
+                return self._wrapped_run(*args, **kwargs)
 
         async def _arun(
             self,
             *args: Any,
+            config: RunnableConfig | None = None,
             run_manager: AsyncCallbackManagerForToolRun | None = None,
             **kwargs: Any,
         ) -> Any:
-            if (
-                run_manager is not None
-                and "run_manager" in inspect.signature(tool._arun).parameters
-            ):
+            if run_manager is not None and arun_wants_rm:
                 kwargs["run_manager"] = run_manager
-            return await self._wrapped_arun(*args, **kwargs)
+            if config is not None and arun_wants_cfg:
+                kwargs["config"] = config
+            with api.with_context(_current_config(config)):
+                return await self._wrapped_arun(*args, **kwargs)
 
     wrapped = _EffectTool(
         name=tool.name,
@@ -110,18 +192,24 @@ def effects(tools: Sequence[Any], ops: Mapping[str, EffectConfig]) -> list[Any]:
             out.append(tool)
             continue
         spec = normalize_effect(name, ops[name])
+        extra_hide = _injected_arg_names(tool) if isinstance(tool, BaseTool) else frozenset()
+        spec = dataclasses.replace(
+            spec,
+            hide=tuple(dict.fromkeys((*spec.hide, *extra_hide))),
+            landed=compose_landed(_is_error_result, spec.landed),
+        )
         dec = make_effect_decorator(spec)
         if isinstance(tool, StructuredTool):
             updates: dict[str, Any] = {}
             if tool.func is not None:
-                updates["func"] = dec(tool.func)
+                updates["func"] = _wrap_callable_with_config(tool.func, dec)
             if tool.coroutine is not None:
-                updates["coroutine"] = dec(tool.coroutine)
+                updates["coroutine"] = _wrap_callable_with_config(tool.coroutine, dec)
             out.append(tool.model_copy(update=updates))
         elif isinstance(tool, BaseTool):
             out.append(_wrap_base_tool(tool, dec))
         elif callable(tool):
-            out.append(dec(tool))
+            out.append(_wrap_callable_with_config(tool, dec))
         else:
             raise TypeError(f"cannot wrap tool {name!r} of type {type(tool).__name__}")
     return out
@@ -231,6 +319,65 @@ def _interrupt_payload(result: Mapping[str, Any]) -> Any:
     return values[0] if len(values) == 1 else values
 
 
+def _node_label(nodes: Sequence[str]) -> str:
+    word = "node" if len(nodes) == 1 else "nodes"
+    return f"{word} {', '.join(repr(n) for n in nodes)}"
+
+
+def _has_checkpointer(graph: Any, config: Mapping[str, Any]) -> bool:
+    return (
+        getattr(graph, "checkpointer", None) is not None
+        and isinstance(config, Mapping)
+        and bool(config.get("configurable", {}).get("thread_id"))
+        and hasattr(graph, "get_state")
+    )
+
+
+def _checkpoint_id(snapshot: Any) -> Any:
+    cfg = getattr(snapshot, "config", None)
+    if isinstance(cfg, Mapping):
+        return cfg.get("configurable", {}).get("checkpoint_id")
+    return None
+
+
+def _denial_update(snapshot: Any) -> dict[str, Any] | None:
+    values = getattr(snapshot, "values", None)
+    if not isinstance(values, Mapping):
+        return None
+    messages = values.get("messages")
+    if not messages:
+        return None
+    last = messages[-1]
+    tool_calls = getattr(last, "tool_calls", None)
+    if not isinstance(last, AIMessage) or not tool_calls:
+        return None
+    return {
+        "messages": [
+            ToolMessage(
+                tool_call_id=str(tc["id"]),
+                name=str(tc["name"]),
+                content="Tool call was not approved by user.",
+            )
+            for tc in tool_calls
+        ]
+    }
+
+
+def _static_resume_input(snapshot: Any, reply: Any) -> tuple[bool, Any]:
+    if reply is True or reply is None:
+        return True, None
+    if reply is False:
+        denial = _denial_update(snapshot)
+        return (True, denial) if denial is not None else (False, None)
+    if isinstance(reply, (Command, Mapping)):
+        return True, reply
+    nodes = _node_label(snapshot.next)
+    raise RuntimeError(
+        f"graph paused before {nodes}; human=... returned {type(reply).__name__}, "
+        "expected bool, None, dict, or Command"
+    )
+
+
 def drive(
     graph: Any,
     input: Any,
@@ -246,18 +393,55 @@ def drive(
     - `run.restarts > 0`: calls `graph.invoke(None, config)` to resume from the checkpointer.
     - Whenever the graph pauses at `interrupt()`, calls `human(payload)` (which may use
       `shape.choose` for approve/reject/edit) and resumes with `Command(resume=reply)`.
+    - Whenever the graph pauses at a static `interrupt_before=` / `interrupt_after=` breakpoint
+      (detected via `graph.get_state(config).next`), calls `human(snapshot)` and resumes (`True`
+      or `None` -> `invoke(None)`, `False` -> denies pending tool calls or stops, `dict`/`Command`
+      -> passed to `invoke`). Raises loudly if no `human=` callback was given or resume stalls.
     """
     kwargs = {"durability": durability} if durability is not None else {}
     result = graph.invoke(input if run.restarts == 0 else None, config, **kwargs)
-    while isinstance(result, Mapping) and result.get("__interrupt__"):
+    while True:
+        if isinstance(result, Mapping) and result.get("__interrupt__"):
+            if human is None:
+                raise RuntimeError(
+                    "graph paused at interrupt(), but no human=... callback was given to "
+                    "shape.langgraph.drive()"
+                )
+            reply = human(_interrupt_payload(result))
+            result = graph.invoke(Command(resume=reply), config, **kwargs)
+            continue
+        if not _has_checkpointer(graph, config):
+            return result
+        snapshot = graph.get_state(config)
+        if not getattr(snapshot, "next", None):
+            return result
+        nodes = _node_label(snapshot.next)
         if human is None:
+            raise RuntimeError(f"graph paused before {nodes}; pass human=... to approve")
+        before_ckpt = _checkpoint_id(snapshot)
+        before_next = tuple(snapshot.next)
+        reply = human(snapshot)
+        should_resume, next_input = _static_resume_input(snapshot, reply)
+        if not should_resume:
+            return result
+        result = graph.invoke(next_input, config, **kwargs)
+        if isinstance(result, Mapping) and result.get("__interrupt__"):
+            continue
+        after = graph.get_state(config)
+        if (
+            getattr(after, "next", None)
+            and tuple(after.next) == before_next
+            and _checkpoint_id(after) == before_ckpt
+        ):
             raise RuntimeError(
-                "graph paused at interrupt(), but no human=... callback was given to "
-                "shape.langgraph.drive()"
+                f"graph remained paused before {nodes} after resume and could not make progress"
             )
-        reply = human(_interrupt_payload(result))
-        result = graph.invoke(Command(resume=reply), config, **kwargs)
-    return result
+
+
+async def _aget_state(graph: Any, config: Mapping[str, Any]) -> Any:
+    if hasattr(graph, "aget_state"):
+        return await graph.aget_state(config)
+    return graph.get_state(config)
 
 
 async def adrive(
@@ -272,14 +456,43 @@ async def adrive(
     """Async counterpart to `drive`, using `await graph.ainvoke(...)`."""
     kwargs = {"durability": durability} if durability is not None else {}
     result = await graph.ainvoke(input if run.restarts == 0 else None, config, **kwargs)
-    while isinstance(result, Mapping) and result.get("__interrupt__"):
+    while True:
+        if isinstance(result, Mapping) and result.get("__interrupt__"):
+            if human is None:
+                raise RuntimeError(
+                    "graph paused at interrupt(), but no human=... callback was given to "
+                    "shape.langgraph.adrive()"
+                )
+            reply = human(_interrupt_payload(result))
+            if inspect.isawaitable(reply):
+                reply = await reply
+            result = await graph.ainvoke(Command(resume=reply), config, **kwargs)
+            continue
+        if not _has_checkpointer(graph, config):
+            return result
+        snapshot = await _aget_state(graph, config)
+        if not getattr(snapshot, "next", None):
+            return result
+        nodes = _node_label(snapshot.next)
         if human is None:
-            raise RuntimeError(
-                "graph paused at interrupt(), but no human=... callback was given to "
-                "shape.langgraph.adrive()"
-            )
-        reply = human(_interrupt_payload(result))
+            raise RuntimeError(f"graph paused before {nodes}; pass human=... to approve")
+        before_ckpt = _checkpoint_id(snapshot)
+        before_next = tuple(snapshot.next)
+        reply = human(snapshot)
         if inspect.isawaitable(reply):
             reply = await reply
-        result = await graph.ainvoke(Command(resume=reply), config, **kwargs)
-    return result
+        should_resume, next_input = _static_resume_input(snapshot, reply)
+        if not should_resume:
+            return result
+        result = await graph.ainvoke(next_input, config, **kwargs)
+        if isinstance(result, Mapping) and result.get("__interrupt__"):
+            continue
+        after = await _aget_state(graph, config)
+        if (
+            getattr(after, "next", None)
+            and tuple(after.next) == before_next
+            and _checkpoint_id(after) == before_ckpt
+        ):
+            raise RuntimeError(
+                f"graph remained paused before {nodes} after resume and could not make progress"
+            )

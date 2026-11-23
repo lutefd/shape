@@ -162,7 +162,8 @@ def cmd_test(args: argparse.Namespace) -> int:
         problems = swept.problems(scen)
         if swept.failing:
             target = f"{path}::{scen.name}"
-            print(runner.investigate_all(scen, swept.failing, runs, target).render())
+            print(runner.investigate_all(scen, swept.failing, runs, target,
+                                         failing_ops=swept.failing_ops).render())
         if swept.flaky:
             print(runner.render_flaky(swept.flaky))
         print("\n".join(problems), end="\n" if problems else "")
