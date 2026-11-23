@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -154,11 +155,15 @@ def cmd_test(args: argparse.Namespace) -> int:
     if args.replay:
         replayed = Path(args.replay)
         scen = chosen[name] if name else found[json.loads(replayed.read_text())["scenario"]]
+        if args.strict_scopes:
+            scen = dataclasses.replace(scen, strict_scopes=True)
         code, text = runner.replay_file(scen, replayed, runs)
         print(text)
         return code
     failed = False
     for scen in chosen.values():
+        if args.strict_scopes:
+            scen = dataclasses.replace(scen, strict_scopes=True)
         swept = runner.run_sweep(scen, range(args.start, args.start + args.seeds), runs, args.jobs,
                                  deadline=deadline)
         flaky = f"  flaky={len(swept.flaky)}" if swept.flaky else ""
@@ -166,6 +171,8 @@ def cmd_test(args: argparse.Namespace) -> int:
               f"failing={len(swept.failing)}{flaky}  wall={swept.wall:.2f}s  "
               f"{swept.seeds / swept.wall:.0f} seeds/s")
         print(swept.cov.render())
+        if scopes_text := swept.cov.render_scopes(scen.invariants):
+            print(scopes_text)
         print("\n".join(swept.notes(scen)), end="\n" if swept.notes(scen) else "")
         problems = swept.problems(scen)
         if swept.failing:
@@ -197,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
                       help="wall time for seeds, confirmations and shrinking")
     test.add_argument("--max-shrinks", type=int, metavar="N",
                       help="maximum failing seeds to minimize (default: 200)")
+    test.add_argument("--strict-scopes", action="store_true",
+                      help="refuse default/derived scopes in duplicate-sensitive invariants")
     test.add_argument("--runs-dir", default="runs")
     test.set_defaults(fn=cmd_test)
     run = sub.add_parser("run", help="run many seeds, shrink the first failure of each kind")

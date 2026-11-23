@@ -298,32 +298,36 @@ class ImapFake:
         mbox["messages"] = kept
         return ("OK", expunged or [None])
 
-    def _classify(self, req: MailRequest) -> tuple[str, str, bool] | None:
+    def _classify(self, req: MailRequest) -> tuple[str, str, str, bool] | None:
         cmd, args = req.method.upper(), req.args
         if cmd == "UID" and args:
             cmd, args = _to_str(args[0]).upper(), args[1:]
         if cmd == "STORE":
-            return ("imap.store", f"msg:{_to_str(args[0]) if args else ''}", False)
+            return ("imap.store", f"msg:{_to_str(args[0]) if args else ''}", "msg", False)
         if cmd == "APPEND":
-            return ("imap.append", f"mailbox:{_to_str(args[0]) if args else 'INBOX'}", False)
+            return ("imap.append", f"mailbox:{_to_str(args[0]) if args else 'INBOX'}", "mailbox", False)
         if cmd == "EXPUNGE":
-            return ("imap.expunge", "mailbox:selected", True)
+            return ("imap.expunge", "mailbox:selected", "mailbox:selected", True)
         return None
 
     def describe(self, req: MailRequest) -> EffectInfo | None:
         info = self._classify(req)
         if info is None:
             return None
-        op, default_scope, irreversible = info
-        return EffectInfo(op, self._scope_fn(req) if self._scope_fn else default_scope, None, irreversible, False)
+        op, default_scope, rule, irreversible = info
+        if self._scope_fn:
+            return EffectInfo(op, self._scope_fn(req), None, irreversible, False, "explicit", None)
+        return EffectInfo(op, default_scope, None, irreversible, False, "fake_default", rule)
 
     def effect(self, req: MailRequest, resp: Any) -> EffectInfo | None:
         info = self._classify(req)
         if info is None:
             return None
-        op, default_scope, irreversible = info
+        op, default_scope, rule, irreversible = info
         landed = isinstance(resp, tuple) and len(resp) >= 1 and str(resp[0]).upper() == "OK"
-        return EffectInfo(op, self._scope_fn(req) if self._scope_fn else default_scope, None, irreversible, landed)
+        if self._scope_fn:
+            return EffectInfo(op, self._scope_fn(req), None, irreversible, landed, "explicit", None)
+        return EffectInfo(op, default_scope, None, irreversible, landed, "fake_default", rule)
 
     def invariants(self) -> list[Invariant]:
         return []

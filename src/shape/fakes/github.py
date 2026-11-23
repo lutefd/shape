@@ -68,20 +68,20 @@ class GitHubFake:
 
     def _classify(
         self, req: Request, params: dict[str, Any]
-    ) -> tuple[str, str, bool, int] | None:
+    ) -> tuple[str, str, str, bool, int] | None:
         method = req.method.upper()
         path, _ = parse_url(req.url)
         if method == "POST" and (m := _ISSUES_COL_RE.match(path)):
             repo = m.group(1)
             default_scope = f"{repo}:title:{params.get('title', '')}"
-            return ("github.issue.create", default_scope, True, 201)
+            return ("github.issue.create", default_scope, "repo:title", True, 201)
         if method == "POST" and (m := _COMMENTS_COL_RE.match(path)):
             repo, num = m.group(1), m.group(2)
-            return ("github.issue.comment", f"{repo}#{num}", True, 201)
+            return ("github.issue.comment", f"{repo}#{num}", "repo#number", True, 201)
         if method == "PATCH" and (m := _ISSUE_ITEM_RE.match(path)):
             repo, num = m.group(1), m.group(2)
             op = "github.issue.close" if params.get("state") == "closed" else "github.issue.update"
-            return (op, f"{repo}#{num}", False, 200)
+            return (op, f"{repo}#{num}", "repo#number", False, 200)
         return None
 
     def describe(self, req: Request) -> EffectInfo | None:
@@ -89,23 +89,32 @@ class GitHubFake:
         info = self._classify(req, params)
         if info is None:
             return None
-        op, default_scope, irreversible, _ = info
-        scope = self._scope_fn(req, params) if self._scope_fn is not None else default_scope
-        return EffectInfo(op=op, scope=scope, key=None, irreversible=irreversible, landed=False)
+        op, default_scope, rule, irreversible, _ = info
+        if self._scope_fn is not None:
+            scope, scope_source, scope_rule = self._scope_fn(req, params), "explicit", None
+        else:
+            scope, scope_source, scope_rule = default_scope, "fake_default", rule
+        return EffectInfo(op=op, scope=scope, key=None, irreversible=irreversible, landed=False,
+                          scope_source=scope_source, scope_rule=scope_rule)
 
     def effect(self, req: Request, resp: Response) -> EffectInfo | None:
         params = parse_params(req)
         info = self._classify(req, params)
         if info is None:
             return None
-        op, default_scope, irreversible, ok_status = info
-        scope = self._scope_fn(req, params) if self._scope_fn is not None else default_scope
+        op, default_scope, rule, irreversible, ok_status = info
+        if self._scope_fn is not None:
+            scope, scope_source, scope_rule = self._scope_fn(req, params), "explicit", None
+        else:
+            scope, scope_source, scope_rule = default_scope, "fake_default", rule
         return EffectInfo(
             op=op,
             scope=scope,
             key=None,
             irreversible=irreversible,
             landed=resp.status == ok_status,
+            scope_source=scope_source,
+            scope_rule=scope_rule,
         )
 
     def handle(self, req: Request, state: dict) -> Response:

@@ -60,23 +60,26 @@ class TwilioFake:
         if hosts is not None:
             self.hosts = tuple(hosts)
 
-    def _scope(self, req: Request, params: dict[str, Any]) -> str:
+    def _scope(self, req: Request, params: dict[str, Any]) -> tuple[str, str, str | None]:
         if self._scope_fn is not None:
-            return self._scope_fn(req, params)
+            return self._scope_fn(req, params), "explicit", None
         to = str(params.get("To") or params.get("to") or "")
-        return f"to:{to}"
+        return f"to:{to}", "fake_default", "to"
 
     def describe(self, req: Request) -> EffectInfo | None:
         path, _ = parse_url(req.url)
         if req.method.upper() != "POST" or not _MESSAGES_COL_RE.match(path):
             return None
         params = parse_params(req)
+        scope, scope_source, scope_rule = self._scope(req, params)
         return EffectInfo(
             op="twilio.message.create",
-            scope=self._scope(req, params),
+            scope=scope,
             key=None,
             irreversible=True,
             landed=False,
+            scope_source=scope_source,
+            scope_rule=scope_rule,
         )
 
     def effect(self, req: Request, resp: Response) -> EffectInfo | None:
@@ -89,6 +92,8 @@ class TwilioFake:
             key=None,
             irreversible=True,
             landed=resp.status == 201,
+            scope_source=info.scope_source,
+            scope_rule=info.scope_rule,
         )
 
     def handle(self, req: Request, state: dict) -> Response:

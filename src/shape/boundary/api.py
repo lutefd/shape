@@ -105,6 +105,8 @@ class _PendingEffect:
     fault: str | None
     error: Exception | None
     attempt_key: str | None
+    scope_source: str = "explicit"
+    scope_rule: str | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +133,7 @@ class Scenario:
     expect_effects: bool = True
     concurrent: Sequence[Callable[[Run], None]] = ()
     net: Sequence[Any] | None = None
+    strict_scopes: bool = False
 
     def __call__(self, run: Run) -> None:
         self.fn(run)
@@ -140,7 +143,7 @@ def scenario(fn: Callable[[Run], None] | None = None, *, invariants: Sequence[An
              max_restarts: int = 3, actors: Sequence[Actor] = (),
              duplicate_trigger: bool = False, expect_effects: bool = True,
              concurrent: Sequence[Callable[[Run], None]] = (),
-             net: Sequence[Any] | None = None) -> Any:
+             net: Sequence[Any] | None = None, strict_scopes: bool = False) -> Any:
     def wrap(f: Callable[[Run], None]) -> Scenario:
         checks = tuple(invariants)
         fakes = None if net is None else tuple(net)
@@ -151,7 +154,8 @@ def scenario(fn: Callable[[Run], None] | None = None, *, invariants: Sequence[An
             checks += tuple(check for fake in fakes for check in fake.invariants())
         return Scenario(f, f.__name__, checks, max_restarts,
                         inspect.getsourcefile(f) or "", f.__module__, tuple(actors),
-                        duplicate_trigger, expect_effects, tuple(concurrent), fakes)
+                        duplicate_trigger, expect_effects, tuple(concurrent), fakes,
+                        strict_scopes)
     return wrap(fn) if fn is not None else wrap
 
 
@@ -387,19 +391,23 @@ class _Context:
         call = f"{label}({', '.join(f'{k}={_short(v)}' for k, v in shown.items())})"
         if self.gate:
             self.gate.point(call)
-        scope = (
-            _call_args_hook(self, "scope", spec.scope, spec.op, named, extra)
-            if spec.scope else ""
-        )
+        if spec.scope:
+            scope = _call_args_hook(self, "scope", spec.scope, spec.op, named, extra)
+            scope_source, scope_rule = "explicit", None
+        else:
+            scope = ""
+            scope_source, scope_rule = "effect_default", "empty"
         key = (
             _call_args_hook(self, "key", spec.key, spec.op, named, extra)
             if spec.key else None
         )
-        return self.begin(spec, shown, all_args, call, scope, key)
+        return self.begin(spec, shown, all_args, call, scope, key,
+                          scope_source=scope_source, scope_rule=scope_rule)
 
     def begin(self, spec: EffectSpec, shown: dict, all_args: Mapping[str, Any],
               call: str, scope: str, key: str | None, *,
-              resolve_after: bool = False) -> _PendingEffect:
+              resolve_after: bool = False, scope_source: str = "explicit",
+              scope_rule: str | None = None) -> _PendingEffect:
         with self.lock:
             n = self.counts[spec.op]
             self.counts[spec.op] += 1
@@ -414,7 +422,10 @@ class _Context:
                     "key": draw_key, "value": value, "fault": fault, "op": spec.op, "call": call,
                     "raised": (getattr(error, "__shape_fault_label__", type(error).__name__)
                                if error is not None else None)})
-        attempt = {"kind": "attempt", "op": spec.op, "scope": scope, "call": call, "fault": fault}
+        attempt = {
+            "kind": "attempt", "op": spec.op, "scope": scope, "call": call, "fault": fault,
+            "scope_source": scope_source, "scope_rule": scope_rule,
+        }
         attempt_key = draw_key if resolve_after else None
         if attempt_key is not None:
             attempt["attempt_key"] = attempt_key
@@ -423,7 +434,8 @@ class _Context:
             os._exit(CRASH_EXIT)
         if error is not None and fault not in AFTER_COMMIT:
             raise error
-        return _PendingEffect(spec, shown, all_args, call, scope, key, fault, error, attempt_key)
+        return _PendingEffect(spec, shown, all_args, call, scope, key, fault, error, attempt_key,
+                              scope_source, scope_rule)
 
     def after(self, pending: _PendingEffect, value: Any) -> None:
         """Record the effect that just landed, then apply the faults that fire after it."""
@@ -433,7 +445,9 @@ class _Context:
                 _call_result_hook(self, "landed", spec.landed, spec.op, value, pending.all_args)
             )
             if not is_landed:
-                self.without_effect(pending, spec.op, scope)
+                self.without_effect(pending, spec.op, scope,
+                                    scope_source=pending.scope_source,
+                                    scope_rule=pending.scope_rule)
                 return
         if key is None and spec.key_from_result is not None:
             derived = _call_result_hook(
@@ -445,22 +459,32 @@ class _Context:
             _call_result_hook(self, "result", spec.result, spec.op, value, pending.all_args)
             if spec.result is not None else None
         )
-        self.record_effect(pending, spec.op, scope, key, spec.irreversible, res)
+        self.record_effect(pending, spec.op, scope, key, spec.irreversible, res,
+                           scope_source=pending.scope_source, scope_rule=pending.scope_rule)
 
-    def without_effect(self, pending: _PendingEffect, op: str, scope: str) -> None:
-        entry = {"kind": "no_effect", "op": op, "scope": scope, "call": pending.call}
+    def without_effect(self, pending: _PendingEffect, op: str, scope: str, *,
+                       scope_source: str | None = None, scope_rule: str | None = None) -> None:
+        entry = {
+            "kind": "no_effect", "op": op, "scope": scope, "call": pending.call,
+            "scope_source": pending.scope_source if scope_source is None else scope_source,
+            "scope_rule": pending.scope_rule if scope_source is None else scope_rule,
+        }
         if pending.attempt_key is not None:
             entry["attempt_key"] = pending.attempt_key
         self.append(self.world, entry)
 
     def record_effect(self, pending: _PendingEffect, op: str, scope: str, key: str | None,
-                      irreversible: bool, result: Any) -> None:
+                      irreversible: bool, result: Any, *,
+                      scope_source: str | None = None, scope_rule: str | None = None) -> None:
         fault, error = pending.fault, pending.error
         entry = {
             "kind": "effect", "op": op, "scope": scope, "key": key, "call": pending.call,
             "irreversible": irreversible, "idempotent": pending.spec.idempotent,
             "args": pending.shown, "args_hash": args_hash(pending.shown), "result": result,
-            "fault": fault, "raised": type(error).__name__ if error else None}
+            "fault": fault, "raised": type(error).__name__ if error else None,
+            "scope_source": pending.scope_source if scope_source is None else scope_source,
+            "scope_rule": pending.scope_rule if scope_source is None else scope_rule,
+        }
         if pending.attempt_key is not None:
             entry["attempt_key"] = pending.attempt_key
         self.append(self.world, entry)
@@ -609,6 +633,13 @@ def claim(scope: str, op: str, *, ok: bool = True) -> None:
     ctx = _active
     if ctx is not None:
         ctx.append(ctx.world, {"kind": "claim", "scope": scope, "op": op, "ok": bool(ok)})
+
+
+def _note(text: str) -> None:
+    """Record a harness-supplied action (such as on_restart='redeliver') so traces show it."""
+    ctx = _active
+    if ctx is not None:
+        ctx.append(ctx.world, {"kind": "note", "text": text})
 
 
 def approval(scope: str, args: Mapping[str, Any] | None = None) -> None:

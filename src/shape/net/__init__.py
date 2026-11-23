@@ -87,11 +87,12 @@ class _Capture:
         except Exception as exc:  # noqa: BLE001 - a broken provider must fail the harness
             api._harness_fail(ctx, "net.describe", describe, op, exc)
 
-        proposed = info or EffectInfo(op, "", None, False, False)
+        proposed = info or EffectInfo(op, "", None, False, False, "effect_default", "empty")
         if not safe:
             spec = api.EffectSpec(proposed.op, None, None, proposed.irreversible, errors)
             pending = ctx.begin(spec, args, args, call, proposed.scope,
-                                proposed.key if key is None else key, resolve_after=True)
+                                proposed.key if key is None else key, resolve_after=True,
+                                scope_source=proposed.scope_source, scope_rule=proposed.scope_rule)
         try:
             with contextlib.closing(sqlite3.connect(self.db, isolation_level=None)) as db, db:
                 db.execute("CREATE TABLE IF NOT EXISTS providers (id INTEGER PRIMARY KEY, "
@@ -114,10 +115,12 @@ class _Capture:
                 if landed_key is None:
                     landed_key = proposed.key
                 ctx.record_effect(pending, final.op, final.scope, landed_key,
-                                  final.irreversible, result(response) if result else None)
+                                  final.irreversible, result(response) if result else None,
+                                  scope_source=final.scope_source, scope_rule=final.scope_rule)
             else:
                 info = final or proposed
-                ctx.without_effect(pending, info.op, info.scope)
+                ctx.without_effect(pending, info.op, info.scope,
+                                   scope_source=info.scope_source, scope_rule=info.scope_rule)
         return response
 
 

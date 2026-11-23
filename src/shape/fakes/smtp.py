@@ -39,6 +39,7 @@ def _parse_message_headers(raw: bytes) -> dict[str, Any]:
         thread = in_reply_to
     else:
         thread = norm_subject or "<no-subject>"
+    headers = {k.lower(): str(v).strip() for k, v in msg.items()}
     return {
         "subject": subject,
         "message_id": message_id,
@@ -47,6 +48,7 @@ def _parse_message_headers(raw: bytes) -> dict[str, Any]:
         "to_header": to_header,
         "thread": thread,
         "norm_subject": norm_subject,
+        "headers": headers,
     }
 
 
@@ -144,10 +146,13 @@ class SmtpFake:
         parsed = _parse_message_headers(msg_bytes)
         if self._scope_fn is not None:
             scope = self._scope_fn(req, parsed)
+            scope_source, scope_rule = "explicit", None
         elif parsed["in_reply_to"]:
             scope = f"thread:{parsed['thread']}|in_reply_to:{parsed['in_reply_to']}"
+            scope_source, scope_rule = "fake_default", "thread|in_reply_to"
         else:
             scope = f"to:{','.join(sorted(to_addrs))}|subject:{parsed['norm_subject']}"
+            scope_source, scope_rule = "fake_default", "to|subject"
         op = "smtp.reply" if parsed["in_reply_to"] else "smtp.send"
         return EffectInfo(
             op=op,
@@ -155,6 +160,8 @@ class SmtpFake:
             key=None,
             irreversible=True,
             landed=landed,
+            scope_source=scope_source,
+            scope_rule=scope_rule,
         )
 
     def describe(self, req: MailRequest) -> EffectInfo | None:
@@ -173,5 +180,6 @@ class SmtpFake:
         return self._info(req, landed=landed)
 
     def invariants(self) -> list[Invariant]:
-        """Default SMTP invariant: at most one reply per `(thread, In-Reply-To)`."""
-        return [at_most_once("smtp.reply")]
+        """Default SMTP invariants: at most one reply per `(thread, In-Reply-To)` and at most
+        one fresh send per configured scope."""
+        return [at_most_once("smtp.reply"), at_most_once("smtp.send")]

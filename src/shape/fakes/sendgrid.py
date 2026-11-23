@@ -50,33 +50,37 @@ class SendGridFake:
         if hosts is not None:
             self.hosts = tuple(hosts)
 
-    def _default_scope(self, params: dict[str, Any]) -> str:
+    def _default_scope(self, params: dict[str, Any]) -> tuple[str, str]:
         custom = params.get("custom_args")
         if isinstance(custom, dict):
             if "scope" in custom:
-                return str(custom["scope"])
+                return str(custom["scope"]), "custom_args.scope"
             if "order_id" in custom:
-                return f"order:{custom['order_id']}"
+                return f"order:{custom['order_id']}", "custom_args.order_id"
         recips = ",".join(sorted(_recipients(params)))
         subject = str(params.get("subject") or "")
-        return f"to:{recips}|subject:{subject}"
+        return f"to:{recips}|subject:{subject}", "to|subject"
 
-    def _scope(self, req: Request, params: dict[str, Any]) -> str:
+    def _scope(self, req: Request, params: dict[str, Any]) -> tuple[str, str, str | None]:
         if self._scope_fn is not None:
-            return self._scope_fn(req, params)
-        return self._default_scope(params)
+            return self._scope_fn(req, params), "explicit", None
+        scope, rule = self._default_scope(params)
+        return scope, "fake_default", rule
 
     def describe(self, req: Request) -> EffectInfo | None:
         path, _ = parse_url(req.url)
         if req.method.upper() != "POST" or path != "/v3/mail/send":
             return None
         params = parse_params(req)
+        scope, scope_source, scope_rule = self._scope(req, params)
         return EffectInfo(
             op="sendgrid.mail.send",
-            scope=self._scope(req, params),
+            scope=scope,
             key=None,
             irreversible=True,
             landed=False,
+            scope_source=scope_source,
+            scope_rule=scope_rule,
         )
 
     def effect(self, req: Request, resp: Response) -> EffectInfo | None:
@@ -89,6 +93,8 @@ class SendGridFake:
             key=None,
             irreversible=True,
             landed=resp.status == 202,
+            scope_source=info.scope_source,
+            scope_rule=info.scope_rule,
         )
 
     def handle(self, req: Request, state: dict) -> Response:

@@ -56,12 +56,13 @@ class World:
     """
 
     def __init__(self, entries: list[dict], completed: bool, incarnations: int, max_restarts: int,
-                 run: Any = None):
+                 run: Any = None, *, strict_scopes: bool = False):
         self.entries = entries
         self.completed = completed
         self.incarnations = incarnations
         self.max_restarts = max_restarts
         self.run = run
+        self.strict_scopes = strict_scopes
 
     def _kind(self, kind: str, op: str | None, scope: str | None) -> list[dict]:
         return [e for e in self.entries if e["kind"] == kind
@@ -82,15 +83,24 @@ class World:
         return out
 
     def attempts(self, op: str | None = None, scope: str | None = None) -> list[dict]:
-        resolved = {e["attempt_key"]: (e["op"], e["scope"]) for e in self.entries
-                    if e["kind"] in {"effect", "no_effect"} and "attempt_key" in e}
+        resolved = {
+            e["attempt_key"]: (e["op"], e["scope"], e.get("scope_source"), e.get("scope_rule"))
+            for e in self.entries
+            if e["kind"] in {"effect", "no_effect"} and "attempt_key" in e
+        }
         if not resolved:
             return self._kind("attempt", op, scope)
         attempts = []
         for entry in self._kind("attempt", None, None):
             result = resolved.get(entry.get("attempt_key"))
             if result is not None:
-                entry = {**entry, "op": result[0], "scope": result[1]}
+                entry = {
+                    **entry,
+                    "op": result[0],
+                    "scope": result[1],
+                    "scope_source": result[2],
+                    "scope_rule": result[3],
+                }
             if (op is None or entry["op"] == op) and (scope is None or entry["scope"] == scope):
                 attempts.append(entry)
         return attempts
@@ -109,6 +119,7 @@ class Invariant:
     name: str
     check: Callable[[World], str | None]
     ops: tuple[str, ...] = ()  # the effect ops it watches, for the coverage report
+    duplicate_sensitive: bool = False
 
 
 def invariant(fn: Callable[[World], str | None]) -> Invariant:
@@ -121,6 +132,22 @@ def _where(scope: str) -> str:
     return f"scope {scope!r}" if scope else "the run"
 
 
+def check_strict_scope(world: World, op: str) -> str | None:
+    """Under `strict_scopes=True`, refuse default/derived scopes for duplicate-sensitive checks."""
+    if not world.strict_scopes:
+        return None
+    for e in world.effects(op):
+        source = e.get("scope_source")
+        if source == "fake_default":
+            rule = e.get("scope_rule") or "default"
+            return (f"{op} used the fake's default scope rule ({rule}, e.g. {e['scope']!r}) "
+                    f"under strict_scopes=True; pass an explicit scope= callback to the fake")
+        if source == "effect_default":
+            return (f"{op} used the default empty scope under strict_scopes=True; pass an "
+                    f"explicit scope= callback to @shape.effect({op!r}, scope=...)")
+    return None
+
+
 def _repeated(world: World, op: str) -> tuple[str, int] | None:
     by_scope: dict[str, int] = defaultdict(int)
     for e in world.effects(op):
@@ -130,10 +157,12 @@ def _repeated(world: World, op: str) -> tuple[str, int] | None:
 
 def at_most_once(op: str) -> Invariant:
     def check(world: World) -> str | None:
+        if (err := check_strict_scope(world, op)) is not None:
+            return err
         if (hit := _repeated(world, op)) is not None:
             return f"{op} happened {hit[1]} times for {_where(hit[0])} (at most 1 allowed)"
         return None
-    return Invariant(f"at_most_once({op})", check, (op,))
+    return Invariant(f"at_most_once({op})", check, (op,), duplicate_sensitive=True)
 
 
 def exactly_once(op: str, *, failure_claim_ok: bool = False) -> Invariant:
@@ -145,6 +174,8 @@ def exactly_once(op: str, *, failure_claim_ok: bool = False) -> Invariant:
     claimed success or finished without reporting failure.
     """
     def check(world: World) -> str | None:
+        if (err := check_strict_scope(world, op)) is not None:
+            return err
         if (hit := _repeated(world, op)) is not None:
             return f"{op} happened {hit[1]} times for {_where(hit[0])} (it must happen exactly once)"
         if world.completed and not world.effects(op):
@@ -168,7 +199,7 @@ def exactly_once(op: str, *, failure_claim_ok: bool = False) -> Invariant:
                         f"finishing (a lost effect)")
             return f"{op} never happened, but the scenario finished (a lost effect)"
         return None
-    return Invariant(f"exactly_once({op})", check, (op,))
+    return Invariant(f"exactly_once({op})", check, (op,), duplicate_sensitive=True)
 
 
 def approved_before(op: str, match: Callable[[dict], Any] | None = None) -> Invariant:

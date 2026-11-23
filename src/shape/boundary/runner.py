@@ -5,6 +5,7 @@ renders it in the code's own words."""
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import math
 import os
@@ -22,7 +23,7 @@ from ..shrink import shrink
 from . import api, coverage, schedule
 from .failure import Cause, Failure, Report, coarse_kinds, kinds, raw_coarse_kinds
 from .faults import CRASH_EXIT, DUPLICATE_KEY, DUPLICATE_TRIGGER, FAULT_TEXT
-from .invariants import Violation, World, scenario_terminates
+from .invariants import Violation, World, check_strict_scope, scenario_terminates
 from .log import PARENT_SEQ, REALIZED, WORLD, JsonlWriter, event_order, read_jsonl
 from .rootcause import describe
 
@@ -268,7 +269,8 @@ def execute(scen: api.Scenario, spec: dict, workdir: Path, *, deadline: float | 
     entries = read_jsonl(workdir / WORLD)
     draws = _read_draws(workdir)
     world = World(entries, completed, incarnations, scen.max_restarts,
-                  api.Run(workdir, incarnations - 1, spec.get("seed")))
+                  api.Run(workdir, incarnations - 1, spec.get("seed")),
+                  strict_scopes=scen.strict_scopes)
     violations = []
     harness_errors = [e for e in entries if e["kind"] == "harness_error"]
     if harness_errors:
@@ -276,12 +278,22 @@ def execute(scen: api.Scenario, spec: dict, workdir: Path, *, deadline: float | 
         violations.append(Violation("harness_error", first_err["text"], first_err.get("op")))
     else:
         for inv in [scenario_terminates(), *scen.invariants]:
-            try:
-                message = inv.check(world)
-            except Exception as exc:  # noqa: BLE001 - a broken invariant is a finding, not a crash
-                message = f"the invariant itself raised {describe(exc)}"
+            message = None
+            strict_op = None
+            if scen.strict_scopes and getattr(inv, "duplicate_sensitive", False):
+                for watched in inv.ops:
+                    if (err := check_strict_scope(world, watched)) is not None:
+                        message = err
+                        strict_op = watched
+                        break
+            if message is None:
+                try:
+                    message = inv.check(world)
+                except Exception as exc:  # noqa: BLE001 - a broken invariant is a finding, not a crash
+                    message = f"the invariant itself raised {describe(exc)}"
             if message:
-                op = getattr(message, "op", None) or (inv.ops[0] if len(inv.ops) == 1 else None)
+                op = (strict_op or getattr(message, "op", None)
+                      or (inv.ops[0] if len(inv.ops) == 1 else None))
                 violations.append(Violation(inv.name, str(message), op))
     stats = coverage.of_run(world, draws) if collect_stats else {}
     return Outcome(workdir, completed, entries + draws, {d["key"]: d["value"] for d in draws},
@@ -479,7 +491,7 @@ def story(entries: list[dict]) -> tuple[list[str], int]:
     """The trace in the code's words, and its step count (calls, approvals and deaths)."""
     events = [e for e in entries
               if e["kind"] in ("effect", "no_effect", "approval", "claim", "choice", "error",
-                               "harness_error", "incarnation", "point", "schedule")
+                               "harness_error", "incarnation", "note", "point", "schedule")
               or (e["kind"] == "fault" and e["fault"] not in api.AFTER_COMMIT)]
     events.sort(key=event_order)
     copies = any(e.get("twin") for e in events)  # the trigger was delivered twice
@@ -526,6 +538,8 @@ def story(entries: list[dict]) -> tuple[list[str], int]:
             steps += 1
             verdict = "happened" if e.get("ok", True) else "did not happen"
             lines.append(f"  {steps}. agent told the user {e['op']} {verdict} for {e['scope']!r}")
+        elif kind == "note":
+            lines.append(f"  {e['text']}")
         elif kind == "harness_error":
             lines.append(f"  harness error: {e['text']}")
         elif kind == "error":
@@ -711,12 +725,14 @@ def replay(scen: api.Scenario, path: str | Path, runs_dir: str | Path = "runs") 
 
 def check(scen: api.Scenario, seeds: int = 100, start: int = 0,
           runs_dir: str | Path = "runs", jobs: int = 1, *, budget: float | None = None,
-          max_shrinks: int = MAX_INVESTIGATED) -> None:
+          max_shrinks: int = MAX_INVESTIGATED, strict_scopes: bool | None = None) -> None:
     """Run `seeds` seeds (in `jobs` forked workers where available). Raises AssertionError
     carrying the minimized trace on failure. A time budget includes confirmation and shrinking.
     `max_shrinks` limits failed seeds investigated and can be zero."""
     if max_shrinks < 0:
         raise ValueError("max_shrinks must be non-negative")
+    if strict_scopes is not None:
+        scen = dataclasses.replace(scen, strict_scopes=strict_scopes)
     deadline = deadline_for(budget)
     runs = Path(runs_dir)
     swept = run_sweep(scen, range(start, start + seeds), runs, jobs=jobs, deadline=deadline)
@@ -725,6 +741,8 @@ def check(scen: api.Scenario, seeds: int = 100, start: int = 0,
         return
     parts = [f"{len(swept.failing)} of {swept.seeds} seeds failed"
              + (f", {len(swept.flaky)} flaky" if swept.flaky else ""), swept.cov.render()]
+    if scopes_text := swept.cov.render_scopes(scen.invariants):
+        parts.append(scopes_text)
     if swept.failing:
         parts.append(
             investigate_all(scen, swept.failing, runs, scen.name, limit=max_shrinks,

@@ -79,30 +79,36 @@ class StripeFake:
     def _now(self) -> int:
         return int(self._clock()) if self._clock is not None else _BASE_TS
 
-    def _scope(self, req: Request, params: dict[str, Any], body: dict[str, Any] | None = None) -> str:
+    def _scope(
+        self, req: Request, params: dict[str, Any], body: dict[str, Any] | None = None
+    ) -> tuple[str, str, str | None]:
         if self._scope_fn is not None:
-            return self._scope_fn(req, params)
+            return self._scope_fn(req, params), "explicit", None
         meta = params.get("metadata")
         if not isinstance(meta, dict) and isinstance(body, dict):
             meta = body.get("metadata")
         if isinstance(meta, dict):
             if self._scope_metadata_key and self._scope_metadata_key in meta:
-                return f"{self._scope_metadata_key}:{meta[self._scope_metadata_key]}"
+                return (
+                    f"{self._scope_metadata_key}:{meta[self._scope_metadata_key]}",
+                    "explicit",
+                    f"scope_metadata_key={self._scope_metadata_key!r}",
+                )
             if "order_id" in meta:
-                return f"order:{meta['order_id']}"
+                return f"order:{meta['order_id']}", "fake_default", "metadata.order_id"
             if "scope" in meta:
-                return str(meta["scope"])
+                return str(meta["scope"]), "fake_default", "metadata.scope"
             if meta:
                 k = min(meta)
-                return f"{k}:{meta[k]}"
+                return f"{k}:{meta[k]}", "fake_default", f"metadata.{k}"
         path, _ = parse_url(req.url)
         if m := _PI_CONFIRM_RE.match(path) or _PI_CANCEL_RE.match(path):
-            return f"payment_intent:{m.group(1)}"
+            return f"payment_intent:{m.group(1)}", "fake_default", "payment_intent"
         for field in ("charge", "payment_intent", "customer"):
             val = params.get(field) or (body.get(field) if isinstance(body, dict) else None)
             if val:
-                return f"{field}:{val}"
-        return ""
+                return f"{field}:{val}", "fake_default", field
+        return "", "fake_default", "empty"
 
     def _route_op(self, method: str, path: str, params: dict[str, Any]) -> tuple[str, bool] | None:
         if method != "POST":
@@ -128,8 +134,9 @@ class StripeFake:
         if routed is None:
             return None
         op, irreversible = routed
-        return EffectInfo(op, self._scope(req, params), header(req.headers, "Idempotency-Key"),
-                          irreversible, False)
+        scope, scope_source, scope_rule = self._scope(req, params)
+        return EffectInfo(op, scope, header(req.headers, "Idempotency-Key"),
+                          irreversible, False, scope_source, scope_rule)
 
     def effect(self, req: Request, resp: Response) -> EffectInfo | None:
         path, _ = parse_url(req.url)
@@ -138,8 +145,9 @@ class StripeFake:
         if routed is None:
             return None
         op, irreversible = routed
-        return EffectInfo(op, self._scope(req, params, response_json(resp)),
-                          header(req.headers, "Idempotency-Key"), irreversible, 200 <= resp.status < 300)
+        scope, scope_source, scope_rule = self._scope(req, params, response_json(resp))
+        return EffectInfo(op, scope, header(req.headers, "Idempotency-Key"),
+                          irreversible, 200 <= resp.status < 300, scope_source, scope_rule)
 
     def handle(self, req: Request, state: dict) -> Response:
         for k in ("customers", "payment_intents", "charges", "refunds", "idempotency"):
@@ -406,5 +414,6 @@ class StripeFake:
         return [
             at_most_once("stripe.charge"),
             at_most_once("stripe.refund"),
-            Invariant("stripe_refunds_le_charges", refunds_le_charges, ("stripe.charge", "stripe.refund")),
+            Invariant("stripe_refunds_le_charges", refunds_le_charges,
+                      ("stripe.charge", "stripe.refund"), duplicate_sensitive=True),
         ]
