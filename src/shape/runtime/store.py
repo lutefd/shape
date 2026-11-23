@@ -33,7 +33,7 @@ class Intent:
     key: str | None
     state: str = "started"  # started | done | failed
     result: dict[str, Any] | None = None
-    unknown: bool = False  # an attempt timed out, so the effect may exist
+    unknown: bool = False  # an attempt timed out or a crash cut it off, so the effect may exist
 
 
 @dataclass

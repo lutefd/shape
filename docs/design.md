@@ -66,6 +66,8 @@ Independent faults never produce the failure runs real providers do, so two kind
 
 A saga ends `committed`, `compensated`, or `escalated`. `escalated` means the runtime could not finish or undo the saga (an irreversible step with unknown outcome, or a compensation that kept failing) and said so in the audit log. `saga_terminates` accepts it only with that audit entry, and the other invariants skip `rollback_restores_state` for it.
 
+An intent is in doubt (`Intent.unknown`) when an attempt timed out or a crash cut it off. A new process has no call in flight, so `recover()` first marks every intent still `started` as in doubt, durably, and only then resumes. The email is the pivot: once it may have taken effect (its intent is not definitively `failed`) the saga can commit or escalate, and `_compensate` escalates instead of undoing anything.
+
 ## Invariants (milestone 1)
 
 1. `at_most_once_effect`: each business scope (an order's charge, an event's email) has at most one real effect.

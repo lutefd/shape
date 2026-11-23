@@ -10,7 +10,11 @@ The agent (a Policy) proposes tool calls. The runtime decides what actually happ
 * if the saga cannot finish it compensates in reverse order. Releasing inventory is
   conflict-aware: it applies a delta by compare-and-set instead of overwriting a record that
   someone else changed, and flags a conflict it cannot resolve;
-* after a crash, `recover()` resumes every unfinished saga from the durable store alone.
+* after a crash, `recover()` resumes every unfinished saga from the durable store alone. A new
+  process has no call in flight, so every intent still `started` was cut off by the crash: its
+  effect may exist, and `recover()` records that durably (`Intent.unknown`) before anything else;
+* the confirmation email is the pivot. Once it may have taken effect the saga can only commit or
+  escalate with an audit entry. It never compensates, because a sent email cannot be undone.
 """
 
 from __future__ import annotations
@@ -80,7 +84,15 @@ class Runtime:
 
     async def recover(self, policy: Policy) -> None:
         for saga_id in self.store.open_sagas():
+            await self._mark_in_doubt(saga_id)
             await self._drive(saga_id, policy)
+
+    async def _mark_in_doubt(self, saga_id: str) -> None:
+        """Record durably that every intent the crash interrupted may have taken effect."""
+        for intent in self.store.intents_of(saga_id):
+            if intent.state == "started" and not intent.unknown:
+                intent.unknown = True
+                self.store.put_intent(intent)
 
     async def compensate_again(self) -> None:
         """Run every finished compensation once more (for the idempotence check)."""
@@ -291,7 +303,13 @@ class Runtime:
 
     # ---- compensation -------------------------------------------------------------------
 
+    def _pivot_may_have_taken_effect(self, saga_id: str) -> bool:
+        email = self.store.intent(saga_id, "email")
+        return email is not None and (email.state != "failed" or email.unknown)
+
     async def _compensate(self, saga_id: str, *, force: bool = False) -> None:
+        if not force and self._pivot_may_have_taken_effect(saga_id):
+            return await self._escalate(saga_id, "confirmation may have been sent; not compensating")
         for intent in reversed(self.store.intents_of(saga_id)):
             if intent.step == "charge":
                 ok = await self._refund(saga_id, intent, force)
