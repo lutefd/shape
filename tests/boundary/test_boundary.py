@@ -272,3 +272,39 @@ def test_async_effect_is_the_plain_coroutine_function_outside_a_run():
     from scenarios import apay
     assert inspect.iscoroutinefunction(apay)
     assert asyncio.run(apay("9")) == "9"
+
+
+def test_choose_returns_the_nominal_option_outside_a_run():
+    assert shape.choose("x", ["nominal", "other"]) == "nominal"
+
+
+def test_a_bug_reachable_only_through_a_model_choice_is_found_and_shrunk_to_it(tmp_path):
+    from scenarios import model_may_repeat_a_refund
+    with pytest.raises(AssertionError) as info:
+        shape.check(model_may_repeat_a_refund, seeds=200, runs_dir=tmp_path)
+    text = str(info.value)
+    assert "at_most_once(t.refund)" in text
+    assert "model chose 'refund_again' at 'after_refund' (nominal: 'reply_to_customer')" in text
+    assert "1 of 1 faults kept" in text  # the choice alone, every injected fault shrunk away
+
+
+def test_model_choices_replay_exactly(tmp_path):
+    from scenarios import model_may_repeat_a_refund
+    explicit = {"model:after_refund#0.0": 1}
+    first = runner.execute(model_may_repeat_a_refund, {"explicit": explicit}, tmp_path / "a")
+    again = runner.execute(model_may_repeat_a_refund, {"explicit": explicit}, tmp_path / "b")
+    assert [v.invariant for v in first.violations] == ["at_most_once(t.refund)"]
+    assert first.realized == again.realized == explicit
+
+
+def test_harmless_choices_do_not_fail_a_correct_scenario(tmp_path):
+    from scenarios import model_never_repeats
+    shape.check(model_never_repeats, seeds=100, runs_dir=tmp_path)
+
+
+def test_choose_rejects_mismatched_weights(tmp_path):
+    @shape.scenario(max_restarts=0)
+    def bad(run):
+        shape.choose("x", ["a", "b"], weights=[1.0])
+    out = runner.execute(bad, {"seed": 0}, tmp_path / "w")
+    assert not out.completed

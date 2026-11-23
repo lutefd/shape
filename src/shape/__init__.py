@@ -8,6 +8,7 @@ from .boundary import (
     approved_before,
     at_most_once,
     check,
+    choose,
     effect,
     exactly_once,
     scenario,
@@ -16,5 +17,5 @@ from .boundary import (
 
 __all__ = [
     "RateLimited", "Run", "ServerError", "approval", "approved_before", "at_most_once", "check",
-    "effect", "exactly_once", "scenario", "scenario_terminates",
+    "choose", "effect", "exactly_once", "scenario", "scenario_terminates",
 ]

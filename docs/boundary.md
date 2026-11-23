@@ -66,6 +66,18 @@ Invariants:
 
 Approvals are recorded by the code that obtains them: `shape.approval(scope, args)` (for example, inside the node that receives the human decision). `args` is the dict of the effect's named arguments (without `self`); the hash is of its sorted JSON, so arguments must have stable reprs.
 
+### Model choices
+
+The model is an untrusted input, so let shape decide what it does at the points that matter. In your scripted model (or any code that stands in for one), call `shape.choose(label, options)`:
+
+```python
+def after_tool_error(messages):
+    action = shape.choose("after_tool_error", ["retry_once", "give_up", "retry_twice"])
+    ...
+```
+
+`options[0]` is the nominal choice, what a well-behaved model does. Each seed may pick another option instead, drawn at key `model:<label>#<incarnation>.<n>`. Choices are shrunk and replayed exactly like faults, so a failure that needs the model to repeat a call shows up in the minimized trace as `model chose 'refund_again' at 'after_refund' (nominal: 'reply_to_customer')`. Outside a run, and on the last fault-free incarnation, `choose` returns `options[0]`. `weights` defaults to the nominal option being 10 times as likely as each alternative.
+
 ## How one seed runs
 
 1. The parent process imports the scenario module once. It starts no threads.

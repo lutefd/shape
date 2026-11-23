@@ -132,7 +132,8 @@ def execute(scen: api.Scenario, spec: dict, workdir: Path) -> Outcome:
         message = inv.check(world)
         if message:
             violations.append(Violation(inv.name, message))
-    return Outcome(workdir, completed, entries + [d | {"kind": "fault"} for d in draws],
+    marked = [d | {"kind": "choice" if "choice" in d else "fault"} for d in draws]
+    return Outcome(workdir, completed, entries + marked,
                    {d["key"]: d["value"] for d in draws}, violations)
 
 
@@ -200,7 +201,7 @@ def _parallel(seeds: list[int], jobs: int, one) -> list:
 def story(entries: list[dict]) -> tuple[list[str], int]:
     """The trace in the code's words, and its step count (calls, approvals and deaths)."""
     events = [e for e in entries
-              if e["kind"] in ("effect", "approval", "error", "incarnation")
+              if e["kind"] in ("effect", "approval", "choice", "error", "incarnation")
               or (e["kind"] == "fault" and e["fault"] not in api.AFTER_COMMIT)]
     events.sort(key=lambda e: (e["inc"], e["seq"]))
     lines: list[str] = []
@@ -218,6 +219,10 @@ def story(entries: list[dict]) -> tuple[list[str], int]:
                 landed = "effect landed" + (f" (idempotency key {e['key']!r})" if e["key"] else "")
                 note = f"{landed}, then {note}" if fault else landed
             lines += [f"  {steps}. {e['call']}", f"       {note}"]
+        elif kind == "choice":
+            steps += 1
+            lines.append(f"  {steps}. model chose {e['chosen']} at {e['choice']!r}"
+                         f" (nominal: {e['nominal']})")
         elif kind == "approval":
             steps += 1
             lines.append(f"  {steps}. approval recorded for {e['scope']!r}")
@@ -313,7 +318,7 @@ def investigate(scen: api.Scenario, seed: int, invariant: str, realized: dict[st
 
 
 def read_story(workdir: Path) -> list[dict]:
-    return read_jsonl(workdir / WORLD) + [d | {"kind": "fault"}
+    return read_jsonl(workdir / WORLD) + [d | {"kind": "choice" if "choice" in d else "fault"}
                                           for d in read_jsonl(workdir / REALIZED)]
 
 

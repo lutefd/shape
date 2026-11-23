@@ -104,6 +104,25 @@ class _Context:
             self.seq += 1
             writer.write({**entry, "inc": self.incarnation, "seq": self.seq})
 
+    def choose(self, label: str, options: Sequence[Any], weights: Sequence[float] | None) -> int:
+        """Draw which of `options` the untrusted input picks at this point. 0 is nominal."""
+        w = list(weights) if weights is not None else [NOMINAL_WEIGHT] + [1.0] * (len(options) - 1)
+        if len(w) != len(options):
+            raise ValueError(f"shape.choose({label!r}): {len(options)} options, {len(w)} weights")
+        with self.lock:
+            counter = f"choice:{label}"
+            n = self.counts[counter]
+            self.counts[counter] += 1
+            draw_key = f"model:{label}#{self.incarnation}.{n}"
+            value = 0 if self.quiet else self.choices.draw(draw_key, w)
+            if value:
+                self.seq += 1
+                self.realized.write({
+                    "key": draw_key, "value": value, "choice": label,
+                    "chosen": _short(options[value]), "nominal": _short(options[0]),
+                    "inc": self.incarnation, "seq": self.seq})
+        return value
+
     def before(self, spec: EffectSpec, fn: Callable, sig: inspect.Signature,
                args: tuple, kwargs: dict) -> tuple | None:
         """Draw this call's fault and apply the ones that fire before the function runs. Returns
@@ -208,6 +227,25 @@ def effect(op: str, *, scope: Callable[..., str] | None = None,
             return ctx.call(spec, fn, sig, args, kwargs)
         return wrapper
     return wrap
+
+
+def choose(label: str, options: Sequence[Any], weights: Sequence[float] | None = None) -> Any:
+    """Let shape pick what an untrusted input does here, usually your scripted model.
+
+    `options[0]` is the nominal choice: what a well-behaved model would do. Inside a shape run,
+    each seed may pick another option instead, and a failure shrinks back toward `options[0]`
+    for every choice that was not needed to reproduce it. Outside a run, and on the last,
+    fault-free incarnation, it returns `options[0]`. `weights` defaults to the nominal option
+    being 10 times as likely as each alternative.
+
+        action = shape.choose("after_tool_error", ["retry_once", "give_up", "retry_twice"])
+    """
+    if not options:
+        raise ValueError(f"shape.choose({label!r}) needs at least one option")
+    ctx = _active
+    if ctx is None or len(options) == 1:
+        return options[0]
+    return options[ctx.choose(label, options, weights)]
 
 
 def approval(scope: str, args: Mapping[str, Any] | None = None) -> None:
