@@ -104,6 +104,7 @@ class _PendingEffect:
     key: str | None
     fault: str | None
     error: Exception | None
+    attempt_key: str | None
 
 
 @dataclass(frozen=True)
@@ -142,16 +143,15 @@ def scenario(fn: Callable[[Run], None] | None = None, *, invariants: Sequence[An
              net: Sequence[Any] | None = None) -> Any:
     def wrap(f: Callable[[Run], None]) -> Scenario:
         checks = tuple(invariants)
-        if net is not None:
+        fakes = None if net is None else tuple(net)
+        if fakes is not None:
             from ..net import _providers
 
-            fakes = tuple(net)
             _providers(fakes)
             checks += tuple(check for fake in fakes for check in fake.invariants())
         return Scenario(f, f.__name__, checks, max_restarts,
                         inspect.getsourcefile(f) or "", f.__module__, tuple(actors),
-                        duplicate_trigger, expect_effects, tuple(concurrent),
-                        None if net is None else fakes)
+                        duplicate_trigger, expect_effects, tuple(concurrent), fakes)
     return wrap(fn) if fn is not None else wrap
 
 
@@ -398,7 +398,8 @@ class _Context:
         return self.begin(spec, shown, all_args, call, scope, key)
 
     def begin(self, spec: EffectSpec, shown: dict, all_args: Mapping[str, Any],
-              call: str, scope: str, key: str | None) -> _PendingEffect:
+              call: str, scope: str, key: str | None, *,
+              resolve_after: bool = False) -> _PendingEffect:
         with self.lock:
             n = self.counts[spec.op]
             self.counts[spec.op] += 1
@@ -413,23 +414,26 @@ class _Context:
                     "key": draw_key, "value": value, "fault": fault, "op": spec.op, "call": call,
                     "raised": (getattr(error, "__shape_fault_label__", type(error).__name__)
                                if error is not None else None)})
-        self.append(self.world, {"kind": "attempt", "op": spec.op, "scope": scope, "call": call,
-                                 "fault": fault})
+        attempt = {"kind": "attempt", "op": spec.op, "scope": scope, "call": call, "fault": fault}
+        attempt_key = draw_key if resolve_after else None
+        if attempt_key is not None:
+            attempt["attempt_key"] = attempt_key
+        self.append(self.world, attempt)
         if fault == "crash_before":
             os._exit(CRASH_EXIT)
         if error is not None and fault not in AFTER_COMMIT:
             raise error
-        return _PendingEffect(spec, shown, all_args, call, scope, key, fault, error)
+        return _PendingEffect(spec, shown, all_args, call, scope, key, fault, error, attempt_key)
 
     def after(self, pending: _PendingEffect, value: Any) -> None:
         """Record the effect that just landed, then apply the faults that fire after it."""
-        spec, call, scope, key = pending.spec, pending.call, pending.scope, pending.key
+        spec, scope, key = pending.spec, pending.scope, pending.key
         if spec.landed is not None:
             is_landed = bool(
                 _call_result_hook(self, "landed", spec.landed, spec.op, value, pending.all_args)
             )
             if not is_landed:
-                self.without_effect(spec.op, scope, call)
+                self.without_effect(pending, spec.op, scope)
                 return
         if key is None and spec.key_from_result is not None:
             derived = _call_result_hook(
@@ -443,17 +447,23 @@ class _Context:
         )
         self.record_effect(pending, spec.op, scope, key, spec.irreversible, res)
 
-    def without_effect(self, op: str, scope: str, call: str) -> None:
-        self.append(self.world, {"kind": "no_effect", "op": op, "scope": scope, "call": call})
+    def without_effect(self, pending: _PendingEffect, op: str, scope: str) -> None:
+        entry = {"kind": "no_effect", "op": op, "scope": scope, "call": pending.call}
+        if pending.attempt_key is not None:
+            entry["attempt_key"] = pending.attempt_key
+        self.append(self.world, entry)
 
     def record_effect(self, pending: _PendingEffect, op: str, scope: str, key: str | None,
                       irreversible: bool, result: Any) -> None:
         fault, error = pending.fault, pending.error
-        self.append(self.world, {
+        entry = {
             "kind": "effect", "op": op, "scope": scope, "key": key, "call": pending.call,
             "irreversible": irreversible, "idempotent": pending.spec.idempotent,
             "args": pending.shown, "args_hash": args_hash(pending.shown), "result": result,
-            "fault": fault, "raised": type(error).__name__ if error else None})
+            "fault": fault, "raised": type(error).__name__ if error else None}
+        if pending.attempt_key is not None:
+            entry["attempt_key"] = pending.attempt_key
+        self.append(self.world, entry)
         if fault == "crash_after":
             os._exit(CRASH_EXIT)
         if error is not None:

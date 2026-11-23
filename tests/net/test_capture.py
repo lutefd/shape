@@ -230,7 +230,7 @@ def test_smtp_envelope_and_imap_commands_share_state(tmp_path, smtp, imap):
 
     out = execute(scenario, tmp_path / "one")
     assert out.ok, (out.dir / "inc-0.out").read_text()
-    assert out.stats["attempts"] == {"test.write": 7}
+    assert out.stats["attempts"] == out.stats["effects"]
     assert out.stats["effects"] == {"test.mail": 2, "test.imap": 5}
 
 
@@ -246,6 +246,37 @@ def test_smtp_disconnect_after_accept(tmp_path):
     out = execute(scenario, tmp_path / "one", "timeout_after_commit")
     assert out.ok, (out.dir / "inc-0.out").read_text()
     assert out.stats["faults"] == {"test.mail": {"timeout_after_commit": 1}}
+
+
+def test_imap_disconnect_after_append(tmp_path):
+    @shape.scenario(net=[Fake()], max_restarts=0)
+    def scenario(run):
+        with imaplib.IMAP4_SSL(HOST) as mailbox:
+            mailbox.login("user", "password")
+            with pytest.raises(imaplib.IMAP4.abort):
+                mailbox.append("INBOX", None, None, b"test")
+        with imaplib.IMAP4_SSL(HOST) as mailbox:
+            mailbox.login("user", "password")
+            assert mailbox.select("INBOX") == ("OK", [b"1"])
+
+    out = execute(scenario, tmp_path / "one", "connection_reset_after_commit")
+    assert out.ok, (out.dir / "inc-0.out").read_text()
+    assert out.stats["faults"] == {"test.imap": {"connection_reset_after_commit": 1}}
+
+
+def test_post_response_metadata_resolves_attempts_without_describe(tmp_path):
+    class MinimalFake(Fake):
+        describe = None
+
+    @shape.scenario(net=[MinimalFake()], max_restarts=0)
+    def scenario(run):
+        urllib_call("POST", URL, {})
+
+    out = execute(scenario, tmp_path / "one", "timeout_after_commit",
+                  op="POST provider.invalid/items")
+    assert out.violated("scenario_terminates")
+    assert out.stats["attempts"] == {"test.write": 1}
+    assert out.stats["faults"] == {"test.write": {"timeout_after_commit": 1}}
 
 
 def test_reads_make_visible_actor_points_and_share_state(tmp_path):

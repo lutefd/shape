@@ -82,7 +82,18 @@ class World:
         return out
 
     def attempts(self, op: str | None = None, scope: str | None = None) -> list[dict]:
-        return self._kind("attempt", op, scope)
+        resolved = {e["attempt_key"]: (e["op"], e["scope"]) for e in self.entries
+                    if e["kind"] in {"effect", "no_effect"} and "attempt_key" in e}
+        if not resolved:
+            return self._kind("attempt", op, scope)
+        attempts = []
+        for entry in self._kind("attempt", None, None):
+            result = resolved.get(entry.get("attempt_key"))
+            if result is not None:
+                entry = {**entry, "op": result[0], "scope": result[1]}
+            if (op is None or entry["op"] == op) and (scope is None or entry["scope"] == scope):
+                attempts.append(entry)
+        return attempts
 
     @property
     def approvals(self) -> list[dict]:
