@@ -88,7 +88,8 @@ class Report:
             out.append(f"({self.skipped} more failing seeds were not minimized; the ones with the "
                        f"fewest deviations were)")
         for i, cause in enumerate(self.causes, 1):
-            seen = ", ".join(map(str, cause.seeds[:5])) + (", ..." if len(cause.seeds) > 5 else "")
+            ordered = sorted(cause.seeds)
+            seen = ", ".join(map(str, ordered[:5])) + (", ..." if len(ordered) > 5 else "")
             heading = (f"cause {i} of {n}: {len(cause.seeds)} of {self.failing} failing seeds "
                        f"({seen})")
             out += ["", heading, cause.failure.render()]
