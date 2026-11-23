@@ -378,6 +378,16 @@ def _static_resume_input(snapshot: Any, reply: Any) -> tuple[bool, Any]:
     )
 
 
+_VALID_ON_RESTART = frozenset({"resume", "none", "redeliver"})
+
+
+def _validate_on_restart(on_restart: str | Callable[[Run], Any]) -> None:
+    if not (callable(on_restart) or on_restart in _VALID_ON_RESTART):
+        raise ValueError(
+            f"on_restart must be 'resume', 'none', 'redeliver', or a callable; got {on_restart!r}"
+        )
+
+
 def drive(
     graph: Any,
     input: Any,
@@ -386,11 +396,18 @@ def drive(
     *,
     human: Callable[[Any], Any] | None = None,
     durability: str | None = None,
+    on_restart: str | Callable[[Run], Any] = "resume",
 ) -> Any:
-    """Drive a compiled LangGraph graph under shape's standard resume policy.
+    """Drive a compiled LangGraph graph under an explicit restart policy.
 
     - `run.restarts == 0`: calls `graph.invoke(input, config)`.
-    - `run.restarts > 0`: calls `graph.invoke(None, config)` to resume from the checkpointer.
+    - `run.restarts > 0`, controlled by `on_restart`:
+      - `"resume"` (default): calls `graph.invoke(None, config)` to resume from the checkpointer
+        (LangGraph's own checkpoint recovery behavior).
+      - `"none"`: does nothing and returns `None` (models an app without a supervisor).
+      - `"redeliver"`: logs `"harness redelivered the request (on_restart='redeliver')"` and
+        resends `input` to `graph.invoke(input, config)` (models an at-least-once queue).
+      - callable `fn(run)`: invokes your own recovery logic on restart.
     - Whenever the graph pauses at `interrupt()`, calls `human(payload)` (which may use
       `shape.choose` for approve/reject/edit) and resumes with `Command(resume=reply)`.
     - Whenever the graph pauses at a static `interrupt_before=` / `interrupt_after=` breakpoint
@@ -398,8 +415,20 @@ def drive(
       or `None` -> `invoke(None)`, `False` -> denies pending tool calls or stops, `dict`/`Command`
       -> passed to `invoke`). Raises loudly if no `human=` callback was given or resume stalls.
     """
+    _validate_on_restart(on_restart)
     kwargs = {"durability": durability} if durability is not None else {}
-    result = graph.invoke(input if run.restarts == 0 else None, config, **kwargs)
+    if run.restarts == 0:
+        initial = input
+    elif on_restart == "none":
+        return None
+    elif callable(on_restart):
+        return on_restart(run)
+    elif on_restart == "redeliver":
+        api._note("harness redelivered the request (on_restart='redeliver')")
+        initial = input
+    else:
+        initial = None
+    result = graph.invoke(initial, config, **kwargs)
     while True:
         if isinstance(result, Mapping) and result.get("__interrupt__"):
             if human is None:
@@ -452,10 +481,26 @@ async def adrive(
     *,
     human: Callable[[Any], Any] | None = None,
     durability: str | None = None,
+    on_restart: str | Callable[[Run], Any] = "resume",
 ) -> Any:
     """Async counterpart to `drive`, using `await graph.ainvoke(...)`."""
+    _validate_on_restart(on_restart)
     kwargs = {"durability": durability} if durability is not None else {}
-    result = await graph.ainvoke(input if run.restarts == 0 else None, config, **kwargs)
+    if run.restarts == 0:
+        initial = input
+    elif on_restart == "none":
+        return None
+    elif callable(on_restart):
+        res = on_restart(run)
+        if inspect.isawaitable(res):
+            res = await res
+        return res
+    elif on_restart == "redeliver":
+        api._note("harness redelivered the request (on_restart='redeliver')")
+        initial = input
+    else:
+        initial = None
+    result = await graph.ainvoke(initial, config, **kwargs)
     while True:
         if isinstance(result, Mapping) and result.get("__interrupt__"):
             if human is None:

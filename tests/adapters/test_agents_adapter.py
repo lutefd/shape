@@ -151,7 +151,9 @@ def test_repeat_perturbation_and_fault_retry_and_crash_resume(tmp_path):
         ctx = _Ctx(run.dir / "p.db", keyed=False)
         ctx.init_db()
         agent = _build_agent(keyed=False)
-        shape.agents.drive(agent, "Please refund order 17.", run, context=ctx)
+        shape.agents.drive(
+            agent, "Please refund order 17.", run, context=ctx, on_restart="redeliver"
+        )
 
     # Pure model perturbation (0 faults) shrinks to repeat choice
     with pytest.raises(AssertionError) as info:

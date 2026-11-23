@@ -65,6 +65,7 @@ def _run_refund(
         context=ctx,
         session_factory=lambda d: SQLiteSession(TICKET, str(d / "session.db")),
         human=_approve if approval else None,
+        on_restart="redeliver",
     )
     if require_refund and not payments.has_refund("17"):
         raise TicketUnresolved("order 17 was not refunded")

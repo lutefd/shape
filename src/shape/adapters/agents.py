@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -245,8 +246,41 @@ class ScriptedModel(Model):
         raise NotImplementedError("ScriptedModel does not support streaming")
 
 
-def _default_session(workdir: Path) -> SQLiteSession:
-    return SQLiteSession("shape", str(workdir / "session.db"))
+_VALID_ON_RESTART = frozenset({"none", "redeliver"})
+_outside_drive_counts: dict[tuple[Path, int], int] = {}
+
+
+def _validate_on_restart(on_restart: str | Callable[[Run], Any]) -> None:
+    if not (callable(on_restart) or on_restart in _VALID_ON_RESTART):
+        raise ValueError(
+            f"on_restart must be 'none', 'redeliver', or a callable; got {on_restart!r}"
+        )
+
+
+def _next_job_index(run: Run) -> int:
+    ctx = api._active
+    if ctx is not None:
+        with ctx.lock:
+            idx = ctx.counts["agents.drive"]
+            ctx.counts["agents.drive"] += 1
+            return idx
+    key = (run.dir, run.restarts)
+    idx = _outside_drive_counts.get(key, 0)
+    _outside_drive_counts[key] = idx + 1
+    return idx
+
+
+def _default_session(workdir: Path, session_id: str) -> SQLiteSession:
+    return SQLiteSession(session_id, str(workdir / "session.db"))
+
+
+def _paused_state_path(workdir: Path, *, session_id: str | None, job_idx: int) -> Path:
+    if session_id is not None:
+        digest = hashlib.blake2s(session_id.encode("utf-8"), digest_size=6).hexdigest()
+        return workdir / f"paused-run-{digest}.json"
+    if job_idx == 0:
+        return workdir / _PAUSED_STATE_FILE
+    return workdir / f"paused-run-{job_idx}.json"
 
 
 def _save_state(
@@ -268,14 +302,37 @@ async def _drive_async(
     run: Run,
     *,
     context: Any = None,
+    session_id: str | None = None,
     session_factory: Callable[[Path], Any] | None = None,
     human: Callable[[Any], Any] | None = None,
     context_serializer: Callable[[Any], dict[str, Any]] | None = None,
     max_turns: int = 10,
-) -> RunResult:
-    session = session_factory(run.dir) if session_factory is not None else _default_session(run.dir)
+    on_restart: str | Callable[[Run], Any] = "none",
+) -> RunResult | None:
+    _validate_on_restart(on_restart)
+    if session_id is not None and session_factory is not None:
+        raise ValueError("pass either session_id or session_factory, not both")
+
+    job_idx = _next_job_index(run)
+
+    if run.restarts > 0:
+        if on_restart == "none":
+            return None
+        if callable(on_restart):
+            res = on_restart(run)
+            if inspect.isawaitable(res):
+                res = await res
+            return res
+        api._note("harness redelivered the request (on_restart='redeliver')")
+
+    effective_session_id = session_id if session_id is not None else f"shape-job-{job_idx}"
+    session = (
+        session_factory(run.dir)
+        if session_factory is not None
+        else _default_session(run.dir, effective_session_id)
+    )
     run_config = RunConfig(tracing_disabled=True)
-    paused = run.dir / _PAUSED_STATE_FILE
+    paused = _paused_state_path(run.dir, session_id=session_id, job_idx=job_idx)
 
     if paused.exists():
         state = await RunState.from_json(
@@ -332,17 +389,26 @@ def drive(
     run: Run,
     *,
     context: Any = None,
+    session_id: str | None = None,
     session_factory: Callable[[Path], Any] | None = None,
     human: Callable[[Any], Any] | None = None,
     context_serializer: Callable[[Any], dict[str, Any]] | None = None,
     max_turns: int = 10,
-) -> RunResult:
-    """Drive an OpenAI Agents SDK `Agent` under shape's standard resume policy.
+    on_restart: str | Callable[[Run], Any] = "none",
+) -> RunResult | None:
+    """Drive an OpenAI Agents SDK `Agent` inside a `shape` scenario.
 
-    Uses a `SQLiteSession` under `run.dir` (or `session_factory(run.dir)`). Because the Agents SDK
-    has no mid-turn checkpoint/resume for an in-flight tool call, a restarted incarnation
-    redelivers `input` into the same session; if a tool paused on `needs_approval=True`, the saved
-    `RunState` under `run.dir` is reloaded and answered via `human(item)`.
+    Each `drive()` call in a scenario gets its own distinct `SQLiteSession` under
+    `run.dir / "session.db"` by default (`shape-job-0`, `shape-job-1`, ...), so independent jobs
+    do not share conversation history. To share a session across turns deliberately, pass the
+    same `session_id="..."` (or `session_factory=...`).
+
+    `on_restart` controls what happens on a restarted incarnation (`run.restarts > 0`):
+    - `"none"` (default): do nothing and return `None` (models an app without a supervisor).
+    - `"redeliver"`: reload any saved approval `RunState` or resend `input` into the same
+      session (models an at-least-once queue/supervisor) and log the harness redelivery in the
+      trace.
+    - callable `fn(run)`: invoke your own recovery logic on restart.
     """
     return asyncio.run(
         _drive_async(
@@ -350,9 +416,11 @@ def drive(
             input,
             run,
             context=context,
+            session_id=session_id,
             session_factory=session_factory,
             human=human,
             context_serializer=context_serializer,
             max_turns=max_turns,
+            on_restart=on_restart,
         )
     )
