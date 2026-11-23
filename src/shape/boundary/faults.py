@@ -18,6 +18,7 @@ FAULTS = (
     "server_error",
     "crash_before",
     "crash_after",
+    "client_error",  # last: older replay files index into this table
 )
 NOMINAL_WEIGHT = 10.0
 CRASHES = frozenset({"crash_before", "crash_after"})
@@ -31,9 +32,16 @@ FAULT_TEXT = {
     "connection_reset_after_commit": "connection reset after commit: the caller saw {exc}",
     "rate_limit": "rate limited before the effect: the caller saw {exc}",
     "server_error": "server error before the effect: the caller saw {exc}",
+    "client_error": "client error (4xx) before the effect: the caller saw {exc}",
     "crash_before": "process killed before the call ran",
     "crash_after": "process killed after the effect landed, before the caller saw it",
+    "duplicate_trigger": "delivered twice: two copies ran at the same time on the same run dir",
 }
+
+# A scenario-level fault, drawn once per seed by the runner instead of once per call. It is not in
+# FAULTS because it has no per-call value; its key is `world:duplicate_trigger`.
+DUPLICATE_TRIGGER = "duplicate_trigger"
+DUPLICATE_KEY = f"world:{DUPLICATE_TRIGGER}"
 
 
 class RateLimited(Exception):
@@ -44,6 +52,10 @@ class ServerError(Exception):
     """Default exception for the `server_error` fault (an HTTP 5xx)."""
 
 
+class ClientError(Exception):
+    """Default exception for the `client_error` fault (an HTTP 4xx other than 429)."""
+
+
 def _default(fault: str) -> Exception:
     message = f"shape: injected {fault}"
     if fault in ("timeout", "timeout_after_commit"):
@@ -52,6 +64,8 @@ def _default(fault: str) -> Exception:
         return ConnectionResetError(message)
     if fault == "rate_limit":
         return RateLimited(message)
+    if fault == "client_error":
+        return ClientError(message)
     return ServerError(message)
 
 

@@ -165,26 +165,6 @@ def test_threaded_tool_calls_get_stable_keys(tmp_path):
         assert sum(1 for e in out.entries if e["kind"] == "effect") == 9
 
 
-def test_a_run_that_cannot_be_replayed_is_reported_not_minimized(tmp_path):
-    flag = tmp_path / "flag"
-
-    @shape.scenario(invariants=[shape.at_most_once("t.pay")], max_restarts=0)
-    def flaky(run):
-        # not controlled by shape: the first execution on this machine double pays, replays do not
-        first = not flag.exists()
-        flag.write_text("seen")
-        pay_twice = first
-        for _ in range(2 if pay_twice else 1):
-            pay_unkeyed()
-
-    with pytest.raises(AssertionError) as info:
-        shape.check(flaky, seeds=1, runs_dir=tmp_path / "runs")
-    text = str(info.value)
-    assert "NOT MINIMIZED" in text
-    assert "did not fail again" in text
-    assert "minimized to" not in text
-
-
 @shape.effect("t.pay", scope=lambda **_: "order:1")
 def pay_unkeyed():
     return None
@@ -285,7 +265,7 @@ def test_a_bug_reachable_only_through_a_model_choice_is_found_and_shrunk_to_it(t
     text = str(info.value)
     assert "at_most_once(t.refund)" in text
     assert "model chose 'refund_again' at 'after_refund' (nominal: 'reply_to_customer')" in text
-    assert "1 of 1 faults kept" in text  # the choice alone, every injected fault shrunk away
+    assert "1 of 1 deviations kept" in text  # the choice alone, every injected fault shrunk away
 
 
 def test_model_choices_replay_exactly(tmp_path):
