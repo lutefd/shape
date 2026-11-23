@@ -11,17 +11,21 @@ from .faults import AFTER_COMMIT, FAULTS
 from .log import event_order
 
 _COARSE_TEXT = {
-    "after_commit": ("after-commit fault", "the caller did not see the commit"),
+    "reply_lost": ("reply lost", "commit landed, caller saw an error"),
+    "crash_after": ("crash after commit", "process died after the commit"),
     "before_commit": ("before-commit fault", "the call failed cleanly"),
     "crash_before": ("crash", "died before the call"),
 }
 
 
 def fault_class(fault_name: str) -> str:
-    """Coarse class of a boundary fault: after_commit (caller did not see the commit),
-    before_commit (call failed cleanly), or crash_before (died before the call)."""
+    """Coarse class of a boundary fault: reply_lost (timeout/reset after commit, same process
+    retries), crash_after (process died after the commit, recovery after restart), before_commit
+    (call failed cleanly), or crash_before (died before the call)."""
+    if fault_name == "crash_after":
+        return "crash_after"
     if fault_name in AFTER_COMMIT:
-        return "after_commit"
+        return "reply_lost"
     if fault_name == "crash_before":
         return "crash_before"
     return "before_commit"
@@ -40,9 +44,9 @@ def kind(key: str, value: int) -> str:
 
 
 def coarse_kind(key: str, value: int) -> str:
-    """Coarse class of a deviation for root-cause grouping: `<op>:after_commit`,
-    `<op>:before_commit`, `<op>:crash_before`, `interleaving`, `model:<label>=<value>`,
-    or `duplicate_trigger`."""
+    """Coarse class of a deviation for root-cause grouping: `<op>:reply_lost`, `<op>:crash_after`,
+    `<op>:before_commit`, `<op>:crash_before`, `interleaving`, `model:<label>=<value>`, or
+    `duplicate_trigger`."""
     family, _, rest = key.partition(":")
     subject = rest.split("#")[0]
     if family == "fault":
