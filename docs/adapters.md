@@ -1,11 +1,15 @@
-# Framework adapters
+# Framework adapters reference
 
-`shape` core has zero dependencies. Optional adapters for LangGraph (`shape.langgraph`) and the OpenAI Agents SDK (`shape.agents`) remove the harness boilerplate — tool effect wrapping, a perturbed scripted model, and a crash-resuming driver — without modifying your tool bodies.
+> For task-oriented walkthroughs with real findings and fixes, see the [LangGraph guide](guide/langgraph.md) and [OpenAI Agents SDK guide](guide/openai-agents.md).
+
+`shape` core has zero dependencies. Optional adapters for LangGraph (`shape.langgraph`) and the OpenAI Agents SDK (`shape.agents`) remove harness boilerplate (tool effect wrapping, a perturbed scripted model, and a crash-resuming driver) without modifying your tool bodies.
 
 ```sh
-pip install 'agent-shape[langgraph]'
-pip install 'agent-shape[agents]'
+pip install "agent-shape[langgraph] @ git+https://github.com/lutefd/shape"
+pip install "agent-shape[agents] @ git+https://github.com/lutefd/shape"
 ```
+
+At release on PyPI, these become `pip install 'agent-shape[langgraph]'` and `pip install 'agent-shape[agents]'`.
 
 ## LangGraph in under 20 lines
 
@@ -69,10 +73,15 @@ For `needs_approval=True` tools, pass `human=approve_fn` (returning `True` to ap
 `effects(tools, ops={...})` returns a new list of tools with each tool named in `ops` wrapped in `@shape.effect(...)` (preserving sync and async execution, schemas, and error handlers). Unlisted tools pass through untouched. Each value in `ops` can be:
 
 - an op name string: `"payments.refund"`
-- a dict: `{"op": "payments.refund", "scope": ..., "key": ..., "irreversible": False, "errors": ...}`
+- a dict: `{"op": "payments.refund", "scope": ..., "key": ..., "irreversible": False, "errors": ..., "idempotent": False, "result": ..., "hide": ()}`
 - an `Effect(...)` dataclass with the same fields.
 
-Unknown tool names in `ops` raise `ValueError`.
+Unknown tool names in `ops` or unknown effect keys raise `ValueError`.
+
+What `scope` and `key` receive:
+
+- `shape.langgraph.effects`: wraps `tool.func`/`tool.coroutine` (for `@tool`/`StructuredTool`) or `_run`/`_arun` (for custom `BaseTool`), so `scope` and `key` receive that function's bound arguments.
+- `shape.agents.effects`: parses the model's JSON argument string and passes only those parsed keys to `scope` and `key` (not `RunContextWrapper` or omitted Python defaults). Passing framework context into `scope` and `key` from adapters is planned.
 
 ## Scripted models and perturbations
 
@@ -109,7 +118,7 @@ incarnation 0
 
 - On incarnation 0 (`run.restarts == 0`), calls `graph.invoke(input, config)`.
 - On restarts (`run.restarts > 0`), calls `graph.invoke(None, config)`, assuming the graph was compiled with a durable checkpointer (such as `SqliteSaver` under `run.dir`) and the same `thread_id` in `config`.
-- Whenever `graph.invoke` returns an `__interrupt__`, calls `human(payload)` and resumes with `Command(resume=reply)` in a loop. `human` may call `shape.choose(...)` to explore approve/reject/edit paths.
+- Whenever `graph.invoke` returns an `__interrupt__`, calls `human(payload)` and resumes with `Command(resume=reply)` in a loop. `human` may call `shape.choose(...)` to explore approve/reject/edit paths. Static `interrupt_before` / `interrupt_after` breakpoints are not detected by `drive` yet (planned); use a `graph.get_state(config).next` loop for static breakpoints.
 - `durability` is forwarded only when explicitly passed, so `durability=None` tests LangGraph's own default (`"async"`).
 
 ### `shape.agents.drive(agent, input, run, *, context=None, session_factory=None, human=None, context_serializer=None, max_turns=10)`
